@@ -1,4 +1,6 @@
-use merman::render::HeadlessRenderer;
+use merman::render::{
+    HeadlessRenderer, HostThemeOutput, HostThemeProfile, HostThemeRoles, HostThemeRootBackground,
+};
 use merman_analysis::{AnalysisOptions, Analyzer, DiagnosticSeverity};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use rmcp::schemars;
@@ -22,7 +24,37 @@ pub struct MermaidResult {
 }
 
 fn engine(diagram_id: Option<&str>) -> (Analyzer, HeadlessRenderer) {
-    let mut renderer = HeadlessRenderer::new().with_strict_parsing();
+    let mut output = HostThemeOutput::resvg_safe_editor();
+    output.root_background = HostThemeRootBackground::Color("transparent".to_owned());
+    let profile = HostThemeProfile::builder()
+        .roles(HostThemeRoles {
+            canvas: Some("#1b1e24".into()),
+            surface: Some("#1b1e24".into()),
+            surface_alt: Some("#232831".into()),
+            surface_muted: Some("#232831".into()),
+            text: Some("#ece8df".into()),
+            subtle_text: Some("#b8b3aa".into()),
+            border: Some("#4a5260".into()),
+            line: Some("#8f98a7".into()),
+            edge_label_background: Some("#1b1e24".into()),
+            cluster_background: Some("#232831".into()),
+            cluster_border: Some("#4a5260".into()),
+            note_background: Some("#302a20".into()),
+            note_border: Some("#9d8555".into()),
+            note_text: Some("#ece8df".into()),
+            actor_background: Some("#232831".into()),
+            actor_border: Some("#4a5260".into()),
+            actor_text: Some("#ece8df".into()),
+            activation_background: Some("#232831".into()),
+            activation_border: Some("#8f98a7".into()),
+            ..HostThemeRoles::default()
+        })
+        .theme_variable("background", "transparent")
+        .output(output)
+        .build();
+    let mut renderer = HeadlessRenderer::new()
+        .with_strict_parsing()
+        .with_host_theme(&profile);
     if let Some(diagram_id) = diagram_id {
         renderer = renderer.with_diagram_id(diagram_id);
     }
@@ -64,7 +96,7 @@ fn validate_with_svg(source: &str, diagram_id: Option<&str>) -> MermaidResult {
         .collect::<Vec<_>>();
     let mut valid = analysis.payload().valid;
     let svg = if valid && diagram_id.is_some() {
-        match renderer.render_svg_resvg_safe_sync(source) {
+        match renderer.render_svg_sync(source) {
             Ok(Some(svg)) => Some(svg),
             Ok(None) => {
                 valid = false;
@@ -184,6 +216,17 @@ mod tests {
                     .as_deref()
                     .is_some_and(|svg| svg.contains("<svg"))
             );
+            let svg = result.svg.unwrap().to_lowercase();
+            assert!(svg.contains("#1b1e24") || svg.contains("#232831"));
+            assert!(svg.contains("#ece8df"));
+            for opaque in [
+                "background-color:white",
+                "background-color:#fff",
+                "background-color:#ffffff",
+                "rgb(255",
+            ] {
+                assert!(!svg.contains(opaque), "{svg}");
+            }
         }
         let first = render("flowchart TD\nA-->B", "archive-first").svg.unwrap();
         let second = render("flowchart TD\nA-->B", "archive-second").svg.unwrap();

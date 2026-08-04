@@ -1,6 +1,6 @@
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
-import { Compartment, EditorState, RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
+import { Annotation, Compartment, EditorState, RangeSetBuilder, StateEffect, StateField, Transaction } from "@codemirror/state";
 import { Decoration, drawSelection, EditorView, keymap, ViewPlugin, WidgetType } from "@codemirror/view";
 import { getCM, vim } from "@replit/codemirror-vim";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -16,8 +16,23 @@ import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 export type MarkdownEditorHandle = {
   focus: (position?: number) => void;
   insertAt: (position: number, text: string) => void;
+  replaceBody: (body: string) => void;
   snapshot: () => EditorSnapshot | null;
 };
+
+const externalDocumentUpdate = Annotation.define<boolean>();
+
+function minimalBodyChange(current: string, next: string) {
+  let from = 0;
+  while (from < current.length && from < next.length && current[from] === next[from]) from += 1;
+  let currentTo = current.length;
+  let nextTo = next.length;
+  while (currentTo > from && nextTo > from && current[currentTo - 1] === next[nextTo - 1]) {
+    currentTo -= 1;
+    nextTo -= 1;
+  }
+  return { from, to: currentTo, insert: next.slice(from, nextTo) };
+}
 
 export type ExplorerOrigin = {
   documentId: number;
@@ -328,6 +343,21 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       });
       view.focus();
     },
+    replaceBody(nextBody) {
+      const view = viewRef.current;
+      if (!view) return;
+      const currentBody = view.state.doc.toString();
+      if (currentBody === nextBody) return;
+      view.dispatch({
+        changes: minimalBodyChange(currentBody, nextBody),
+        annotations: [
+          externalDocumentUpdate.of(true),
+          Transaction.addToHistory.of(false),
+          Transaction.remote.of(true),
+        ],
+      });
+      view.requestMeasure();
+    },
     snapshot() {
       const view = viewRef.current;
       if (!view) return null;
@@ -363,7 +393,12 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
           referencesCompartment.of(referenceDecorations(references, (id) => onOpenReferenceRef.current(id))),
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
-            if (update.docChanged) onChangeRef.current(entryId, update.state.doc.toString());
+            if (
+              update.docChanged &&
+              !update.transactions.some((transaction) => transaction.annotation(externalDocumentUpdate))
+            ) {
+              onChangeRef.current(entryId, update.state.doc.toString());
+            }
           }),
           EditorView.theme({
             "&": { minHeight: "160px", backgroundColor: "transparent", color: "#ece8df" },

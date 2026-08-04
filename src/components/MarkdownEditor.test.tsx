@@ -248,6 +248,38 @@ describe("MarkdownEditor application shortcuts", () => {
     expect(previous).toHaveBeenCalledOnce();
     expect(insertH.defaultPrevented).toBe(false);
   });
+
+  it("keeps external document replacements out of undo history and change callbacks", async () => {
+    const editorRef = createRef<MarkdownEditorHandle>();
+    const onChange = vi.fn();
+    const { container } = render(
+      <MarkdownEditor
+        ref={editorRef}
+        entryId={1}
+        body="local body"
+        readOnly={false}
+        onChange={onChange}
+        onClipboardError={vi.fn()}
+        onModeChange={vi.fn()}
+        onNewNote={() => false}
+        onNewPrivateNote={() => false}
+        onOpenCommands={() => false}
+        onOpenExplorer={() => false}
+        references={[]}
+        onPreviousBuffer={() => false}
+        onNextBuffer={() => false}
+        onOpenReference={() => false}
+      />,
+    );
+
+    act(() => editorRef.current?.replaceBody("remote body"));
+    container.querySelector(".cm-editor")!.dispatchEvent(
+      new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ctrlKey: true, key: "z" }),
+    );
+    await act(async () => Promise.resolve());
+    expect(container.querySelector(".cm-content")?.textContent).toContain("remote body");
+    expect(onChange).not.toHaveBeenCalled();
+  });
 });
 
 describe("reference selection boundaries", () => {

@@ -13,6 +13,13 @@ export type Document = {
   created_at: string;
   updated_at: string;
   body: string;
+  revision: number;
+};
+
+export type SyncSnapshot = {
+  document: Document | null;
+  user_count: number;
+  agent_present: boolean;
 };
 
 export type ReferenceSummary = {
@@ -47,8 +54,20 @@ export function getDocument(id: number): Promise<Document> {
   return invoke("get_document", { id });
 }
 
-export function updateDocument(id: number, expectedBody: string, body: string): Promise<Document> {
-  return invoke("update_document_body", { id, expectedBody, body });
+export function updateDocument(id: number, expectedRevision: number, body: string): Promise<Document> {
+  return invoke("update_document_body", { id, expectedRevision, body });
+}
+
+export function syncDocument(id: number, knownRevision: number): Promise<SyncSnapshot> {
+  return invoke("sync_document", { id, knownRevision });
+}
+
+export function updatePresence(sessionId: string, documentId: number): Promise<void> {
+  return invoke("update_presence", { sessionId, documentId });
+}
+
+export function removePresence(sessionId: string): Promise<void> {
+  return invoke("remove_presence", { sessionId });
 }
 
 export function deleteNote(id: number): Promise<void> {

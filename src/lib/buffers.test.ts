@@ -3,7 +3,7 @@ import type { Document } from "./archive";
 import { addBuffer, adjacentBufferId, removeBuffer } from "./buffers";
 
 const document = (id: number): Document => ({
-  id, kind: "note", visibility: "shared", author: "user", day: "2026-08-03", created_at: "", updated_at: "", body: `note ${id}`,
+  id, kind: "note", visibility: "shared", author: "user", day: "2026-08-03", created_at: "", updated_at: "", body: `note ${id}`, revision: 1,
 });
 
 describe("document buffers", () => {

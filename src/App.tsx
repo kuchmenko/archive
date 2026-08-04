@@ -28,13 +28,16 @@ import {
   deleteNote,
   getDocument,
   getOrCreateDaily,
+  removePresence,
   resolveReferences,
   searchDocuments,
+  syncDocument,
   updateDocument,
+  updatePresence,
   type Document,
   type ReferenceSummary,
 } from "@/lib/archive";
-import { AutosaveController, type SaveState } from "@/lib/autosave";
+import { AutosaveController, mergeDocumentBodies, type SaveState } from "@/lib/autosave";
 import { formatLocalDay, millisecondsUntilNextLocalDay, toLocalDay } from "@/lib/date";
 import { documentLabel, formatNoteReference } from "@/lib/documents";
 import { addBuffer, adjacentBufferId, removeBuffer, type DocumentBuffer } from "@/lib/buffers";
@@ -47,6 +50,17 @@ import { useCallback, useEffect, useRef, useState } from "react";
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
 }
+
+type DocumentConflict = {
+  documentId: number;
+  baseBody: string;
+  remote: Document;
+};
+
+type Presence = {
+  userCount: number;
+  agentPresent: boolean;
+};
 
 export function App() {
   const [today, setToday] = useState(() => toLocalDay(new Date()));
@@ -65,6 +79,9 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(true);
   const [notice, setNotice] = useState<string | null>(null);
+  const [conflict, setConflict] = useState<DocumentConflict | null>(null);
+  const [resolvingConflict, setResolvingConflict] = useState(false);
+  const [presence, setPresence] = useState<Presence>({ userCount: 1, agentPresent: false });
   const activeRef = useRef(active);
   const todayRef = useRef(today);
   const operation = useRef(true);
@@ -72,17 +89,21 @@ export function App() {
   const searchToken = useRef(0);
   const referenceToken = useRef(0);
   const buffersRef = useRef(buffers);
+  const conflictRef = useRef(conflict);
+  const syncGeneration = useRef(0);
+  const sessionId = useRef(
+    `archive-gui-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`,
+  ).current;
   activeRef.current = active;
   buffersRef.current = buffers;
+  conflictRef.current = conflict;
 
   const autosaveRef = useRef<AutosaveController | null>(null);
   if (!autosaveRef.current) {
     autosaveRef.current = new AutosaveController(
-      async (id, expectedBody, body) => {
-        const updated = await updateDocument(id, expectedBody, body);
-        setActive((current) =>
-          current?.id === id ? { ...updated, body: current.body } : current,
-        );
+      async (id, expectedRevision, body) => {
+        const updated = await updateDocument(id, expectedRevision, body);
+        return updated;
       },
       (state) => {
         setSaveState(state);
@@ -92,6 +113,30 @@ export function App() {
             buffer.document.id === id ? { ...buffer, saveState: state } : buffer,
           ));
         }
+      },
+      650,
+      (id, persisted) => {
+        setActive((current) =>
+          current?.id === id
+            ? {
+                ...current,
+                revision: persisted.revision,
+                updated_at: persisted.updated_at ?? current.updated_at,
+              }
+            : current,
+        );
+        setBuffers((current) => current.map((buffer) =>
+          buffer.document.id === id
+            ? {
+                ...buffer,
+                document: {
+                  ...buffer.document,
+                  revision: persisted.revision,
+                  updated_at: persisted.updated_at ?? buffer.document.updated_at,
+                },
+              }
+            : buffer,
+        ));
       },
     );
   }
@@ -109,7 +154,9 @@ export function App() {
       setBuffers((current) => addBuffer(current, document));
       setActive(document);
       setVimMode("NORMAL");
-      autosave.load(document.id, document.body);
+      setConflict(null);
+      setPresence({ userCount: 1, agentPresent: false });
+      autosave.load(document.id, document.body, document.revision);
     },
     [autosave],
   );
@@ -142,6 +189,108 @@ export function App() {
   }, [autosave, showDocument]);
 
   useEffect(() => {
+    return () => {
+      void removePresence(sessionId).catch(() => undefined);
+    };
+  }, [sessionId]);
+
+  useEffect(() => {
+    const documentId = active?.id;
+    if (documentId === undefined) return;
+    const generation = ++syncGeneration.current;
+    let disposed = false;
+    let polling = false;
+
+    const current = () =>
+      !disposed && generation === syncGeneration.current && activeRef.current?.id === documentId;
+    const applyDocument = (document: Document) => {
+      if (!current()) return;
+      editorRef.current?.replaceBody(document.body);
+      activeRef.current = document;
+      setActive(document);
+      setBuffers((buffers) => buffers.map((buffer) =>
+        buffer.document.id === document.id ? { ...buffer, document } : buffer,
+      ));
+    };
+    const saveMerged = (body: string, remote: Document) => {
+      const merged = { ...remote, body };
+      autosave.resume();
+      autosave.rebase(body, remote);
+      applyDocument(merged);
+      void autosave.flush().catch((error) => {
+        if (current()) setNotice(`Could not save merged note: ${message(error)}`);
+      });
+    };
+    const receiveRemote = (remote: Document) => {
+      const state = autosave.snapshot();
+      if (state.id !== documentId || remote.revision <= state.revision) return;
+      const existingConflict = conflictRef.current;
+      if (existingConflict?.documentId === documentId) {
+        const merged = mergeDocumentBodies(
+          existingConflict.baseBody,
+          state.body,
+          remote.body,
+        );
+        if (merged.kind === "merged") {
+          setConflict(null);
+          saveMerged(merged.body, remote);
+        } else {
+          setConflict({ ...existingConflict, remote });
+        }
+        return;
+      }
+      if (!state.dirty) {
+        autosave.adoptRemote(remote.body, remote.revision);
+        applyDocument(remote);
+        return;
+      }
+      const merged = mergeDocumentBodies(state.persistedBody, state.body, remote.body);
+      if (merged.kind === "merged") {
+        saveMerged(merged.body, remote);
+      } else {
+        autosave.pause();
+        setConflict({
+          documentId,
+          baseBody: state.persistedBody,
+          remote,
+        });
+      }
+    };
+    const poll = async () => {
+      if (!current() || polling) return;
+      polling = true;
+      try {
+        const knownRevision = conflictRef.current?.documentId === documentId
+          ? conflictRef.current.remote.revision
+          : autosave.snapshot().revision;
+        const snapshot = await syncDocument(documentId, knownRevision);
+        if (!current()) return;
+        setPresence({ userCount: snapshot.user_count, agentPresent: snapshot.agent_present });
+        if (snapshot.document) receiveRemote(snapshot.document);
+      } catch (error) {
+        if (current()) setNotice(`Sync: ${message(error)}`);
+      } finally {
+        polling = false;
+      }
+    };
+    const heartbeat = () => {
+      void updatePresence(sessionId, documentId).catch((error) => {
+        if (current()) setNotice(`Presence: ${message(error)}`);
+      });
+    };
+
+    heartbeat();
+    void poll();
+    const pollTimer = setInterval(() => void poll(), 400);
+    const heartbeatTimer = setInterval(heartbeat, 2_500);
+    return () => {
+      disposed = true;
+      clearInterval(pollTimer);
+      clearInterval(heartbeatTimer);
+    };
+  }, [active?.id, autosave, sessionId]);
+
+  useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
     const window = getCurrentWindow();
@@ -150,6 +299,7 @@ export function App() {
         event.preventDefault();
         if (await flush()) {
           try {
+            await removePresence(sessionId).catch(() => undefined);
             await window.destroy();
           } catch (error) {
             setNotice(`Could not close Archive: ${message(error)}`);
@@ -165,7 +315,7 @@ export function App() {
       disposed = true;
       unlisten?.();
     };
-  }, [autosave]);
+  }, [autosave, sessionId]);
 
   useEffect(() => {
     let cancelled = false;
@@ -439,10 +589,55 @@ export function App() {
     queueMicrotask(() => setDeleteTargetId(targetId));
   }
 
+  async function keepLocalConflict() {
+    const currentConflict = conflictRef.current;
+    if (!currentConflict || resolvingConflict) return;
+    setResolvingConflict(true);
+    setNotice(null);
+    const localBody = autosave.snapshot().body;
+    autosave.resume();
+    autosave.rebase(localBody, currentConflict.remote);
+    const localDocument = { ...currentConflict.remote, body: localBody };
+    editorRef.current?.replaceBody(localBody);
+    activeRef.current = localDocument;
+    setActive(localDocument);
+    setBuffers((current) => current.map((buffer) =>
+      buffer.document.id === localDocument.id ? { ...buffer, document: localDocument } : buffer,
+    ));
+    try {
+      await autosave.flush();
+      setConflict(null);
+      queueMicrotask(() => editorRef.current?.focus());
+    } catch (error) {
+      autosave.pause();
+      setNotice(`Could not keep local version: ${message(error)}`);
+    } finally {
+      setResolvingConflict(false);
+    }
+  }
+
+  function useRemoteConflict() {
+    const currentConflict = conflictRef.current;
+    if (!currentConflict || resolvingConflict) return;
+    const remote = currentConflict.remote;
+    autosave.resume();
+    autosave.adoptRemote(remote.body, remote.revision);
+    editorRef.current?.replaceBody(remote.body);
+    activeRef.current = remote;
+    setActive(remote);
+    setBuffers((current) => current.map((buffer) =>
+      buffer.document.id === remote.id ? { ...buffer, document: remote } : buffer,
+    ));
+    setConflict(null);
+    queueMicrotask(() => editorRef.current?.focus());
+  }
+
   const selectedExplorerDocument =
     explorerResults.find((document) => document.id === explorerSelectedId) ?? null;
   const transientStatus =
-    saveState.kind === "saving"
+    conflict
+      ? "Conflict · choose version"
+      : saveState.kind === "saving"
       ? "Saving…"
       : saveState.kind === "error"
         ? `Save error: ${saveState.message}`
@@ -475,7 +670,7 @@ export function App() {
                 ref={editorRef}
                 entryId={active.id}
                 body={active.body}
-                readOnly={busy}
+                readOnly={busy || conflict !== null}
                 onChange={editorChanged}
                 onClipboardError={(error) => setNotice(`Clipboard: ${error}`)}
                 onModeChange={setVimMode}
@@ -507,6 +702,8 @@ export function App() {
             {active.visibility === "private" ? " · Private" : ""}
             {active.kind === "artifact" ? " · Artifact" : ""}
             {active.author === "agent" ? " · Agent" : ""}
+            {presence.userCount > 1 ? ` · ${presence.userCount} viewers` : ""}
+            {active.visibility === "shared" && presence.agentPresent ? " · ✦ Agent present" : ""}
           </span>
         )}
         {transientStatus && (
@@ -622,6 +819,29 @@ export function App() {
           </CommandList>
         </Command>
       </CommandDialog>
+
+      <AlertDialog
+        open={conflict !== null}
+        onOpenChange={() => undefined}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Concurrent edits need your choice</AlertDialogTitle>
+            <AlertDialogDescription>
+              Archive preserved both versions because the same lines changed here and in another process.
+              Keep your exact text or replace it with the latest remote version.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={resolvingConflict} onClick={useRemoteConflict}>
+              Use remote
+            </AlertDialogCancel>
+            <AlertDialogAction disabled={resolvingConflict} onClick={() => void keepLocalConflict()}>
+              Keep mine
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog
         open={deleteTargetId !== null}

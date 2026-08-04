@@ -1,6 +1,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
+use rusqlite::Connection;
 use serde_json::{Value, json};
 
 fn send(stdin: &mut impl Write, message: Value) {
@@ -22,6 +24,10 @@ fn response(reader: &mut impl BufRead, id: i64) -> Value {
 #[test]
 fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
     let state = tempfile::tempdir().unwrap();
+    let database_path = state
+        .path()
+        .join("dev.kuchmenko.archive")
+        .join("archive.sqlite3");
     let mut child = Command::new(env!("CARGO_BIN_EXE_archive"))
         .arg("mcp")
         .env("XDG_DATA_HOME", state.path())
@@ -118,6 +124,64 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
         document["body"]
     );
 
+    let observer = Connection::open(&database_path).unwrap();
+    observer.busy_timeout(Duration::from_secs(5)).unwrap();
+    let agent_document: i64 = observer
+        .query_row(
+            "SELECT document_id FROM presence WHERE actor='agent'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(agent_document, id);
+
+    for (request_id, expected_revision, expected_body) in [
+        (7, 1, "first append"),
+        (8, 2, "first append\n\nsecond append"),
+    ] {
+        let addition = if request_id == 7 {
+            "first append"
+        } else {
+            "second append"
+        };
+        send(
+            &mut stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "append_to_daily",
+                    "arguments": {"day": "2026-08-04", "body": addition}
+                }
+            }),
+        );
+        let appended = response(&mut stdout, request_id);
+        assert_eq!(
+            appended["result"]["structuredContent"]["body"],
+            expected_body
+        );
+        let (revision, stored_body): (i64, String) = observer
+            .query_row(
+                "SELECT revision, body FROM documents WHERE kind='daily' AND day='2026-08-04'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (revision, stored_body.as_str()),
+            (expected_revision, expected_body)
+        );
+    }
+    let daily_agent_count: i64 = observer
+        .query_row(
+            "SELECT count(*) FROM presence p JOIN documents d ON d.id=p.document_id WHERE p.actor='agent' AND d.kind='daily' AND d.day='2026-08-04'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(daily_agent_count, 1);
+
     drop(stdin);
     let mut remaining_stdout = String::new();
     stdout.read_to_string(&mut remaining_stdout).unwrap();
@@ -125,4 +189,8 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
     assert!(output.status.success());
     assert!(remaining_stdout.is_empty());
     assert!(output.stderr.is_empty());
+    let remaining_presence: i64 = observer
+        .query_row("SELECT count(*) FROM presence", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(remaining_presence, 0);
 }

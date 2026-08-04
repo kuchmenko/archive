@@ -1,7 +1,8 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { createNote, getOrCreateDaily } from "./lib/archive";
+import { createNote, getOrCreateDaily, removePresence, syncDocument, updateDocument, updatePresence } from "./lib/archive";
+import { readText } from "@tauri-apps/plugin-clipboard-manager";
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -18,6 +19,9 @@ vi.mock("./lib/archive", () => ({
   searchDocuments: vi.fn(),
   resolveReferences: vi.fn().mockResolvedValue([]),
   updateDocument: vi.fn(),
+  syncDocument: vi.fn(),
+  updatePresence: vi.fn().mockResolvedValue(undefined),
+  removePresence: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("@replit/codemirror-vim", () => ({
@@ -26,7 +30,7 @@ vi.mock("@replit/codemirror-vim", () => ({
 }));
 
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
-  readText: vi.fn(),
+  readText: vi.fn().mockResolvedValue(""),
   writeText: vi.fn(),
 }));
 
@@ -39,6 +43,7 @@ const daily = {
   created_at: "2026-08-03T10:00:00.000Z",
   updated_at: "2026-08-03T10:00:00.000Z",
   body: "",
+  revision: 1,
 };
 
 describe("Archive document canvas", () => {
@@ -55,12 +60,25 @@ describe("Archive document canvas", () => {
       },
     );
     Element.prototype.scrollIntoView = vi.fn();
+    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => new DOMRect();
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
       queueMicrotask(() => callback(0));
       return 0;
     });
     vi.mocked(getOrCreateDaily).mockResolvedValue(daily);
     vi.mocked(createNote).mockResolvedValue({ ...daily, id: 2, kind: "note" });
+    vi.mocked(syncDocument).mockResolvedValue({
+      document: null,
+      user_count: 1,
+      agent_present: false,
+    });
+    vi.mocked(updateDocument).mockImplementation(async (id, expectedRevision, body) => ({
+      ...daily,
+      id,
+      body,
+      revision: expectedRevision + 1,
+    }));
   });
 
   afterEach(() => {
@@ -116,5 +134,119 @@ describe("Archive document canvas", () => {
     });
     expect(screen.getByRole("heading", { name: "Tuesday, August 4, 2026" })).toBeTruthy();
     expect(getOrCreateDaily).toHaveBeenCalledTimes(3);
+  });
+
+  it("applies clean remote revisions without echo-saving and shows live presence", async () => {
+    const remote = { ...daily, body: "remote body", revision: 2 };
+    vi.mocked(syncDocument)
+      .mockResolvedValueOnce({ document: null, user_count: 1, agent_present: false })
+      .mockResolvedValueOnce({ document: remote, user_count: 2, agent_present: true });
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+
+    await act(async () => vi.advanceTimersByTimeAsync(400));
+    expect(container.querySelector(".cm-content")?.textContent).toContain("remote body");
+    expect(screen.getByText(/2 viewers.*Agent present/, { selector: "footer *" })).toBeTruthy();
+    await act(async () => vi.advanceTimersByTimeAsync(700));
+    expect(updateDocument).not.toHaveBeenCalled();
+  });
+
+  it("suppresses a stale poll after switching documents and cleans up timers and presence", async () => {
+    let resolveOld: ((value: Awaited<ReturnType<typeof syncDocument>>) => void) | undefined;
+    vi.mocked(syncDocument).mockImplementationOnce(() => new Promise((resolve) => {
+      resolveOld = resolve;
+    }));
+    const { container, unmount } = render(<App />);
+    await act(async () => Promise.resolve());
+
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("heading", { name: "Untitled note" })).toBeTruthy();
+    await act(async () => resolveOld?.({
+      document: { ...daily, body: "stale old body", revision: 2 },
+      user_count: 4,
+      agent_present: true,
+    }));
+    expect(container.querySelector(".cm-content")?.textContent).not.toContain("stale old body");
+
+    const heartbeatCalls = vi.mocked(updatePresence).mock.calls.length;
+    unmount();
+    await act(async () => vi.advanceTimersByTimeAsync(3_000));
+    expect(updatePresence).toHaveBeenCalledTimes(heartbeatCalls);
+    expect(removePresence).toHaveBeenCalled();
+  });
+
+  it("three-way merges disjoint edits and saves against the remote revision", async () => {
+    const base = { ...daily, body: "one\ntwo\nthree" };
+    vi.mocked(getOrCreateDaily).mockResolvedValue(base);
+    vi.mocked(syncDocument)
+      .mockResolvedValueOnce({ document: null, user_count: 1, agent_present: false })
+      .mockResolvedValueOnce({
+        document: { ...base, body: "one\ntwo\nTHREE", revision: 2 },
+        user_count: 1,
+        agent_present: false,
+      });
+    vi.mocked(readText).mockResolvedValue("LOCAL\n");
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    await act(async () => Promise.resolve());
+
+    await act(async () => vi.advanceTimersByTimeAsync(400));
+    expect(updateDocument).toHaveBeenCalledWith(1, 2, "LOCAL\none\ntwo\nTHREE");
+    expect(container.querySelector(".cm-content")?.textContent).toContain("LOCAL");
+    expect(container.querySelector(".cm-content")?.textContent).toContain("THREE");
+  });
+
+  it("preserves overlapping versions, blocks switching, and resolves Keep mine", async () => {
+    const base = { ...daily, body: "base" };
+    vi.mocked(getOrCreateDaily).mockResolvedValue(base);
+    vi.mocked(syncDocument)
+      .mockResolvedValueOnce({ document: null, user_count: 1, agent_present: false })
+      .mockResolvedValueOnce({
+        document: { ...base, body: "REMOTEbase", revision: 2 },
+        user_count: 1,
+        agent_present: false,
+      });
+    vi.mocked(readText).mockResolvedValue("LOCAL");
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(400));
+
+    expect(screen.getByRole("alertdialog", { name: "Concurrent edits need your choice" })).toBeTruthy();
+    expect(container.querySelector(".cm-content")?.textContent).toContain("LOCALbase");
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    await act(async () => Promise.resolve());
+    expect(createNote).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Keep mine" }));
+    await act(async () => Promise.resolve());
+    expect(updateDocument).toHaveBeenCalledWith(1, 2, "LOCALbase");
+    expect(screen.queryByRole("alertdialog", { name: "Concurrent edits need your choice" })).toBeNull();
+    expect(container.querySelector(".cm-content")?.textContent).toContain("LOCALbase");
+  });
+
+  it("resolves an overlapping edit with the exact remote body without saving", async () => {
+    const base = { ...daily, body: "base" };
+    vi.mocked(getOrCreateDaily).mockResolvedValue(base);
+    vi.mocked(syncDocument)
+      .mockResolvedValueOnce({ document: null, user_count: 1, agent_present: false })
+      .mockResolvedValueOnce({
+        document: { ...base, body: "REMOTEbase", revision: 2 },
+        user_count: 1,
+        agent_present: false,
+      });
+    vi.mocked(readText).mockResolvedValue("LOCAL");
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(400));
+
+    fireEvent.click(screen.getByRole("button", { name: "Use remote" }));
+    expect(container.querySelector(".cm-content")?.textContent).toContain("REMOTEbase");
+    expect(updateDocument).not.toHaveBeenCalled();
   });
 });

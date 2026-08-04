@@ -36,7 +36,7 @@ try {
   await page.addInitScript(() => {
     const timestamp = "2026-08-03T10:00:00.000Z";
     const documents = [
-      { id: 1, kind: "daily", visibility: "shared", author: "user", day: "2026-08-03", created_at: timestamp, updated_at: timestamp, body: "" },
+      { id: 1, kind: "daily", visibility: "shared", author: "user", day: "2026-08-03", created_at: timestamp, updated_at: timestamp, body: "", revision: 1 },
       {
         id: 2,
         kind: "note",
@@ -46,6 +46,7 @@ try {
         created_at: timestamp,
         updated_at: timestamp,
         body: "# Project note\n[[note:999|Missing]]",
+        revision: 1,
       },
       {
         id: 3,
@@ -56,6 +57,7 @@ try {
         created_at: "2026-08-02T10:00:00.000Z",
         updated_at: "2026-08-02T10:00:00.000Z",
         body: "Nearby Sunday notes",
+        revision: 1,
       },
       {
         id: 4,
@@ -66,6 +68,7 @@ try {
         created_at: timestamp,
         updated_at: timestamp,
         body: "# Agent research artifact\nUseful findings\n```mermaid\ngraph TD\nA-->B\n```",
+        revision: 1,
       },
     ];
     let nextId = 5;
@@ -73,6 +76,22 @@ try {
     window.__tauriCallbacks = [];
     window.__clipboardFailure = false;
     window.__clipboardText = "clipboard";
+    const presence = { user_count: 1, agent_present: false };
+    const syncQueue = [];
+    window.__archiveSync = {
+      presence,
+      queue: syncQueue,
+      pushRemote(id, body, revision) {
+        const document = documents.find((candidate) => candidate.id === id);
+        if (!document) throw new Error(`Document ${id} does not exist`);
+        Object.assign(document, { body, revision, updated_at: timestamp });
+        syncQueue.push({ ...document });
+      },
+      setPresence(user_count, agent_present) {
+        presence.user_count = user_count;
+        presence.agent_present = agent_present;
+      },
+    };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" } },
       transformCallback: (callback) => {
@@ -88,12 +107,12 @@ try {
         if (command === "get_or_create_daily") {
           const existing = documents.find((document) => document.kind === "daily" && document.day === args.day);
           if (existing) return { ...existing };
-          const daily = { id: nextId++, kind: "daily", visibility: "shared", author: "user", day: args.day, created_at: timestamp, updated_at: timestamp, body: "" };
+          const daily = { id: nextId++, kind: "daily", visibility: "shared", author: "user", day: args.day, created_at: timestamp, updated_at: timestamp, body: "", revision: 1 };
           documents.push(daily);
           return { ...daily };
         }
         if (command === "create_note") {
-          const note = { id: nextId++, kind: "note", visibility: args.visibility, author: "user", day: args.day, created_at: timestamp, updated_at: timestamp, body: "" };
+          const note = { id: nextId++, kind: "note", visibility: args.visibility, author: "user", day: args.day, created_at: timestamp, updated_at: timestamp, body: "", revision: 1 };
           documents.push(note);
           return { ...note };
         }
@@ -105,10 +124,21 @@ try {
         if (command === "update_document_body") {
           const document = documents.find((candidate) => candidate.id === args.id);
           if (!document) throw new Error(`Document ${args.id} does not exist`);
+          if (args.expectedRevision !== document.revision) {
+            throw new Error(`Revision conflict: expected ${args.expectedRevision}, current ${document.revision}`);
+          }
           document.body = args.body;
           document.updated_at = timestamp;
+          document.revision += 1;
           return { ...document };
         }
+        if (command === "sync_document") {
+          const queuedIndex = syncQueue.findIndex((document) => document.id === args.id && document.revision > args.knownRevision);
+          const document = queuedIndex < 0 ? null : syncQueue.splice(queuedIndex, 1)[0];
+          return { document, ...presence };
+        }
+        if (command === "update_presence") return null;
+        if (command === "remove_presence") return null;
         if (command === "delete_note") {
           const index = documents.findIndex((candidate) => candidate.id === args.id);
           if (index < 0) throw new Error(`Document ${args.id} does not exist`);
@@ -169,6 +199,16 @@ try {
   const editorBody = async () => (await content.innerText()).replace(/\n$/, "");
   const calls = (command) => page.evaluate((name) => window.__archiveCalls.filter((call) => call.command === name), command);
 
+  async function replaceAllInVim(body) {
+    await content.click();
+    await page.keyboard.press("Escape");
+    await page.keyboard.type("ggVGc");
+    await mode("INSERT").waitFor();
+    await page.keyboard.insertText(body);
+    await page.keyboard.press("Escape");
+    await mode("NORMAL").waitFor();
+  }
+
   async function selectionRendering(name) {
     await page.waitForFunction(() => document.querySelectorAll(".cm-selectionLayer .cm-selectionBackground").length > 0);
     const ranges = await page.locator(".cm-selectionLayer .cm-selectionBackground").evaluateAll((elements) =>
@@ -190,6 +230,64 @@ try {
   await page.keyboard.press("Shift+H");
   assert((await page.getByRole("heading", { name: "Monday, August 3, 2026" }).count()) === 1, "Single-buffer H changed documents");
   assert((await calls("get_document")).length === 0, "Single-buffer H attempted to open a document");
+
+  const cleanRemote = "shared line\nstable line";
+  const cleanUpdateCount = (await calls("update_document_body")).length;
+  await page.evaluate((body) => {
+    window.__archiveSync.setPresence(2, true);
+    window.__archiveSync.pushRemote(1, body, 2);
+  }, cleanRemote);
+  await page.waitForFunction((body) => document.querySelector(".cm-content")?.innerText.replace(/\n$/, "") === body, cleanRemote, { timeout: 450 });
+  assert((await editorBody()) === cleanRemote, "Clean remote source was not applied exactly");
+  const cleanEditorState = await page.evaluate(() => {
+    const content = document.querySelector(".cm-content");
+    const selection = getSelection();
+    return {
+      focused: document.querySelector(".cm-editor")?.classList.contains("cm-focused"),
+      scrollTop: document.querySelector(".cm-scroller")?.scrollTop,
+      selectionInside: !!content && !!selection?.anchorNode && content.contains(selection.anchorNode),
+    };
+  });
+  assert(cleanEditorState.focused && cleanEditorState.selectionInside && Number.isFinite(cleanEditorState.scrollTop) && cleanEditorState.scrollTop >= 0, "Clean sync did not preserve a sensible cursor, focus, and scroll position");
+  await page.waitForFunction(() => document.querySelector("footer")?.textContent?.includes("2 viewers") && document.querySelector("footer")?.textContent?.includes("✦ Agent present"), { timeout: 450 });
+  await page.evaluate(() => window.__archiveSync.setPresence(1, false));
+  await page.waitForFunction(() => !document.querySelector("footer")?.textContent?.includes("2 viewers") && !document.querySelector("footer")?.textContent?.includes("✦ Agent present"), { timeout: 450 });
+  await page.waitForTimeout(550);
+  assert((await calls("update_document_body")).length === cleanUpdateCount, "Clean remote sync produced an echo-save");
+
+  const firstLocal = "LOCAL line\nstable line";
+  const firstRemote = "REMOTE line\nstable line";
+  await replaceAllInVim(firstLocal);
+  const writesBeforeFirstConflict = (await calls("update_document_body")).length;
+  await page.evaluate((body) => window.__archiveSync.pushRemote(1, body, 3), firstRemote);
+  const conflictDialog = page.getByRole("alertdialog", { name: "Concurrent edits need your choice" });
+  await conflictDialog.waitFor({ timeout: 850 });
+  assert((await editorBody()) === firstLocal, "First conflict did not preserve the exact local source");
+  assert((await calls("update_document_body")).length === writesBeforeFirstConflict, "Autosave wrote an unresolved first conflict");
+  const dialogBox = await conflictDialog.boundingBox();
+  assert(dialogBox && dialogBox.width < 600 && dialogBox.height < 360, "Conflict alert is not compact");
+  await conflictDialog.getByRole("button", { name: "Use remote" }).click();
+  await conflictDialog.waitFor({ state: "detached" });
+  assert((await editorBody()) === firstRemote, "Use remote did not apply the exact remote source");
+
+  const secondLocal = "MINE line\nstable line";
+  const secondRemote = "THEIRS line\nstable line";
+  await replaceAllInVim(secondLocal);
+  const writesBeforeSecondConflict = (await calls("update_document_body")).length;
+  await page.evaluate((body) => window.__archiveSync.pushRemote(1, body, 4), secondRemote);
+  await conflictDialog.waitFor({ timeout: 850 });
+  assert((await editorBody()) === secondLocal, "Second conflict did not preserve the exact local source");
+  assert((await calls("update_document_body")).length === writesBeforeSecondConflict, "Autosave wrote an unresolved second conflict");
+  await conflictDialog.getByRole("button", { name: "Keep mine" }).click();
+  await conflictDialog.waitFor({ state: "detached" });
+  await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
+  const keepMineWrites = await calls("update_document_body");
+  assert(keepMineWrites.some((call) => call.args.id === 1 && call.args.expectedRevision === 4 && call.args.body === secondLocal), "Keep mine did not write the exact local source against the remote revision");
+  assert((await editorBody()) === secondLocal, "Keep mine changed the local source");
+
+  await page.evaluate(() => window.__archiveSync.pushRemote(1, "", 6));
+  await page.waitForFunction(() => document.querySelector(".cm-content")?.innerText.replace(/\n$/, "") === "", { timeout: 450 });
+  assert((await page.locator(".editor-toolbar, .editor-topbar, .editor-split, .sidebar, [role=tablist], [data-mermaid-toolbar], [data-sync-toolbar], [data-sync-status]").count()) === 0, "Sync or presence added permanent application chrome");
 
   await page.keyboard.press("Control+o");
   const dailyDelete = page.locator('[data-slot="command-item"]', { hasText: "Daily documents cannot be deleted" });
@@ -252,7 +350,7 @@ try {
     });
   });
   let updates = await calls("update_document_body");
-  assert(updates.some((call) => call.args.id === 5 && call.args.expectedBody === "" && call.args.body === "Draft body "), `Standalone body did not autosave from its persisted base: ${JSON.stringify(updates)}`);
+  assert(updates.some((call) => call.args.id === 5 && call.args.expectedRevision === 1 && call.args.body === "Draft body "), `Standalone body did not autosave from revision 1: ${JSON.stringify(updates)}`);
   assert((await calls("plugin:window|destroy")).length === 1, "Close request did not flush before destroy");
   const closeOrder = await page.evaluate(() => [
     window.__archiveCalls.findIndex(
@@ -284,7 +382,7 @@ try {
   const expectedSourceWithReference = "Draft body[[note:2|Project note]] ";
   await page.waitForTimeout(650);
   updates = await calls("update_document_body");
-  assert(updates.some((call) => call.args.id === 5 && call.args.expectedBody === "Draft body " && call.args.body === expectedSourceWithReference), "Inserted raw reference did not reach autosave unchanged from its persisted base");
+  assert(updates.some((call) => call.args.id === 5 && call.args.expectedRevision === 2 && call.args.body === expectedSourceWithReference), "Inserted raw reference did not reach autosave unchanged from revision 2");
   await page.locator(".cm-reference-note", { hasText: "Project note" }).waitFor();
 
   await page.keyboard.press("0");

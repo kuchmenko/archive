@@ -1,4 +1,11 @@
-use std::sync::Arc;
+use std::{
+    process,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use rmcp::{
     ServiceExt,
@@ -14,7 +21,11 @@ use crate::merman::{self, MermaidResult};
 #[derive(Clone)]
 pub struct ArchiveMcp {
     database: Arc<Database>,
+    session_id: Arc<String>,
+    active_document: Arc<Mutex<Option<i64>>>,
 }
+
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchArgs {
@@ -115,9 +126,28 @@ impl From<Document> for SharedDocument {
 #[tool_router(server_handler)]
 impl ArchiveMcp {
     pub fn new(database: Database) -> Self {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         Self {
             database: Arc::new(database),
+            session_id: Arc::new(format!(
+                "mcp-{}-{nanos}-{}",
+                process::id(),
+                SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+            )),
+            active_document: Arc::new(Mutex::new(None)),
         }
+    }
+
+    fn claim(&self, document_id: i64) {
+        if let Ok(mut active_document) = self.active_document.lock() {
+            *active_document = Some(document_id);
+        }
+        let _ = self
+            .database
+            .set_agent_presence(&self.session_id, document_id);
     }
 
     #[tool(description = "Search shared Archive documents and return deterministic summaries")]
@@ -152,8 +182,11 @@ impl ArchiveMcp {
     ) -> Result<Json<SharedDocument>, String> {
         self.database
             .mcp_read_document(args.id)
-            .map(|document| Json(document.into()))
             .map_err(tool_error)
+            .map(|document| {
+                self.claim(document.id);
+                Json(document.into())
+            })
     }
 
     #[tool(
@@ -169,8 +202,11 @@ impl ArchiveMcp {
                 &args.body,
                 args.related_document_ids.as_deref().unwrap_or(&[]),
             )
-            .map(|document| Json(document.into()))
             .map_err(tool_error)
+            .map(|document| {
+                self.claim(document.id);
+                Json(document.into())
+            })
     }
 
     #[tool(description = "Append content to the shared user daily for an explicit YYYY-MM-DD day")]
@@ -180,8 +216,11 @@ impl ArchiveMcp {
     ) -> Result<Json<SharedDocument>, String> {
         self.database
             .mcp_append_to_daily(&args.day, &args.body)
-            .map(|document| Json(document.into()))
             .map_err(tool_error)
+            .map(|document| {
+                self.claim(document.id);
+                Json(document.into())
+            })
     }
 
     #[tool(description = "Validate Mermaid source and return its type and structured diagnostics")]
@@ -194,11 +233,29 @@ impl ArchiveMcp {
 }
 
 pub async fn run(database: Database) -> Result<(), Box<dyn std::error::Error>> {
-    ArchiveMcp::new(database)
-        .serve(stdio())
-        .await?
-        .waiting()
-        .await?;
+    let archive = ArchiveMcp::new(database);
+    let service = archive.clone().serve(stdio()).await?;
+    let heartbeat_archive = archive.clone();
+    let heartbeat = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+            let id = heartbeat_archive
+                .active_document
+                .lock()
+                .ok()
+                .and_then(|value| *value);
+            if let Some(id) = id {
+                let _ = heartbeat_archive
+                    .database
+                    .set_agent_presence(&heartbeat_archive.session_id, id);
+            }
+        }
+    });
+    let result = service.waiting().await;
+    heartbeat.abort();
+    let _ = heartbeat.await;
+    archive.database.remove_presence(&archive.session_id)?;
+    result?;
     Ok(())
 }
 

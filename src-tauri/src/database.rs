@@ -10,7 +10,9 @@ use chrono::{Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+const MAX_SESSION_ID_BYTES: usize = 128;
+const PRESENCE_TTL_SECONDS: i64 = 10;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const SEARCH_RESULT_LIMIT: usize = 50;
 const MAX_REFERENCE_IDS: usize = 200;
@@ -27,6 +29,14 @@ pub struct Document {
     pub created_at: String,
     pub updated_at: String,
     pub body: String,
+    pub revision: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SyncSnapshot {
+    pub document: Option<Document>,
+    pub user_count: usize,
+    pub agent_present: bool,
 }
 
 pub type DocumentSummary = Document;
@@ -50,6 +60,7 @@ pub enum Error {
     TooManyReferenceIds,
     SearchQueryTooLarge,
     InvalidLimit,
+    InvalidSessionId,
     InvalidMermaid(String),
     MissingDocument(i64),
     CannotDeleteDaily,
@@ -83,6 +94,10 @@ impl fmt::Display for Error {
             Self::InvalidLimit => write!(
                 formatter,
                 "limit must be between 1 and {SEARCH_RESULT_LIMIT}"
+            ),
+            Self::InvalidSessionId => write!(
+                formatter,
+                "session id must be non-empty and at most {MAX_SESSION_ID_BYTES} bytes"
             ),
             Self::InvalidMermaid(message) => message.fmt(formatter),
             Self::MissingDocument(id) => write!(formatter, "document {id} does not exist"),
@@ -129,6 +144,7 @@ impl Database {
 
     fn from_connection(mut connection: Connection) -> Result<Self, Error> {
         connection.busy_timeout(Duration::from_secs(5))?;
+        connection.pragma_update(None, "foreign_keys", true)?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         migrate(&mut connection)?;
         Ok(Self {
@@ -176,7 +192,7 @@ impl Database {
         validate_id(id)?;
         let connection = self.connection()?;
         if connection.execute(
-            "UPDATE documents SET body = ?1, updated_at = ?2 WHERE id = ?3",
+            "UPDATE documents SET body = ?1, updated_at = ?2, revision = revision + 1 WHERE id = ?3",
             params![body, now(), id],
         )? == 0
         {
@@ -188,23 +204,77 @@ impl Database {
     pub fn replace_document_body(
         &self,
         id: i64,
-        expected_body: &str,
+        expected_revision: i64,
         body: &str,
     ) -> Result<Document, Error> {
         validate_id(id)?;
         let connection = self.connection()?;
-        if connection.execute(
-            "UPDATE documents SET body = ?1, updated_at = ?2 WHERE id = ?3 AND body = ?4",
-            params![body, now(), id, expected_body],
-        )? == 0
-        {
-            return if get_document_from(&connection, id)?.is_some() {
-                Err(Error::WriteConflict)
-            } else {
-                Err(Error::MissingDocument(id))
-            };
+        let updated = connection
+            .query_row(
+                "UPDATE documents SET body = ?1, updated_at = ?2, revision = revision + 1
+                 WHERE id = ?3 AND revision = ?4
+                 RETURNING id, kind, visibility, author, day, created_at, updated_at, body, revision",
+                params![body, now(), id, expected_revision],
+                document_from_row,
+            )
+            .optional()?;
+        if let Some(document) = updated {
+            return Ok(document);
         }
-        get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))
+        if get_document_from(&connection, id)?.is_some() {
+            Err(Error::WriteConflict)
+        } else {
+            Err(Error::MissingDocument(id))
+        }
+    }
+
+    pub fn sync_document(&self, id: i64, known_revision: i64) -> Result<SyncSnapshot, Error> {
+        validate_id(id)?;
+        let connection = self.connection()?;
+        let document = get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))?;
+        let (user_count, agent_present) = presence_snapshot(&connection, id)?;
+        let document = (document.revision > known_revision).then_some(document);
+        Ok(SyncSnapshot {
+            document,
+            user_count,
+            agent_present,
+        })
+    }
+
+    pub fn set_presence(
+        &self,
+        session_id: &str,
+        actor: &str,
+        document_id: i64,
+    ) -> Result<(), Error> {
+        validate_session_id(session_id)?;
+        validate_id(document_id)?;
+        if !matches!(actor, "user" | "agent") {
+            return Err(Error::InvalidSessionId);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if actor == "agent" && get_shared_document_from(&transaction, document_id)?.is_none() {
+            return Err(Error::MissingDocument(document_id));
+        }
+        if actor == "user" && get_document_from(&transaction, document_id)?.is_none() {
+            return Err(Error::MissingDocument(document_id));
+        }
+        delete_stale_presence(&transaction)?;
+        transaction.execute("INSERT INTO presence(session_id, actor, document_id, last_heartbeat) VALUES(?1, ?2, ?3, unixepoch()) ON CONFLICT(session_id) DO UPDATE SET actor=excluded.actor, document_id=excluded.document_id, last_heartbeat=excluded.last_heartbeat", params![session_id, actor, document_id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn set_agent_presence(&self, session_id: &str, document_id: i64) -> Result<(), Error> {
+        self.set_presence(session_id, "agent", document_id)
+    }
+
+    pub fn remove_presence(&self, session_id: &str) -> Result<(), Error> {
+        validate_session_id(session_id)?;
+        self.connection()?
+            .execute("DELETE FROM presence WHERE session_id=?1", [session_id])?;
+        Ok(())
     }
 
     pub fn delete_note(&self, id: i64) -> Result<(), Error> {
@@ -236,7 +306,7 @@ impl Database {
         let pattern = format!("%{}%", escape_like(query));
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, kind, visibility, author, day, created_at, updated_at, body FROM documents
+            "SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents
              WHERE body LIKE ?2 ESCAPE '\\' OR day LIKE ?2 ESCAPE '\\'
              ORDER BY (day = ?1) DESC, abs(julianday(day) - julianday(?1)) ASC,
                       CASE kind WHEN 'daily' THEN 0 ELSE 1 END ASC, day DESC, created_at DESC, id DESC LIMIT ?3")?;
@@ -287,7 +357,7 @@ impl Database {
         }
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, kind, visibility, author, day, created_at, updated_at, body FROM documents
+            "SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents
              WHERE visibility = 'shared' ORDER BY updated_at DESC, id DESC",
         )?;
         let documents = statement
@@ -377,7 +447,7 @@ impl Database {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let timestamp = now();
-        transaction.execute("INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body) VALUES ('daily', 'shared', 'user', ?1, ?2, ?2, '') ON CONFLICT(day) WHERE kind = 'daily' DO NOTHING", params![day, timestamp])?;
+        let inserted = transaction.execute("INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body) VALUES ('daily', 'shared', 'user', ?1, ?2, ?2, '') ON CONFLICT(day) WHERE kind = 'daily' DO NOTHING", params![day, timestamp])?;
         let current = get_daily(&transaction, day)?.ok_or(Error::MissingDocument(0))?;
         let joined = if current.body.is_empty() {
             body.to_owned()
@@ -386,8 +456,8 @@ impl Database {
         };
         validate_body_size(&joined)?;
         transaction.execute(
-            "UPDATE documents SET body = ?1, updated_at = ?2 WHERE id = ?3",
-            params![joined, now(), current.id],
+            "UPDATE documents SET body = ?1, updated_at = ?2, revision = revision + ?4 WHERE id = ?3",
+            params![joined, now(), current.id, i64::from(inserted == 0)],
         )?;
         let document = get_document_from(&transaction, current.id)?
             .ok_or(Error::MissingDocument(current.id))?;
@@ -471,6 +541,20 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
              DROP TABLE documents_v2;"
         )?;
     }
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 3 {
+        transaction.execute_batch(
+            "ALTER TABLE documents ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+             CREATE TABLE presence (
+                session_id TEXT PRIMARY KEY,
+                actor TEXT NOT NULL CHECK(actor IN ('user', 'agent')),
+                document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                last_heartbeat INTEGER NOT NULL
+             );
+             CREATE INDEX presence_document ON presence(document_id);
+             PRAGMA user_version = 4;",
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -494,6 +578,13 @@ fn validate_visibility(value: &str) -> Result<(), Error> {
         Ok(())
     } else {
         Err(Error::InvalidVisibility)
+    }
+}
+fn validate_session_id(value: &str) -> Result<(), Error> {
+    if value.is_empty() || value.len() > MAX_SESSION_ID_BYTES {
+        Err(Error::InvalidSessionId)
+    } else {
+        Ok(())
     }
 }
 fn validate_query(query: &str) -> Result<(), Error> {
@@ -575,7 +666,23 @@ fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
         body: row.get(7)?,
+        revision: row.get(8)?,
     })
+}
+fn delete_stale_presence(connection: &Connection) -> Result<(), Error> {
+    connection.execute(
+        "DELETE FROM presence WHERE last_heartbeat < unixepoch() - ?1",
+        [PRESENCE_TTL_SECONDS],
+    )?;
+    Ok(())
+}
+fn presence_snapshot(connection: &Connection, id: i64) -> Result<(usize, bool), Error> {
+    let (users, agents): (i64, i64) = connection.query_row(
+        "SELECT count(*) FILTER (WHERE actor='user'), count(*) FILTER (WHERE actor='agent') FROM presence WHERE document_id=?1 AND last_heartbeat >= unixepoch() - ?2",
+        params![id, PRESENCE_TTL_SECONDS],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok((users as usize, agents > 0))
 }
 fn reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceSummary> {
     let id = row.get(0)?;
@@ -595,13 +702,13 @@ fn reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceSumm
     })
 }
 fn get_document_from(connection: &Connection, id: i64) -> Result<Option<Document>, Error> {
-    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body FROM documents WHERE id = ?1", [id], document_from_row).optional()?)
+    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents WHERE id = ?1", [id], document_from_row).optional()?)
 }
 fn get_shared_document_from(connection: &Connection, id: i64) -> Result<Option<Document>, Error> {
-    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body FROM documents WHERE id = ?1 AND visibility = 'shared'", [id], document_from_row).optional()?)
+    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents WHERE id = ?1 AND visibility = 'shared'", [id], document_from_row).optional()?)
 }
 fn get_daily(connection: &Connection, day: &str) -> Result<Option<Document>, Error> {
-    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body FROM documents WHERE kind = 'daily' AND day = ?1", [day], document_from_row).optional()?)
+    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents WHERE kind = 'daily' AND day = ?1", [day], document_from_row).optional()?)
 }
 fn resolve_shared_references(
     connection: &Connection,
@@ -764,13 +871,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_schema_is_v3_with_constraints() {
+    fn fresh_schema_is_v4_with_constraints() {
         let database = database();
         let connection = database.connection.lock().unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','private','user','2026-01-01','a','a','')", []).is_err());
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','shared','agent','2026-01-01','a','a','')", []).is_err());
     }
@@ -821,6 +928,19 @@ mod tests {
             (&row.visibility, &row.author),
             (&"shared".to_owned(), &"user".to_owned())
         );
+    }
+
+    #[test]
+    fn v3_migration_assigns_revision_one() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        {
+            let tx = connection.transaction().unwrap();
+            create_v3_schema(&tx).unwrap();
+            tx.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('note','shared','user','2026-08-04','a','b','body')", []).unwrap();
+            tx.commit().unwrap();
+        }
+        let database = Database::from_connection(connection).unwrap();
+        assert_eq!(database.get_document(1).unwrap().revision, 1);
     }
 
     #[test]
@@ -1028,11 +1148,75 @@ mod tests {
         let first = d.mcp_append_to_daily("2026-08-04", "one").unwrap();
         let second = d.mcp_append_to_daily("2026-08-04", "two").unwrap();
         assert_eq!(first.id, second.id);
+        assert_eq!(first.revision, 1);
+        assert_eq!(second.revision, 2);
         assert_eq!(second.body, "one\n\ntwo");
         assert_eq!(
             (&second.visibility, &second.author),
             (&"shared".to_owned(), &"user".to_owned())
         );
+    }
+
+    #[test]
+    fn revisions_poll_cross_connections_and_presence_are_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.sqlite3");
+        let gui = Database::open(&path).unwrap();
+        let other = Database::open(&path).unwrap();
+        let initial = gui.get_or_create_daily("2026-08-04").unwrap();
+        assert_eq!(initial.revision, 1);
+        assert!(gui.sync_document(initial.id, 1).unwrap().document.is_none());
+        let changed = other
+            .replace_document_body(initial.id, 1, "changed")
+            .unwrap();
+        assert_eq!(changed.revision, 2);
+        assert_eq!(
+            gui.sync_document(initial.id, 1)
+                .unwrap()
+                .document
+                .unwrap()
+                .body,
+            "changed"
+        );
+        assert!(matches!(
+            gui.replace_document_body(initial.id, 1, "stale"),
+            Err(Error::WriteConflict)
+        ));
+
+        gui.set_presence("user-one", "user", initial.id).unwrap();
+        gui.set_agent_presence("agent-one", initial.id).unwrap();
+        let snapshot = gui.sync_document(initial.id, 2).unwrap();
+        assert_eq!((snapshot.user_count, snapshot.agent_present), (1, true));
+        assert_eq!(gui.get_document(initial.id).unwrap().revision, 2);
+        let note = gui.create_note("2026-08-04", "shared").unwrap();
+        gui.set_presence("user-one", "user", note.id).unwrap();
+        assert_eq!(gui.sync_document(initial.id, 2).unwrap().user_count, 0);
+        gui.remove_presence("agent-one").unwrap();
+        assert!(!gui.sync_document(initial.id, 2).unwrap().agent_present);
+    }
+
+    #[test]
+    fn stale_presence_expires_and_agents_cannot_claim_private_documents() {
+        let d = database();
+        let shared = d.create_note("2026-08-04", "shared").unwrap();
+        let private = d.create_note("2026-08-04", "private").unwrap();
+        d.set_presence("stale", "user", shared.id).unwrap();
+        d.connection
+            .lock()
+            .unwrap()
+            .execute("UPDATE presence SET last_heartbeat=unixepoch()-11", [])
+            .unwrap();
+        assert_eq!(d.sync_document(shared.id, 1).unwrap().user_count, 0);
+        assert!(matches!(
+            d.set_agent_presence("agent", private.id),
+            Err(Error::MissingDocument(_))
+        ));
+        assert!(matches!(
+            d.set_agent_presence("agent", private.id + 1000),
+            Err(Error::MissingDocument(_))
+        ));
+        d.set_presence("private-user", "user", private.id).unwrap();
+        assert_eq!(d.sync_document(private.id, 1).unwrap().user_count, 1);
     }
 
     #[test]
@@ -1080,7 +1264,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            gui.replace_document_body(daily.id, "user text", "user edit"),
+            gui.replace_document_body(daily.id, 2, "user edit"),
             Err(Error::WriteConflict)
         ));
         assert_eq!(

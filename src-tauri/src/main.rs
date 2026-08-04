@@ -2,7 +2,7 @@ mod database;
 mod mcp;
 mod merman;
 
-use database::{Database, Document, DocumentSummary, ReferenceSummary};
+use database::{Database, Document, DocumentSummary, ReferenceSummary, SyncSnapshot};
 use tauri::{Manager, State};
 
 #[tauri::command]
@@ -42,11 +42,40 @@ fn get_document(database: State<'_, Database>, id: i64) -> Result<Document, Stri
 fn update_document_body(
     database: State<'_, Database>,
     id: i64,
-    expected_body: String,
+    expected_revision: i64,
     body: String,
 ) -> Result<Document, String> {
     database
-        .replace_document_body(id, &expected_body, &body)
+        .replace_document_body(id, expected_revision, &body)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn sync_document(
+    database: State<'_, Database>,
+    id: i64,
+    known_revision: i64,
+) -> Result<SyncSnapshot, String> {
+    database
+        .sync_document(id, known_revision)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn update_presence(
+    database: State<'_, Database>,
+    session_id: String,
+    document_id: i64,
+) -> Result<(), String> {
+    database
+        .set_presence(&session_id, "user", document_id)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn remove_presence(database: State<'_, Database>, session_id: String) -> Result<(), String> {
+    database
+        .remove_presence(&session_id)
         .map_err(|error| error.to_string())
 }
 
@@ -100,6 +129,9 @@ fn run_gui() {
             create_note,
             get_document,
             update_document_body,
+            sync_document,
+            update_presence,
+            remove_presence,
             delete_note,
             search_documents,
             resolve_references,
