@@ -1,0 +1,283 @@
+use std::sync::Arc;
+
+use rmcp::{
+    ServiceExt,
+    handler::server::wrapper::{Json, Parameters},
+    schemars, tool, tool_router,
+    transport::stdio,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::database::{Database, Document, Error};
+
+#[derive(Clone)]
+pub struct ArchiveMcp {
+    database: Arc<Database>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchArgs {
+    query: String,
+    limit: Option<usize>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ReadArgs {
+    id: i64,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct CreateArtifactArgs {
+    title: String,
+    body: String,
+    related_document_ids: Option<Vec<i64>>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AppendArgs {
+    day: String,
+    body: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct DocumentSummary {
+    id: i64,
+    kind: String,
+    author: String,
+    day: String,
+    label: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct SharedDocument {
+    id: i64,
+    kind: String,
+    author: String,
+    day: String,
+    created_at: String,
+    updated_at: String,
+    body: String,
+}
+
+fn tool_error(error: Error) -> String {
+    if matches!(error, Error::MissingDocument(_)) {
+        "document not found".to_owned()
+    } else {
+        error.to_string()
+    }
+}
+
+fn label(document: &Document) -> String {
+    if document.kind == "daily" {
+        return document.day.clone();
+    }
+    let line = document
+        .body
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
+    let value = if (1..=6).contains(&hashes)
+        && line[hashes..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+    {
+        line[hashes..].trim()
+    } else {
+        line
+    };
+    if value.is_empty() {
+        "Untitled note".to_owned()
+    } else {
+        value.to_owned()
+    }
+}
+
+impl From<Document> for SharedDocument {
+    fn from(document: Document) -> Self {
+        Self {
+            id: document.id,
+            kind: document.kind,
+            author: document.author,
+            day: document.day,
+            created_at: document.created_at,
+            updated_at: document.updated_at,
+            body: document.body,
+        }
+    }
+}
+
+#[tool_router(server_handler)]
+impl ArchiveMcp {
+    pub fn new(database: Database) -> Self {
+        Self {
+            database: Arc::new(database),
+        }
+    }
+
+    #[tool(description = "Search shared Archive documents and return deterministic summaries")]
+    fn search_documents(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<Json<Vec<DocumentSummary>>, String> {
+        self.database
+            .mcp_search_documents(&args.query, args.limit.unwrap_or(20))
+            .map(|documents| {
+                Json(
+                    documents
+                        .into_iter()
+                        .map(|document| DocumentSummary {
+                            label: label(&document),
+                            id: document.id,
+                            kind: document.kind.clone(),
+                            author: document.author,
+                            day: document.day,
+                            updated_at: document.updated_at,
+                        })
+                        .collect(),
+                )
+            })
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Read one shared Archive document by its positive ID")]
+    fn read_document(
+        &self,
+        Parameters(args): Parameters<ReadArgs>,
+    ) -> Result<Json<SharedDocument>, String> {
+        self.database
+            .mcp_read_document(args.id)
+            .map(|document| Json(document.into()))
+            .map_err(tool_error)
+    }
+
+    #[tool(
+        description = "Create a shared agent-authored artifact with optional links to shared documents"
+    )]
+    fn create_artifact(
+        &self,
+        Parameters(args): Parameters<CreateArtifactArgs>,
+    ) -> Result<Json<SharedDocument>, String> {
+        self.database
+            .mcp_create_artifact(
+                &args.title,
+                &args.body,
+                args.related_document_ids.as_deref().unwrap_or(&[]),
+            )
+            .map(|document| Json(document.into()))
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Append content to the shared user daily for an explicit YYYY-MM-DD day")]
+    fn append_to_daily(
+        &self,
+        Parameters(args): Parameters<AppendArgs>,
+    ) -> Result<Json<SharedDocument>, String> {
+        self.database
+            .mcp_append_to_daily(&args.day, &args.body)
+            .map(|document| Json(document.into()))
+            .map_err(tool_error)
+    }
+}
+
+pub async fn run(database: Database) -> Result<(), Box<dyn std::error::Error>> {
+    ArchiveMcp::new(database)
+        .serve(stdio())
+        .await?
+        .waiting()
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rmcp::model::CallToolRequestParams;
+
+    fn server() -> ArchiveMcp {
+        ArchiveMcp::new(Database::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap())
+    }
+
+    #[test]
+    fn generated_router_has_exactly_four_structured_tools() {
+        let tools = ArchiveMcp::tool_router().list_all();
+        assert_eq!(tools.len(), 4);
+        assert_eq!(
+            tools
+                .iter()
+                .map(|tool| tool.name.as_ref())
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "append_to_daily",
+                "create_artifact",
+                "read_document",
+                "search_documents"
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
+    }
+
+    #[test]
+    fn private_and_missing_errors_are_exactly_identical() {
+        let archive = server();
+        let private = archive
+            .database
+            .create_note("2026-08-04", "private")
+            .unwrap();
+        let private_error = archive
+            .read_document(Parameters(ReadArgs { id: private.id }))
+            .err()
+            .expect("private document must not be readable");
+        let missing_error = archive
+            .read_document(Parameters(ReadArgs {
+                id: private.id + 1000,
+            }))
+            .err()
+            .expect("missing document must not be readable");
+        assert_eq!(private_error, missing_error);
+        assert_eq!(private_error, "document not found");
+    }
+
+    #[tokio::test]
+    async fn duplex_initialization_framing_dispatch_and_malformed_arguments() {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+        let task = tokio::spawn(async move {
+            server()
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap()
+        });
+        let client = ().serve(client_transport).await.unwrap();
+        let result = client
+            .call_tool(
+                CallToolRequestParams::new("append_to_daily").with_arguments(
+                    serde_json::json!({"day":"2026-08-04","body":"hello"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.structured_content.unwrap()["body"], "hello");
+        let malformed = client
+            .call_tool(
+                CallToolRequestParams::new("read_document").with_arguments(
+                    serde_json::json!({"id":"wrong"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.is_error, Some(true));
+        client.cancel().await.unwrap();
+        task.await.unwrap();
+    }
+}
