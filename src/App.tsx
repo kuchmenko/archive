@@ -690,27 +690,35 @@ export function App() {
       </main>
 
       <footer
-        className="flex items-center justify-between border-t border-border/70 bg-[#17191f] px-3 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground select-none"
+        className="grid grid-cols-[minmax(0,1fr)_minmax(0,auto)_minmax(0,1fr)] items-center border-t border-border/70 bg-[#17191f] px-3 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground select-none"
         data-tauri-drag-region
       >
-        <span data-tauri-drag-region>
+        <span className="min-w-0 truncate justify-self-start" data-status-region="identity" data-tauri-drag-region>
           Archive <span className="px-1 text-border">·</span> {vimMode}
         </span>
-        {active && (
-          <span className="normal-case" data-tauri-drag-region>
+        <span
+          className="min-w-0 max-w-full truncate px-3 text-center normal-case"
+          data-status-region="document"
+          data-tauri-drag-region
+        >
+          {active && (
+            <>
             {activeIndex + 1}/{buffers.length} · {documentLabel(active)}
             {active.visibility === "private" ? " · Private" : ""}
             {active.kind === "artifact" ? " · Artifact" : ""}
             {active.author === "agent" ? " · Agent" : ""}
             {presence.userCount > 1 ? ` · ${presence.userCount} viewers` : ""}
             {active.visibility === "shared" && presence.agentPresent ? " · ✦ Agent present" : ""}
-          </span>
-        )}
-        {transientStatus && (
-          <span className={saveState.kind === "error" ? "text-destructive" : ""} data-tauri-drag-region>
-            {transientStatus}
-          </span>
-        )}
+            </>
+          )}
+        </span>
+        <span
+          className={`min-w-0 max-w-full truncate justify-self-end text-right ${saveState.kind === "error" ? "text-destructive" : ""}`}
+          data-status-region="persistence"
+          data-tauri-drag-region
+        >
+          {transientStatus}
+        </span>
       </footer>
 
       <CommandDialog

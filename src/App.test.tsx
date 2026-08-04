@@ -79,6 +79,7 @@ describe("Archive document canvas", () => {
       body,
       revision: expectedRevision + 1,
     }));
+    vi.mocked(readText).mockResolvedValue("");
   });
 
   afterEach(() => {
@@ -98,6 +99,27 @@ describe("Archive document canvas", () => {
     await act(async () => Promise.resolve());
     expect(createNote).toHaveBeenCalledWith("2026-08-03", "shared");
     expect(screen.getByRole("heading", { name: "Untitled note" })).toBeTruthy();
+  });
+
+  it("keeps identity, document, and transient persistence in stable footer regions", async () => {
+    vi.mocked(readText).mockResolvedValue("draft");
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+
+    const footer = container.querySelector("footer")!;
+    const identity = footer.querySelector('[data-status-region="identity"]')!;
+    const document = footer.querySelector('[data-status-region="document"]')!;
+    const persistence = footer.querySelector('[data-status-region="persistence"]')!;
+    expect(footer.className).toContain("grid-cols-[minmax(0,1fr)_minmax(0,auto)_minmax(0,1fr)]");
+    expect(identity.textContent).toContain("Archive");
+    expect(document.textContent).toContain("1/1 · Monday, August 3, 2026");
+    expect(persistence.textContent).toBe("");
+
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    await act(async () => Promise.resolve());
+    expect(persistence.textContent).toBe("Saving…");
+    expect(document.textContent).toContain("1/1 · Monday, August 3, 2026");
+    expect(persistence.className).toContain("justify-self-end");
   });
 
   it("Ctrl+Shift+N creates and focuses a private note", async () => {

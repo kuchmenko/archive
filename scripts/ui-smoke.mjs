@@ -225,6 +225,28 @@ try {
   await page.getByRole("heading", { name: "Monday, August 3, 2026" }).waitFor();
   await editor.waitFor();
   assert((await editor.count()) === 1, "Startup did not render exactly one editor");
+  const footer = page.locator("footer");
+  const identityStatus = footer.locator('[data-status-region="identity"]');
+  const documentStatus = footer.locator('[data-status-region="document"]');
+  const persistenceStatus = footer.locator('[data-status-region="persistence"]');
+  const footerBox = await footer.boundingBox();
+  const documentBox = await documentStatus.boundingBox();
+  assert(footerBox && documentBox, "Status geometry is unavailable");
+  assert(Math.abs(documentBox.x + documentBox.width / 2 - (footerBox.x + footerBox.width / 2)) < 1, "Document status is not centered against the full window");
+  assert((await identityStatus.innerText()).includes("ARCHIVE") && (await documentStatus.innerText()).includes("1/1 · Monday, August 3, 2026"), "Stable status regions contain the wrong information");
+  assert((await persistenceStatus.innerText()) === "", "Persistence status is not initially empty");
+  await page.setViewportSize({ width: 420, height: 720 });
+  const narrowStatus = await documentStatus.evaluate((element) => ({
+    overflow: getComputedStyle(element).overflow,
+    whiteSpace: getComputedStyle(element).whiteSpace,
+    textOverflow: getComputedStyle(element).textOverflow,
+    footerOverflow: element.closest("footer").scrollWidth - element.closest("footer").clientWidth,
+  }));
+  const narrowFooterBox = await footer.boundingBox();
+  const narrowDocumentBox = await documentStatus.boundingBox();
+  assert(narrowFooterBox && narrowDocumentBox && Math.abs(narrowDocumentBox.x + narrowDocumentBox.width / 2 - (narrowFooterBox.x + narrowFooterBox.width / 2)) < 1, "Narrow document status lost full-window centering");
+  assert(narrowStatus.overflow === "hidden" && narrowStatus.whiteSpace === "nowrap" && narrowStatus.textOverflow === "ellipsis" && narrowStatus.footerOverflow <= 0, "Narrow status does not truncate without overflowing");
+  await page.setViewportSize({ width: 960, height: 720 });
   const startupCalls = await calls("get_or_create_daily");
   assert(startupCalls.length === 1 && startupCalls[0].args.day === "2026-08-03", "Startup did not request the canonical daily");
   await page.keyboard.press("Shift+H");
@@ -342,6 +364,13 @@ try {
   await page.keyboard.press("i");
   await mode("INSERT").waitFor();
   await page.keyboard.type("Draft body ");
+  const savingFooterBox = await footer.boundingBox();
+  const savingDocumentBox = await documentStatus.boundingBox();
+  const savingPersistenceBox = await persistenceStatus.boundingBox();
+  assert((await persistenceStatus.textContent()) === "Saving…", "Transient save status is not in the persistence region");
+  assert(savingFooterBox && savingDocumentBox && savingPersistenceBox, "Saving status geometry is unavailable");
+  assert(Math.abs(savingDocumentBox.x + savingDocumentBox.width / 2 - (savingFooterBox.x + savingFooterBox.width / 2)) < 1, "Saving status shifted the centered document information");
+  assert(savingPersistenceBox.x + savingPersistenceBox.width > savingFooterBox.x + savingFooterBox.width / 2 && savingPersistenceBox.x + savingPersistenceBox.width <= savingFooterBox.x + savingFooterBox.width, "Saving status is not bottom-right aligned");
   await page.evaluate(async () => {
     await window.__tauriCallbacks[0]({
       event: "tauri://close-requested",
