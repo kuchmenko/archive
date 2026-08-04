@@ -1,8 +1,19 @@
 mod database;
 mod mcp;
+mod merman;
 
 use database::{Database, Document, DocumentSummary, ReferenceSummary};
 use tauri::{Manager, State};
+
+#[tauri::command]
+async fn render_mermaid(
+    source: String,
+    diagram_id: String,
+) -> Result<merman::MermaidResult, String> {
+    tokio::task::spawn_blocking(move || merman::render(&source, &diagram_id))
+        .await
+        .map_err(|error| error.to_string())
+}
 
 #[tauri::command]
 fn get_or_create_daily(database: State<'_, Database>, day: String) -> Result<Document, String> {
@@ -91,7 +102,8 @@ fn run_gui() {
             update_document_body,
             delete_note,
             search_documents,
-            resolve_references
+            resolve_references,
+            render_mermaid
         ])
         .run(tauri::generate_context!())
         .expect("failed to run Archive");

@@ -10,6 +10,9 @@ import {
 const vimMock = vi.hoisted(() => ({
   modeListener: null as ((event: { mode: string; subMode?: string }) => void) | null,
 }));
+const invokeMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 vi.mock("@replit/codemirror-vim", () => ({
   getCM: () => ({
@@ -256,5 +259,72 @@ describe("reference selection boundaries", () => {
     expect(selectionIntersectsReference({ from: 12, to: 12 }, reference)).toBe(false);
     expect(selectionIntersectsReference({ from: 0, to: 4 }, reference)).toBe(false);
     expect(selectionIntersectsReference({ from: 0, to: 5 }, reference)).toBe(true);
+  });
+});
+
+describe("Mermaid blocks", () => {
+  const body = "before\n```mermaid title=Main\ngraph TD\nA-->B\n```\nafter";
+  const props = {
+    entryId: 1,
+    body,
+    readOnly: false,
+    onChange: vi.fn(),
+    onClipboardError: vi.fn(),
+    onModeChange: vi.fn(),
+    onNewNote: () => false,
+    onNewPrivateNote: () => false,
+    onOpenCommands: () => false,
+    onOpenExplorer: () => false,
+    onOpenReference: () => false,
+    references: [],
+    onPreviousBuffer: () => false,
+    onNextBuffer: () => false,
+  };
+
+  beforeEach(() => {
+    invokeMock.mockReset();
+    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => new DOMRect();
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      queueMicrotask(() => callback(0));
+      return 0;
+    });
+  });
+
+  it("renders an inactive diagram and reveals source by click and keyboard", async () => {
+    invokeMock.mockResolvedValue({ valid: true, diagram_type: "flowchart", diagnostics: [], svg: '<svg viewBox="0 0 10 10"><path d="M0 0L10 10"/></svg>' });
+    const ref = createRef<MarkdownEditorHandle>();
+    const { container } = render(<MarkdownEditor ref={ref} {...props} />);
+    await act(async () => Promise.resolve());
+    const diagram = container.querySelector("button.cm-mermaid") as HTMLButtonElement;
+    expect(diagram.querySelector("svg")).not.toBeNull();
+    act(() => diagram.click());
+    expect(container.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    expect(container.querySelector(".cm-content")?.textContent).toContain("```mermaid");
+
+    act(() => ref.current?.focus(body.length));
+    const keyboardDiagram = container.querySelector("button.cm-mermaid") as HTMLButtonElement;
+    keyboardDiagram.focus();
+    keyboardDiagram.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    expect(container.querySelector(".cm-mermaid-preview")).not.toBeNull();
+    expect(container.querySelector(".cm-content")?.textContent).toContain("```mermaid");
+  });
+
+  it("keeps invalid source visible with a local diagnostic", async () => {
+    invokeMock.mockResolvedValue({ valid: false, diagnostics: [{ line: 2, column: 3, message: "Expected arrow" }] });
+    const { container } = render(<MarkdownEditor {...props} />);
+    await act(async () => Promise.resolve());
+    expect(container.querySelector(".cm-content")?.textContent).toContain("graph TD");
+    expect(container.querySelector(".cm-mermaid-diagnostic")?.textContent).toBe("Line 2:3: Expected arrow");
+  });
+
+  it("suppresses a response after the source changes", async () => {
+    let resolveFirst!: (value: unknown) => void;
+    invokeMock.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve; }));
+    const ref = createRef<MarkdownEditorHandle>();
+    const { container } = render(<MarkdownEditor ref={ref} {...props} />);
+    act(() => ref.current?.insertAt(body.indexOf("A-->B") + 1, "X"));
+    await act(async () => resolveFirst({ valid: true, diagnostics: [], svg: '<svg data-stale="true"/>' }));
+    expect(container.querySelector('[data-stale="true"]')).toBeNull();
   });
 });

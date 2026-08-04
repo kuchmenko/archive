@@ -9,6 +9,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::database::{Database, Document, Error};
+use crate::merman::{self, MermaidResult};
 
 #[derive(Clone)]
 pub struct ArchiveMcp {
@@ -34,6 +35,10 @@ struct CreateArtifactArgs {
 struct AppendArgs {
     day: String,
     body: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ValidateMermaidArgs {
+    source: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -178,6 +183,14 @@ impl ArchiveMcp {
             .map(|document| Json(document.into()))
             .map_err(tool_error)
     }
+
+    #[tool(description = "Validate Mermaid source and return its type and structured diagnostics")]
+    fn validate_mermaid(
+        &self,
+        Parameters(args): Parameters<ValidateMermaidArgs>,
+    ) -> Json<MermaidResult> {
+        Json(merman::validate(&args.source))
+    }
 }
 
 pub async fn run(database: Database) -> Result<(), Box<dyn std::error::Error>> {
@@ -199,9 +212,9 @@ mod tests {
     }
 
     #[test]
-    fn generated_router_has_exactly_four_structured_tools() {
+    fn generated_router_has_exactly_five_structured_tools() {
         let tools = ArchiveMcp::tool_router().list_all();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 5);
         assert_eq!(
             tools
                 .iter()
@@ -211,7 +224,8 @@ mod tests {
                 "append_to_daily",
                 "create_artifact",
                 "read_document",
-                "search_documents"
+                "search_documents",
+                "validate_mermaid"
             ]
             .into_iter()
             .collect()
@@ -253,6 +267,30 @@ mod tests {
                 .unwrap()
         });
         let client = ().serve(client_transport).await.unwrap();
+        let invalid = client
+            .call_tool(
+                CallToolRequestParams::new("validate_mermaid").with_arguments(
+                    serde_json::json!({"source":"flowchart TD\nA-->"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(invalid.structured_content.unwrap()["valid"], false);
+        let valid = client
+            .call_tool(
+                CallToolRequestParams::new("validate_mermaid").with_arguments(
+                    serde_json::json!({"source":"flowchart TD\nA-->B"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(valid.structured_content.unwrap()["valid"], true);
         let result = client
             .call_tool(
                 CallToolRequestParams::new("append_to_daily").with_arguments(

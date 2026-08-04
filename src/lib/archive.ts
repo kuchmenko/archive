@@ -22,6 +22,19 @@ export type ReferenceSummary = {
   label: string;
 };
 
+export type MermaidDiagnostic = {
+  line?: number;
+  column?: number;
+  message: string;
+};
+
+export type MermaidRender = {
+  valid: boolean;
+  diagram_type?: string;
+  diagnostics: MermaidDiagnostic[];
+  svg?: string;
+};
+
 export function getOrCreateDaily(day: string): Promise<Document> {
   return invoke("get_or_create_daily", { day });
 }
@@ -48,4 +61,8 @@ export function searchDocuments(activeDay: string, query: string): Promise<Docum
 
 export function resolveReferences(ids: number[]): Promise<ReferenceSummary[]> {
   return invoke("resolve_references", { ids });
+}
+
+export function renderMermaid(source: string, diagramId: string): Promise<MermaidRender> {
+  return invoke("render_mermaid", { source, diagramId });
 }

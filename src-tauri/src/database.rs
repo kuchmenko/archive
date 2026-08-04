@@ -50,6 +50,7 @@ pub enum Error {
     TooManyReferenceIds,
     SearchQueryTooLarge,
     InvalidLimit,
+    InvalidMermaid(String),
     MissingDocument(i64),
     CannotDeleteDaily,
     WriteConflict,
@@ -83,6 +84,7 @@ impl fmt::Display for Error {
                 formatter,
                 "limit must be between 1 and {SEARCH_RESULT_LIMIT}"
             ),
+            Self::InvalidMermaid(message) => message.fmt(formatter),
             Self::MissingDocument(id) => write!(formatter, "document {id} does not exist"),
             Self::CannotDeleteDaily => write!(formatter, "daily documents cannot be deleted"),
             Self::WriteConflict => write!(
@@ -322,6 +324,7 @@ impl Database {
     ) -> Result<Document, Error> {
         validate_title(title)?;
         validate_body_size(body)?;
+        crate::merman::validate_markdown_fences(body).map_err(Error::InvalidMermaid)?;
         let distinct_ids = distinct_valid_ids(related_ids)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -370,6 +373,7 @@ impl Database {
             return Err(Error::EmptyBody);
         }
         validate_body_size(body)?;
+        crate::merman::validate_markdown_fences(body).map_err(Error::InvalidMermaid)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let timestamp = now();
@@ -1028,6 +1032,39 @@ mod tests {
         assert_eq!(
             (&second.visibility, &second.author),
             (&"shared".to_owned(), &"user".to_owned())
+        );
+    }
+
+    #[test]
+    fn invalid_mermaid_rejects_create_and_append_without_mutation() {
+        let d = database();
+        let invalid = "```mermaid\nflowchart TD\nA-->\n```";
+        let create_error = d.mcp_create_artifact("Rejected", invalid, &[]).unwrap_err();
+        assert!(create_error.to_string().contains("Mermaid block 1"));
+        assert!(d.mcp_search_documents("Rejected", 50).unwrap().is_empty());
+
+        let daily = d.mcp_append_to_daily("2026-08-04", "before").unwrap();
+        let append_error = d.mcp_append_to_daily("2026-08-04", invalid).unwrap_err();
+        assert!(append_error.to_string().contains("Mermaid block 1"));
+        assert_eq!(d.get_document(daily.id).unwrap().body, "before");
+    }
+
+    #[test]
+    fn valid_mermaid_artifact_round_trips_and_existing_daily_is_not_revalidated() {
+        let d = database();
+        let body = "```mermaid\nsequenceDiagram\nAlice->>Bob: Hi\n```";
+        let artifact = d.mcp_create_artifact("Diagram", body, &[]).unwrap();
+        assert_eq!(
+            d.mcp_read_document(artifact.id).unwrap().body,
+            artifact.body
+        );
+
+        let daily = d.get_or_create_daily("2026-08-04").unwrap();
+        d.update_document_body(daily.id, "```mermaid\ninvalid")
+            .unwrap();
+        assert!(
+            d.mcp_append_to_daily("2026-08-04", "plain addition")
+                .is_ok()
         );
     }
 

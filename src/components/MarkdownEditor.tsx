@@ -1,11 +1,13 @@
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
-import { Compartment, EditorState, RangeSetBuilder } from "@codemirror/state";
+import { Compartment, EditorState, RangeSetBuilder, StateEffect, StateField } from "@codemirror/state";
 import { Decoration, drawSelection, EditorView, keymap, ViewPlugin, WidgetType } from "@codemirror/view";
 import { getCM, vim } from "@replit/codemirror-vim";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
+import DOMPurify from "dompurify";
 import { noteReferenceAt, parseNoteReferences } from "@/lib/documents";
-import type { ReferenceSummary } from "@/lib/archive";
+import { renderMermaid, type MermaidRender, type ReferenceSummary } from "@/lib/archive";
+import { mermaidBlockKey, mermaidBlocks, selectionIntersectsBlock, type MermaidBlock } from "@/lib/mermaid";
 import type { EditorSnapshot } from "@/lib/buffers";
 import { formatLocalDay } from "@/lib/date";
 import { appShortcut } from "@/lib/shortcuts";
@@ -85,7 +87,9 @@ function referenceDecorations(references: ReferenceSummary[], open: (id: number)
     }
     build(view: EditorView) {
       const builder = new RangeSetBuilder<Decoration>();
+      const blocks = mermaidBlocks(view.state);
       for (const reference of parseNoteReferences(view.state.doc.toString())) {
+        if (blocks.some((block) => reference.from >= block.from && reference.to <= block.to)) continue;
         if (view.state.selection.ranges.some((range) => selectionIntersectsReference(range, reference))) continue;
         const target = resolved.get(reference.id);
         builder.add(reference.from, reference.to, Decoration.replace({
@@ -102,6 +106,161 @@ function referenceDecorations(references: ReferenceSummary[], open: (id: number)
       return builder.finish();
     }
   }, { decorations: (plugin) => plugin.decorations });
+}
+
+function safeSvg(svg: string) {
+  const sanitized = DOMPurify.sanitize(svg, {
+    USE_PROFILES: { svg: true, svgFilters: true },
+    FORBID_TAGS: ["foreignObject", "script"],
+    FORBID_ATTR: ["href", "xlink:href"],
+  });
+  const parsed = new DOMParser().parseFromString(sanitized, "image/svg+xml");
+  const root = parsed.documentElement;
+  if (root.localName !== "svg" || parsed.querySelector("parsererror")) return null;
+  return document.importNode(root, true);
+}
+
+class MermaidWidget extends WidgetType {
+  constructor(
+    readonly block: MermaidBlock,
+    readonly result: MermaidRender | undefined,
+    readonly preview: boolean,
+  ) { super(); }
+
+  eq(other: MermaidWidget) {
+    return this.block.source === other.block.source && this.preview === other.preview && this.result === other.result;
+  }
+
+  toDOM() {
+    const valid = this.result?.valid && this.result.svg;
+    const element = document.createElement(this.preview ? "div" : "button");
+    const reveal = () => {
+      const view = EditorView.findFromDOM(element);
+      if (!view) return;
+      view.dispatch({ selection: { anchor: this.block.from } });
+      view.focus();
+    };
+    element.className = `cm-mermaid${this.preview ? " cm-mermaid-preview" : ""}`;
+    if (!this.preview) {
+      (element as HTMLButtonElement).type = "button";
+      element.setAttribute("aria-label", `Reveal Mermaid ${this.result?.diagram_type ?? "diagram"} source`);
+      element.addEventListener("click", reveal);
+      element.addEventListener("keydown", (event) => {
+        const keyboardEvent = event as KeyboardEvent;
+        if (keyboardEvent.key !== "Enter" && keyboardEvent.key !== " ") return;
+        event.preventDefault();
+        reveal();
+      });
+    }
+    if (valid) {
+      const imported = safeSvg(this.result!.svg!);
+      if (imported) element.append(imported);
+    } else if (this.result) {
+      const diagnostic = document.createElement("div");
+      diagnostic.className = "cm-mermaid-diagnostic";
+      const first = this.result.diagnostics[0];
+      diagnostic.textContent = first
+        ? `${first.line ? `Line ${first.line}${first.column ? `:${first.column}` : ""}: ` : ""}${first.message}`
+        : "Invalid Mermaid diagram";
+      element.append(diagnostic);
+    } else {
+      element.setAttribute("aria-busy", "true");
+      element.textContent = "Rendering diagram…";
+    }
+    return element;
+  }
+}
+
+const setMermaidResult = StateEffect.define<{ key: string; result: MermaidRender }>();
+
+function buildMermaidDecorations(state: EditorState, results: Map<string, MermaidRender>) {
+  const builder = new RangeSetBuilder<Decoration>();
+  for (const block of mermaidBlocks(state)) {
+    const result = results.get(mermaidBlockKey(block));
+    const active = result?.valid === false || state.selection.ranges.some((range) => selectionIntersectsBlock(range, block));
+    const widget = new MermaidWidget(block, result, active);
+    if (active) builder.add(block.to, block.to, Decoration.widget({ widget, block: true, side: 1 }));
+    else builder.add(block.from, block.to, Decoration.replace({ widget, block: true }));
+  }
+  return builder.finish();
+}
+
+const mermaidDecorationField = StateField.define<{ results: Map<string, MermaidRender>; decorations: ReturnType<typeof buildMermaidDecorations> }>({
+  create(state) {
+    const results = new Map<string, MermaidRender>();
+    return { results, decorations: buildMermaidDecorations(state, results) };
+  },
+  update(value, transaction) {
+    let results = value.results;
+    for (const effect of transaction.effects) if (effect.is(setMermaidResult)) {
+      results = new Map(results);
+      results.set(effect.value.key, effect.value.result);
+    }
+    if (transaction.docChanged || transaction.selection || results !== value.results) {
+      return { results, decorations: buildMermaidDecorations(transaction.state, results) };
+    }
+    return value;
+  },
+  provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
+});
+
+function mermaidRenderer(entryId: number) {
+  return ViewPlugin.fromClass(class {
+    timers = new Map<string, ReturnType<typeof setTimeout>>();
+    pending = new Set<string>();
+    generation = 0;
+    destroyed = false;
+
+    constructor(readonly view: EditorView) { this.requestBlocks(); }
+
+    update(update: { docChanged: boolean; selectionSet: boolean }) {
+      if (update.docChanged) {
+        this.generation += 1;
+        for (const timer of this.timers.values()) clearTimeout(timer);
+        this.timers.clear();
+        this.pending.clear();
+      }
+      if (update.docChanged || update.selectionSet) this.requestBlocks();
+    }
+
+    request(block: MermaidBlock, active: boolean) {
+      const key = mermaidBlockKey(block);
+      const cached = this.view.state.field(mermaidDecorationField).results;
+      if (cached.has(key) || this.timers.has(key) || this.pending.has(key)) return;
+      const generation = this.generation;
+      const run = () => {
+        this.timers.delete(key);
+        this.pending.add(key);
+        void renderMermaid(block.source, `archive-${entryId}-${block.from}`).then((result) => {
+          this.pending.delete(key);
+          if (this.destroyed || generation !== this.generation) return;
+          this.view.dispatch({ effects: setMermaidResult.of({ key, result }) });
+          this.view.requestMeasure();
+        }).catch((error: unknown) => {
+          this.pending.delete(key);
+          if (this.destroyed || generation !== this.generation) return;
+          const result = { valid: false, diagnostics: [{ message: error instanceof Error ? error.message : String(error) }] };
+          this.view.dispatch({ effects: setMermaidResult.of({ key, result }) });
+          this.view.requestMeasure();
+        });
+      };
+      if (active) this.timers.set(key, setTimeout(run, 250));
+      else run();
+    }
+
+    requestBlocks() {
+      for (const block of mermaidBlocks(this.view.state)) {
+        const active = this.view.state.selection.ranges.some((range) => selectionIntersectsBlock(range, block));
+        this.request(block, active);
+      }
+    }
+
+    destroy() {
+      this.destroyed = true;
+      this.generation += 1;
+      for (const timer of this.timers.values()) clearTimeout(timer);
+    }
+  });
 }
 
 export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorProps>(function MarkdownEditor(
@@ -199,6 +358,8 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
           readOnlyCompartment.of(EditorState.readOnly.of(readOnly)),
           keymap.of([...defaultKeymap, ...historyKeymap]),
           markdown(),
+          mermaidDecorationField,
+          mermaidRenderer(entryId),
           referencesCompartment.of(referenceDecorations(references, (id) => onOpenReferenceRef.current(id))),
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
@@ -228,6 +389,11 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
             ".cm-reference": { color: "#c6bda9", textDecoration: "underline", textDecorationColor: "#5d6675", textUnderlineOffset: "3px", cursor: "pointer" },
             ".cm-reference-daily": { color: "#b8c7d9" },
             ".cm-reference-broken": { color: "#bf7777", textDecorationStyle: "dotted" },
+            ".cm-mermaid": { display: "block", width: "100%", margin: "12px 0", padding: "14px", border: "1px solid #383e49", borderRadius: "6px", background: "#1b1e24", color: "#aeb5c0", textAlign: "left" },
+            "button.cm-mermaid": { cursor: "pointer" },
+            ".cm-mermaid-preview": { borderStyle: "dashed" },
+            ".cm-mermaid svg": { display: "block", width: "100%", maxWidth: "100%", height: "auto", maxHeight: "70vh", margin: "0 auto" },
+            ".cm-mermaid-diagnostic": { color: "#df8f8f", fontSize: "13px", lineHeight: "1.5" },
           }),
         ],
       }),

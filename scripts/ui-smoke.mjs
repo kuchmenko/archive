@@ -65,7 +65,7 @@ try {
         day: "2026-08-03",
         created_at: timestamp,
         updated_at: timestamp,
-        body: "# Agent research artifact\nUseful findings",
+        body: "# Agent research artifact\nUseful findings\n```mermaid\ngraph TD\nA-->B\n```",
       },
     ];
     let nextId = 5;
@@ -139,6 +139,15 @@ try {
               : (document.body.match(/^\s*#{1,6}\s+(.+)$/m)?.[1] ?? "Untitled note");
             return [{ id, kind: document.kind, day: document.day, label }];
           });
+        }
+        if (command === "render_mermaid") {
+          if (args.source.includes("INVALID")) return { valid: false, diagnostics: [{ line: 1, column: 1, message: "Invalid test diagram" }] };
+          return {
+            valid: true,
+            diagram_type: "flowchart",
+            diagnostics: [],
+            svg: '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 40" aria-label="Test flowchart"><path d="M5 20h100" stroke="currentColor"/><path d="m105 15 10 5-10 5" fill="none" stroke="currentColor"/></svg>',
+          };
         }
         if (command === "plugin:clipboard-manager|write_text") {
           if (window.__clipboardFailure) throw new Error("clipboard unavailable");
@@ -343,6 +352,31 @@ try {
   await page.keyboard.press("Enter");
   await page.getByRole("heading", { name: "Agent research artifact" }).waitFor();
   assert((await page.locator("footer").innerText()).includes("Artifact · Agent"), "Agent artifact status is not distinguished");
+  const diagram = page.locator("button.cm-mermaid");
+  await diagram.locator("svg").waitFor();
+  assert((await calls("render_mermaid")).some((call) => call.args.source === "graph TD\nA-->B"), "Inactive Mermaid source was not rendered lazily");
+  assert((await page.locator(".editor-toolbar, .editor-topbar, .editor-split, [data-mermaid-toolbar]").count()) === 0, "Mermaid added application chrome");
+  await diagram.click();
+  await page.locator(".cm-mermaid-preview svg").waitFor();
+  assert((await editorBody()).includes("```mermaid\ngraph TD\nA-->B\n```"), "Click did not reveal canonical Mermaid source");
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("k");
+  await diagram.waitFor();
+  await page.keyboard.press("v");
+  await page.keyboard.press("j");
+  await page.locator(".cm-mermaid-preview").waitFor();
+  assert((await editorBody()).includes("```mermaid"), "Visual selection intersecting Mermaid did not reveal source");
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("j");
+  await page.keyboard.press("i");
+  await page.keyboard.type("INVALID ");
+  await page.waitForTimeout(300);
+  await page.locator(".cm-mermaid-diagnostic", { hasText: "Invalid test diagram" }).waitFor();
+  const invalidBody = await editorBody();
+  assert(invalidBody.includes("INVALID") && invalidBody.includes("```mermaid"), "Invalid Mermaid edit did not preserve raw source");
+  const mermaidCalls = await calls("render_mermaid");
+  assert(mermaidCalls.some((call) => call.args.source.includes("INVALID")), "Debounced active Mermaid preview did not render the edited source");
+  await page.keyboard.press("Escape");
 
   const privateCountBefore = (await calls("create_note")).length;
   await page.keyboard.press("Control+Shift+n");
