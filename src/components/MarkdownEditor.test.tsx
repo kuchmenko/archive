@@ -280,6 +280,51 @@ describe("MarkdownEditor application shortcuts", () => {
     expect(container.querySelector(".cm-content")?.textContent).toContain("remote body");
     expect(onChange).not.toHaveBeenCalled();
   });
+
+  it("scrolls the page container to the top when the cursor moves to document start", async () => {
+    const body = `${"line\n".repeat(80)}end`;
+    const ref = createRef<MarkdownEditorHandle>();
+    const { container } = render(
+      <main style={{ height: 200, overflow: "auto" }}>
+        <div style={{ height: 80 }}>heading</div>
+        <MarkdownEditor
+          ref={ref}
+          entryId={1}
+          body={body}
+          readOnly={false}
+          onChange={vi.fn()}
+          onClipboardError={vi.fn()}
+          onModeChange={vi.fn()}
+          onNewNote={() => false}
+          onNewPrivateNote={() => false}
+          onOpenCommands={() => false}
+          onOpenExplorer={() => false}
+          references={[]}
+          onPreviousBuffer={() => false}
+          onNextBuffer={() => false}
+          onOpenReference={() => false}
+        />
+      </main>,
+    );
+    const page = container.querySelector("main") as HTMLElement;
+    Object.defineProperty(page, "scrollTop", {
+      configurable: true,
+      writable: true,
+      value: 240,
+    });
+
+    await act(async () => {
+      ref.current?.focus(body.length);
+      await Promise.resolve();
+    });
+    expect(page.scrollTop).toBe(240);
+
+    await act(async () => {
+      ref.current?.focus(0);
+      await Promise.resolve();
+    });
+    expect(page.scrollTop).toBe(0);
+  });
 });
 
 describe("reference selection boundaries", () => {

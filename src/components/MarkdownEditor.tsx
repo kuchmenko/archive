@@ -34,6 +34,29 @@ function minimalBodyChange(current: string, next: string) {
   return { from, to: currentTo, insert: next.slice(from, nextTo) };
 }
 
+function pageScrollContainer(view: EditorView): HTMLElement | null {
+  return view.dom.closest("main");
+}
+
+function scrollCursorIntoPage(view: EditorView) {
+  const container = pageScrollContainer(view);
+  if (!container) return;
+  const head = view.state.selection.main.head;
+  if (head === 0) {
+    container.scrollTop = 0;
+    return;
+  }
+  const coords = view.coordsAtPos(head);
+  if (!coords) return;
+  const bounds = container.getBoundingClientRect();
+  const margin = 32;
+  if (coords.top < bounds.top + margin) {
+    container.scrollTop += coords.top - bounds.top - margin;
+  } else if (coords.bottom > bounds.bottom - margin) {
+    container.scrollTop += coords.bottom - bounds.bottom + margin;
+  }
+}
+
 export type ExplorerOrigin = {
   documentId: number;
   cursor: number;
@@ -362,7 +385,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       const view = viewRef.current;
       if (!view) return null;
       const { anchor, head } = view.state.selection.main;
-      return { anchor, head, scrollTop: mount.current?.closest("main")?.scrollTop ?? 0 };
+      return { anchor, head, scrollTop: pageScrollContainer(view)?.scrollTop ?? 0 };
     },
   }));
 
@@ -398,6 +421,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
               !update.transactions.some((transaction) => transaction.annotation(externalDocumentUpdate))
             ) {
               onChangeRef.current(entryId, update.state.doc.toString());
+            }
+            if (update.selectionSet) {
+              scrollCursorIntoPage(update.view);
             }
           }),
           EditorView.theme({
