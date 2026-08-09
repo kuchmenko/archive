@@ -34,6 +34,35 @@ fn create_note(
         .create_note(&day, visibility.as_deref().unwrap_or("shared"))
         .map_err(|error| error.to_string())
 }
+#[tauri::command]
+fn create_project(
+    database: State<'_, Database>,
+    day: String,
+    visibility: Option<String>,
+) -> Result<Document, String> {
+    database
+        .create_project(&day, visibility.as_deref().unwrap_or("shared"))
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn add_document_to_project(
+    database: State<'_, Database>,
+    project_id: i64,
+    document_id: i64,
+) -> Result<(), String> {
+    database
+        .add_document_to_project(project_id, document_id, "user")
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn list_project_documents(
+    database: State<'_, Database>,
+    project_id: i64,
+) -> Result<Vec<Document>, String> {
+    database
+        .list_project_documents(project_id)
+        .map_err(|error| error.to_string())
+}
 
 #[tauri::command]
 fn get_document(database: State<'_, Database>, id: i64) -> Result<Document, String> {
@@ -139,6 +168,9 @@ fn run_gui() {
         .invoke_handler(tauri::generate_handler![
             get_or_create_daily,
             create_note,
+            create_project,
+            add_document_to_project,
+            list_project_documents,
             get_document,
             update_document_body,
             sync_document,

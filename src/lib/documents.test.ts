@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { Document } from "./archive";
 import {
+  documentLabel,
   escapeReferenceLabel,
   formatNoteReference,
   insertAt,
@@ -26,6 +27,12 @@ describe("document labels", () => {
     expect(noteTitle("\n  ## Heading  \nbody")).toBe("Heading");
     expect(noteTitle("#tag")).toBe("#tag");
     expect(noteTitle("\n \n")).toBe("Untitled note");
+  });
+
+  it("uses project-specific empty labels and Markdown titles", () => {
+    expect(documentLabel({ ...note(""), kind: "project" })).toBe("Untitled project");
+    expect(documentLabel({ ...note("\n## Archive foundation\nDetails"), kind: "project" })).toBe("Archive foundation");
+    expect(documentLabel(note(""))).toBe("Untitled note");
   });
 });
 

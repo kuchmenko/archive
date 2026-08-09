@@ -84,7 +84,7 @@ class ReferenceWidget extends WidgetType {
   constructor(
     readonly id: number,
     readonly label: string,
-    readonly kind: "daily" | "note" | "artifact" | "broken",
+    readonly kind: "daily" | "note" | "artifact" | "project" | "broken",
     readonly open: (id: number) => boolean,
   ) { super(); }
 

@@ -72,6 +72,7 @@ try {
       },
     ];
     let nextId = 5;
+    const projectDocuments = new Map();
     window.__archiveCalls = [];
     window.__tauriCallbacks = [];
     window.__clipboardFailure = false;
@@ -116,6 +117,22 @@ try {
           documents.push(note);
           return { ...note };
         }
+        if (command === "create_project") {
+          const project = { id: nextId++, kind: "project", visibility: args.visibility, author: "user", day: args.day, created_at: timestamp, updated_at: timestamp, body: "", revision: 1 };
+          documents.push(project);
+          projectDocuments.set(project.id, []);
+          return { ...project };
+        }
+        if (command === "add_document_to_project") {
+          const members = projectDocuments.get(args.projectId);
+          const document = documents.find((candidate) => candidate.id === args.documentId);
+          if (!members || !document || document.kind === "project") throw new Error("Document does not exist");
+          if (!members.includes(args.documentId)) members.push(args.documentId);
+          return null;
+        }
+        if (command === "list_project_documents") {
+          return (projectDocuments.get(args.projectId) ?? []).map((id) => ({ ...documents.find((document) => document.id === id) }));
+        }
         if (command === "get_document") {
           const document = documents.find((candidate) => candidate.id === args.id);
           if (!document) throw new Error(`Document ${args.id} does not exist`);
@@ -143,6 +160,11 @@ try {
           const index = documents.findIndex((candidate) => candidate.id === args.id);
           if (index < 0) throw new Error(`Document ${args.id} does not exist`);
           if (documents[index].kind === "daily") throw new Error("Daily documents cannot be deleted");
+          projectDocuments.delete(documents[index].id);
+          for (const members of projectDocuments.values()) {
+            const memberIndex = members.indexOf(args.id);
+            if (memberIndex >= 0) members.splice(memberIndex, 1);
+          }
           documents.splice(index, 1);
           return null;
         }
@@ -338,6 +360,7 @@ try {
   await page.keyboard.press("Escape");
   await explorer.waitFor({ state: "detached" });
   await editor.waitFor({ state: "visible" });
+  await page.waitForTimeout(10);
   await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
 
   await page.keyboard.type("  ");
@@ -519,6 +542,29 @@ try {
   const privateResult = explorer.locator('[data-slot="command-item"]', { hasText: "Untitled note" }).filter({ hasText: "Private" });
   await privateResult.waitFor();
   assert((await privateResult.innerText()).toLowerCase().includes("private"), "Private explorer metadata is missing");
+  await page.keyboard.press("Escape");
+
+  await page.keyboard.press("Control+o");
+  await page.locator('[data-slot="command-item"]', { hasText: "New project" }).click();
+  await page.getByRole("heading", { name: "Untitled project" }).waitFor();
+  await page.getByRole("heading", { name: "Project documents" }).waitFor();
+  assert((await calls("create_project")).length === 1, "New project did not invoke create_project");
+  await page.getByRole("button", { name: "Add document" }).click();
+  const addExplorer = page.getByRole("dialog", { name: "Add document to project" });
+  await addExplorer.waitFor();
+  await addExplorer.getByPlaceholder("Search documents…").fill("Untitled");
+  const addResult = addExplorer.locator('[data-slot="command-item"]', { hasText: "Untitled note" }).filter({ hasText: "Private" });
+  await addResult.waitFor();
+  await addResult.click();
+  await addExplorer.waitFor({ state: "detached" });
+  await page.getByRole("button", { name: /Untitled note/ }).waitFor();
+  assert((await calls("add_document_to_project")).length === 1, "Project member was not persisted through add_document_to_project");
+  await page.getByRole("button", { name: /Untitled note/ }).click();
+  await page.getByRole("heading", { name: "Untitled note" }).waitFor();
+  await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
+  await page.keyboard.type("  ");
+  await explorer.waitFor();
+  assert((await explorer.innerText()).includes("Enter open") && (await explorer.innerText()).includes("Ctrl Enter reference"), "Ordinary Explorer behavior was not restored after adding a project member");
 
   await browser.close();
 } finally {

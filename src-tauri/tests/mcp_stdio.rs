@@ -62,7 +62,7 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
     );
     let tools = response(&mut stdout, 2);
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 6);
     assert!(
         tools["result"]["tools"]
             .as_array()
@@ -72,6 +72,19 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
                 tool.get("inputSchema").is_some() && tool["outputSchema"]["type"] == "object"
             })
     );
+
+    let observer = Connection::open(&database_path).unwrap();
+    observer.busy_timeout(Duration::from_secs(5)).unwrap();
+    observer.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('project','shared','user','2026-08-04','a','a','# Stdio project')", []).unwrap();
+    let project_id = observer.last_insert_rowid();
+    observer.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('note','private','user','2026-08-04','a','a','# Private member')", []).unwrap();
+    let private_id = observer.last_insert_rowid();
+    observer
+        .execute(
+            "INSERT INTO project_documents VALUES(?1,?2,'user','a')",
+            [project_id, private_id],
+        )
+        .unwrap();
 
     for (id, source, valid) in [
         (3, "flowchart TD\nA-->", false),
@@ -101,7 +114,8 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
                 "name": "create_artifact",
                 "arguments": {
                     "title": "Validated diagram",
-                    "body": "```mermaid\nflowchart TD\nA-->B\n```"
+                    "body": "```mermaid\nflowchart TD\nA-->B\n```",
+                    "project_id": project_id
                 }
             }
         }),
@@ -124,8 +138,23 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
         document["body"]
     );
 
-    let observer = Connection::open(&database_path).unwrap();
-    observer.busy_timeout(Duration::from_secs(5)).unwrap();
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_project_context","arguments":{"project_id":project_id}}}),
+    );
+    let context = response(&mut stdout, 10);
+    assert_eq!(
+        context["result"]["structuredContent"]["project"]["id"],
+        project_id
+    );
+    let members = context["result"]["structuredContent"]["documents"]
+        .as_array()
+        .unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0]["id"], id);
+    let persisted: i64 = observer.query_row("SELECT count(*) FROM project_documents WHERE project_document_id=?1 AND document_id=?2 AND added_by='agent'", [project_id, id], |row| row.get(0)).unwrap();
+    assert_eq!(persisted, 1);
+
     let agent_document: i64 = observer
         .query_row(
             "SELECT document_id FROM presence WHERE actor='agent'",
@@ -133,7 +162,7 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(agent_document, id);
+    assert_eq!(agent_document, project_id);
 
     for (request_id, title, body, status) in [
         (7, "First run", "first attachment", "blocked"),

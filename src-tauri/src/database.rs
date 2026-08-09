@@ -10,7 +10,7 @@ use chrono::{Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_SESSION_ID_BYTES: usize = 128;
 const PRESENCE_TTL_SECONDS: i64 = 10;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
@@ -192,6 +192,75 @@ impl Database {
         get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))
     }
 
+    pub fn create_project(&self, day: &str, visibility: &str) -> Result<Document, Error> {
+        validate_day(day)?;
+        validate_visibility(visibility)?;
+        let connection = self.connection()?;
+        let timestamp = now();
+        connection.execute("INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body) VALUES ('project', ?1, 'user', ?2, ?3, ?3, '')", params![visibility, day, timestamp])?;
+        let id = connection.last_insert_rowid();
+        get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))
+    }
+
+    pub fn add_document_to_project(
+        &self,
+        project_id: i64,
+        document_id: i64,
+        added_by: &str,
+    ) -> Result<(), Error> {
+        validate_id(project_id)?;
+        validate_id(document_id)?;
+        if !matches!(added_by, "user" | "agent") {
+            return Err(Error::InvalidSessionId);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let project = get_document_from(&transaction, project_id)?
+            .ok_or(Error::MissingDocument(project_id))?;
+        if project.kind != "project" {
+            return Err(Error::MissingDocument(project_id));
+        }
+        let document = get_document_from(&transaction, document_id)?
+            .ok_or(Error::MissingDocument(document_id))?;
+        if document.kind == "project" {
+            return Err(Error::MissingDocument(document_id));
+        }
+        transaction.execute("INSERT INTO project_documents(project_document_id, document_id, added_by, created_at) VALUES(?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING", params![project_id, document_id, added_by, now()])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn list_project_documents(&self, project_id: i64) -> Result<Vec<Document>, Error> {
+        validate_id(project_id)?;
+        let connection = self.connection()?;
+        let project = get_document_from(&connection, project_id)?
+            .ok_or(Error::MissingDocument(project_id))?;
+        if project.kind != "project" {
+            return Err(Error::MissingDocument(project_id));
+        }
+        project_documents(&connection, project_id, false, 50)
+    }
+
+    pub fn mcp_project_context(
+        &self,
+        project_id: i64,
+        limit: usize,
+    ) -> Result<(Document, Vec<Document>), Error> {
+        validate_id(project_id)?;
+        if !(1..=50).contains(&limit) {
+            return Err(Error::InvalidLimit);
+        }
+        let connection = self.connection()?;
+        let project = get_shared_document_from(&connection, project_id)?
+            .ok_or(Error::MissingDocument(project_id))?;
+        if project.kind != "project" {
+            return Err(Error::MissingDocument(project_id));
+        }
+        let project = sanitize_mcp_document(&connection, project)?;
+        let documents = project_documents(&connection, project_id, true, limit)?;
+        Ok((project, sanitize_mcp_documents(&connection, documents)?))
+    }
+
     pub fn get_document(&self, id: i64) -> Result<Document, Error> {
         validate_id(id)?;
         let connection = self.connection()?;
@@ -299,7 +368,7 @@ impl Database {
         match kind.as_deref() {
             None => Err(Error::MissingDocument(id)),
             Some("daily") => Err(Error::CannotDeleteDaily),
-            Some("note" | "artifact") => {
+            Some("note" | "artifact" | "project") => {
                 connection.execute("DELETE FROM documents WHERE id = ?1", [id])?;
                 Ok(())
             }
@@ -427,6 +496,7 @@ impl Database {
         title: &str,
         body: &str,
         related_ids: &[i64],
+        project_id: Option<i64>,
     ) -> Result<Document, Error> {
         validate_title(title)?;
         validate_body_size(body)?;
@@ -434,6 +504,7 @@ impl Database {
         let distinct_ids = distinct_valid_ids(related_ids)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_mcp_project(&transaction, project_id)?;
         let references = resolve_shared_references(&transaction, &distinct_ids)?;
         if references.len() != distinct_ids.len() {
             let found = references.iter().map(|r| r.id).collect::<HashSet<_>>();
@@ -467,6 +538,7 @@ impl Database {
         let day = Local::now().date_naive().format("%Y-%m-%d").to_string();
         transaction.execute("INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body) VALUES ('artifact', 'shared', 'agent', ?1, ?2, ?2, ?3)", params![day, timestamp, markdown])?;
         let id = transaction.last_insert_rowid();
+        associate_mcp_project(&transaction, project_id, id)?;
         let document = get_document_from(&transaction, id)?.ok_or(Error::MissingDocument(id))?;
         let document = sanitize_mcp_document(&transaction, document)?;
         transaction.commit()?;
@@ -479,6 +551,7 @@ impl Database {
         title: &str,
         body: &str,
         status: Option<&str>,
+        project_id: Option<i64>,
     ) -> Result<Document, Error> {
         validate_day(day)?;
         validate_title(title)?;
@@ -494,6 +567,7 @@ impl Database {
         validate_body_size(&markdown)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_mcp_project(&transaction, project_id)?;
         let timestamp = now();
         transaction.execute(
             "INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body)
@@ -508,6 +582,7 @@ impl Database {
             params![day, timestamp, markdown],
         )?;
         let artifact_id = transaction.last_insert_rowid();
+        associate_mcp_project(&transaction, project_id, artifact_id)?;
         transaction.execute(
             "INSERT INTO document_attachments (parent_document_id, attached_document_id, status)
              VALUES (?1, ?2, ?3)",
@@ -622,6 +697,68 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
              CREATE INDEX document_attachments_parent ON document_attachments(parent_document_id);
              PRAGMA user_version = 5;",
         )?;
+    }
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 5 {
+        let documents_sequence: i64 = transaction
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'documents'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        transaction.execute_batch(
+            "CREATE TEMP TABLE presence_v5 AS SELECT * FROM presence;
+             CREATE TEMP TABLE attachments_v5 AS SELECT * FROM document_attachments;
+             DROP TABLE presence;
+             DROP TABLE document_attachments;
+             ALTER TABLE documents RENAME TO documents_v5;
+             DROP INDEX documents_daily_day;
+             DROP INDEX documents_day;
+             CREATE TABLE documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (kind IN ('daily', 'note', 'artifact', 'project')),
+                visibility TEXT NOT NULL CHECK (visibility IN ('shared', 'private')),
+                author TEXT NOT NULL CHECK (author IN ('user', 'agent')),
+                day TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
+                CHECK (kind <> 'daily' OR (visibility = 'shared' AND author = 'user')),
+                CHECK (kind <> 'project' OR author = 'user')
+             );
+             INSERT INTO documents SELECT * FROM documents_v5;
+             DROP TABLE documents_v5;
+             CREATE UNIQUE INDEX documents_daily_day ON documents(day) WHERE kind = 'daily';
+             CREATE INDEX documents_day ON documents(day);
+             CREATE TABLE presence (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL CHECK(actor IN ('user', 'agent')), document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, last_heartbeat INTEGER NOT NULL);
+             INSERT INTO presence SELECT * FROM presence_v5;
+             DROP TABLE presence_v5;
+             CREATE INDEX presence_document ON presence(document_id);
+             CREATE TABLE document_attachments (parent_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, attached_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK (status IN ('completed', 'blocked', 'failed')), PRIMARY KEY (parent_document_id, attached_document_id), UNIQUE (attached_document_id));
+             INSERT INTO document_attachments SELECT * FROM attachments_v5;
+             DROP TABLE attachments_v5;
+             CREATE INDEX document_attachments_parent ON document_attachments(parent_document_id);
+             CREATE TABLE project_documents (project_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, added_by TEXT NOT NULL CHECK(added_by IN ('user', 'agent')), created_at TEXT NOT NULL, PRIMARY KEY(project_document_id, document_id), CHECK(project_document_id <> document_id));
+             CREATE INDEX project_documents_document ON project_documents(document_id);
+             PRAGMA user_version = 6;"
+        )?;
+        let sequence_updated = transaction.execute(
+            "UPDATE sqlite_sequence SET seq = max(seq, ?1) WHERE name = 'documents'",
+            [documents_sequence],
+        )?;
+        if sequence_updated == 0 {
+            transaction.execute(
+                "INSERT INTO sqlite_sequence(name, seq) VALUES('documents', ?1)",
+                [documents_sequence],
+            )?;
+        }
+        let violations: i64 =
+            transaction.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })?;
+        if violations != 0 {
+            return Err(Error::Sqlite(rusqlite::Error::ExecuteReturnedResults));
+        }
     }
     transaction.commit()?;
     Ok(())
@@ -785,6 +922,44 @@ fn get_shared_document_from(connection: &Connection, id: i64) -> Result<Option<D
 fn get_daily(connection: &Connection, day: &str) -> Result<Option<Document>, Error> {
     Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents WHERE kind = 'daily' AND day = ?1", [day], document_from_row).optional()?)
 }
+fn project_documents(
+    connection: &Connection,
+    project_id: i64,
+    shared_only: bool,
+    limit: usize,
+) -> Result<Vec<Document>, Error> {
+    let sql = format!(
+        "SELECT d.id, d.kind, d.visibility, d.author, d.day, d.created_at, d.updated_at, d.body, d.revision
+         FROM project_documents pd JOIN documents d ON d.id = pd.document_id
+         WHERE pd.project_document_id = ?1 {} ORDER BY d.updated_at DESC, d.id DESC LIMIT ?2",
+        if shared_only { "AND d.visibility = 'shared'" } else { "" }
+    );
+    let mut statement = connection.prepare(&sql)?;
+    Ok(statement
+        .query_map(params![project_id, limit], document_from_row)?
+        .collect::<Result<Vec<_>, _>>()?)
+}
+fn validate_mcp_project(connection: &Connection, project_id: Option<i64>) -> Result<(), Error> {
+    let Some(id) = project_id else {
+        return Ok(());
+    };
+    validate_id(id)?;
+    let project = get_shared_document_from(connection, id)?.ok_or(Error::MissingDocument(id))?;
+    if project.kind != "project" {
+        return Err(Error::MissingDocument(id));
+    }
+    Ok(())
+}
+fn associate_mcp_project(
+    connection: &Connection,
+    project_id: Option<i64>,
+    document_id: i64,
+) -> Result<(), Error> {
+    if let Some(project_id) = project_id {
+        connection.execute("INSERT INTO project_documents(project_document_id, document_id, added_by, created_at) VALUES(?1, ?2, 'agent', ?3)", params![project_id, document_id, now()])?;
+    }
+    Ok(())
+}
 fn resolve_shared_references(
     connection: &Connection,
     ids: &[i64],
@@ -946,15 +1121,17 @@ mod tests {
     }
 
     #[test]
-    fn fresh_schema_is_v5_with_constraints() {
+    fn fresh_schema_is_v6_with_constraints() {
         let database = database();
         let connection = database.connection.lock().unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','private','user','2026-01-01','a','a','')", []).is_err());
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','shared','agent','2026-01-01','a','a','')", []).is_err());
+        assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('project','shared','agent','2026-01-01','a','a','')", []).is_err());
+        connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('project','shared','user','2026-01-01','a','a','')", []).unwrap();
         let table: String = connection
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='document_attachments'",
@@ -1003,13 +1180,84 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         assert_eq!(database.get_document(1).unwrap().body, "user body");
         assert!(
             database
                 .list_daily_attachments("2026-08-04")
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn v5_migration_preserves_documents_children_ids_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind IN ('daily','note','artifact')), visibility TEXT NOT NULL CHECK(visibility IN ('shared','private')), author TEXT NOT NULL CHECK(author IN ('user','agent')), day TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, CHECK(kind <> 'daily' OR (visibility='shared' AND author='user')));
+             CREATE UNIQUE INDEX documents_daily_day ON documents(day) WHERE kind='daily';
+             CREATE INDEX documents_day ON documents(day);
+             CREATE TABLE presence (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL CHECK(actor IN ('user','agent')), document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, last_heartbeat INTEGER NOT NULL);
+             CREATE INDEX presence_document ON presence(document_id);
+             CREATE TABLE document_attachments (parent_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, attached_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK(status IN ('completed','blocked','failed')), PRIMARY KEY(parent_document_id,attached_document_id), UNIQUE(attached_document_id));
+             CREATE INDEX document_attachments_parent ON document_attachments(parent_document_id);
+             INSERT INTO documents VALUES(3,'daily','shared','user','2026-08-04','a','b','daily',4);
+             INSERT INTO documents VALUES(7,'note','private','user','2026-08-04','c','d','note',2);
+             INSERT INTO documents VALUES(11,'artifact','shared','agent','2026-08-04','e','f','artifact',3);
+             INSERT INTO documents VALUES(50,'note','shared','user','2026-08-04','g','h','deleted',1);
+             DELETE FROM documents WHERE id=50;
+             INSERT INTO presence VALUES('session','user',7,123);
+             INSERT INTO document_attachments VALUES(3,11,'blocked');
+             PRAGMA user_version=5;"
+        ).unwrap();
+        drop(connection);
+
+        let database = Database::open(&path).unwrap();
+        assert_eq!(database.get_document(3).unwrap().body, "daily");
+        assert_eq!(database.get_document(7).unwrap().revision, 2);
+        assert_eq!(database.get_document(11).unwrap().author, "agent");
+        let connection = database.connection.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name='documents'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            50
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM presence WHERE session_id='session' AND document_id=7",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(connection.query_row("SELECT count(*) FROM document_attachments WHERE parent_document_id=3 AND attached_document_id=11 AND status='blocked'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+        drop(connection);
+        let project = database.create_project("2026-08-04", "shared").unwrap();
+        assert!(project.id > 50);
+        drop(database);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(reopened.get_document(project.id).unwrap(), project);
+        assert_eq!(
+            reopened.list_daily_attachments("2026-08-04").unwrap()[0].id,
+            11
         );
     }
 
@@ -1081,6 +1329,162 @@ mod tests {
         assert_eq!(d.get_or_create_daily("2024-02-29").unwrap(), daily);
         let note = d.create_note("2024-02-29", "shared").unwrap();
         assert_ne!(daily.id, note.id);
+    }
+
+    #[test]
+    fn projects_have_concrete_many_to_many_membership_and_reject_nesting() {
+        let d = database();
+        let first = d.create_project("2026-08-04", "shared").unwrap();
+        let second = d.create_project("2026-08-04", "shared").unwrap();
+        let note = d.create_note("2026-08-04", "shared").unwrap();
+        d.add_document_to_project(first.id, note.id, "user")
+            .unwrap();
+        d.add_document_to_project(first.id, note.id, "user")
+            .unwrap();
+        d.add_document_to_project(second.id, note.id, "agent")
+            .unwrap();
+        assert_eq!(
+            d.list_project_documents(first.id).unwrap(),
+            vec![note.clone()]
+        );
+        assert_eq!(d.list_project_documents(second.id).unwrap(), vec![note]);
+        assert!(matches!(
+            d.add_document_to_project(first.id, second.id, "user"),
+            Err(Error::MissingDocument(_))
+        ));
+        assert!(
+            d.add_document_to_project(first.id, first.id, "user")
+                .is_err()
+        );
+        assert!(d.add_document_to_project(first.id, 9999, "user").is_err());
+        assert!(d.add_document_to_project(first.id, 1, "other").is_err());
+    }
+
+    #[test]
+    fn project_members_are_ordered_bounded_and_survive_project_deletion() {
+        let d = database();
+        let project = d.create_project("2026-08-04", "shared").unwrap();
+        let mut ids = Vec::new();
+        for index in 0..55 {
+            let note = d.create_note("2026-08-04", "shared").unwrap();
+            d.update_document_body(note.id, &format!("note {index}"))
+                .unwrap();
+            d.add_document_to_project(project.id, note.id, "user")
+                .unwrap();
+            ids.push(note.id);
+        }
+        let rows = d.list_project_documents(project.id).unwrap();
+        assert_eq!(rows.len(), 50);
+        assert_eq!(rows[0].id, *ids.last().unwrap());
+        assert_eq!(rows[49].id, ids[5]);
+        let retained = ids[10];
+        d.delete_note(project.id).unwrap();
+        assert_eq!(d.get_document(retained).unwrap().id, retained);
+        let memberships: i64 = d
+            .connection
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM project_documents", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(memberships, 0);
+    }
+
+    #[test]
+    fn mcp_project_context_is_private_safe_sanitized_and_bounded() {
+        let d = database();
+        let project = d.create_project("2026-08-04", "shared").unwrap();
+        let shared = d.create_note("2026-08-04", "shared").unwrap();
+        let private = d.create_note("2026-08-04", "private").unwrap();
+        d.update_document_body(private.id, "# Secret member")
+            .unwrap();
+        d.update_document_body(
+            shared.id,
+            &format!("# Shared\n[[note:{}|Secret label]]", private.id),
+        )
+        .unwrap();
+        d.update_document_body(
+            project.id,
+            &format!("# Project\n[[note:{}|Private project label]]", private.id),
+        )
+        .unwrap();
+        d.add_document_to_project(project.id, shared.id, "user")
+            .unwrap();
+        d.add_document_to_project(project.id, private.id, "user")
+            .unwrap();
+        let (visible_project, members) = d.mcp_project_context(project.id, 1).unwrap();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].id, shared.id);
+        for secret in [
+            private.id.to_string(),
+            "Secret label".into(),
+            "Private project label".into(),
+        ] {
+            assert!(!visible_project.body.contains(&secret));
+            assert!(!members[0].body.contains(&secret));
+        }
+        assert!(matches!(
+            d.mcp_project_context(project.id, 0),
+            Err(Error::InvalidLimit)
+        ));
+        assert!(matches!(
+            d.mcp_project_context(project.id, 51),
+            Err(Error::InvalidLimit)
+        ));
+        let private_project = d.create_project("2026-08-04", "private").unwrap();
+        assert!(matches!(
+            d.mcp_project_context(private_project.id, 20),
+            Err(Error::MissingDocument(_))
+        ));
+        assert!(matches!(
+            d.mcp_project_context(9999, 20),
+            Err(Error::MissingDocument(_))
+        ));
+    }
+
+    #[test]
+    fn invalid_mcp_project_associations_roll_back_every_related_row() {
+        let d = database();
+        let private = d.create_project("2026-08-04", "private").unwrap();
+        let note = d.create_note("2026-08-04", "shared").unwrap();
+        for project_id in [Some(private.id), Some(note.id), Some(9999)] {
+            assert!(matches!(
+                d.mcp_create_artifact("Rejected", "body", &[], project_id),
+                Err(Error::MissingDocument(_))
+            ));
+            assert!(matches!(
+                d.mcp_create_daily_attachment("2026-08-04", "Rejected", "body", None, project_id),
+                Err(Error::MissingDocument(_))
+            ));
+        }
+        let connection = d.connection.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM documents WHERE body LIKE '# Rejected%'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM document_attachments", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT count(*) FROM project_documents", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -1245,14 +1649,14 @@ mod tests {
         let note = d.create_note("2026-08-04", "shared").unwrap();
         d.update_document_body(note.id, "# a|b]\\c").unwrap();
         let artifact = d
-            .mcp_create_artifact("Title", "Body", &[note.id, note.id])
+            .mcp_create_artifact("Title", "Body", &[note.id, note.id], None)
             .unwrap();
         assert_eq!(artifact.kind, "artifact");
         assert_eq!(artifact.author, "agent");
         assert_eq!(artifact.body.matches("[[note:").count(), 1);
         assert!(artifact.body.contains("a\\|b\\]\\\\c"));
         let before = d.mcp_search_documents("Title", 50).unwrap().len();
-        assert!(d.mcp_create_artifact("Other", "", &[999999]).is_err());
+        assert!(d.mcp_create_artifact("Other", "", &[999999], None).is_err());
         assert_eq!(d.mcp_search_documents("Other", 50).unwrap().len(), 0);
         assert_eq!(d.mcp_search_documents("Title", 50).unwrap().len(), before);
     }
@@ -1264,11 +1668,17 @@ mod tests {
         d.update_document_body(note.id, &"x".repeat(MAX_BODY_BYTES + 1))
             .unwrap();
         assert!(matches!(
-            d.mcp_create_daily_attachment("2026-08-04", "x", &"x".repeat(MAX_BODY_BYTES + 1), None),
+            d.mcp_create_daily_attachment(
+                "2026-08-04",
+                "x",
+                &"x".repeat(MAX_BODY_BYTES + 1),
+                None,
+                None
+            ),
             Err(Error::BodyTooLarge)
         ));
         assert!(matches!(
-            d.mcp_create_artifact("x", &"x".repeat(MAX_BODY_BYTES + 1), &[]),
+            d.mcp_create_artifact("x", &"x".repeat(MAX_BODY_BYTES + 1), &[], None),
             Err(Error::BodyTooLarge)
         ));
     }
@@ -1279,10 +1689,10 @@ mod tests {
         let daily = d.get_or_create_daily("2026-08-04").unwrap();
         d.update_document_body(daily.id, "user thoughts").unwrap();
         let first = d
-            .mcp_create_daily_attachment("2026-08-04", "Run A", "details a", Some("blocked"))
+            .mcp_create_daily_attachment("2026-08-04", "Run A", "details a", Some("blocked"), None)
             .unwrap();
         let second = d
-            .mcp_create_daily_attachment("2026-08-04", "Run B", "details b", Some("failed"))
+            .mcp_create_daily_attachment("2026-08-04", "Run B", "details b", Some("failed"), None)
             .unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(first.kind, "artifact");
@@ -1298,7 +1708,7 @@ mod tests {
         assert_eq!(attachments[1].id, first.id);
         assert_eq!(attachments[1].status, "blocked");
         assert!(matches!(
-            d.mcp_create_daily_attachment("2026-08-04", "Bad", "x", Some("running")),
+            d.mcp_create_daily_attachment("2026-08-04", "Bad", "x", Some("running"), None),
             Err(Error::InvalidStatus)
         ));
     }
@@ -1369,14 +1779,16 @@ mod tests {
     fn invalid_mermaid_rejects_create_and_attachment_without_mutation() {
         let d = database();
         let invalid = "```mermaid\nflowchart TD\nA-->\n```";
-        let create_error = d.mcp_create_artifact("Rejected", invalid, &[]).unwrap_err();
+        let create_error = d
+            .mcp_create_artifact("Rejected", invalid, &[], None)
+            .unwrap_err();
         assert!(create_error.to_string().contains("Mermaid block 1"));
         assert!(d.mcp_search_documents("Rejected", 50).unwrap().is_empty());
 
         let daily = d.get_or_create_daily("2026-08-04").unwrap();
         d.update_document_body(daily.id, "before").unwrap();
         let attach_error = d
-            .mcp_create_daily_attachment("2026-08-04", "Rejected", invalid, None)
+            .mcp_create_daily_attachment("2026-08-04", "Rejected", invalid, None, None)
             .unwrap_err();
         assert!(attach_error.to_string().contains("Mermaid block 1"));
         assert_eq!(d.get_document(daily.id).unwrap().body, "before");
@@ -1387,7 +1799,7 @@ mod tests {
     fn valid_mermaid_artifact_round_trips_and_existing_daily_is_not_revalidated() {
         let d = database();
         let body = "```mermaid\nsequenceDiagram\nAlice->>Bob: Hi\n```";
-        let artifact = d.mcp_create_artifact("Diagram", body, &[]).unwrap();
+        let artifact = d.mcp_create_artifact("Diagram", body, &[], None).unwrap();
         assert_eq!(
             d.mcp_read_document(artifact.id).unwrap().body,
             artifact.body
@@ -1397,7 +1809,7 @@ mod tests {
         d.update_document_body(daily.id, "```mermaid\ninvalid")
             .unwrap();
         assert!(
-            d.mcp_create_daily_attachment("2026-08-04", "Plain", "plain addition", None)
+            d.mcp_create_daily_attachment("2026-08-04", "Plain", "plain addition", None, None)
                 .is_ok()
         );
         assert_eq!(
@@ -1414,7 +1826,7 @@ mod tests {
         let mcp = Database::open(&path).unwrap();
         let daily = gui.get_or_create_daily("2026-08-04").unwrap();
         gui.update_document_body(daily.id, "user text").unwrap();
-        mcp.mcp_create_daily_attachment("2026-08-04", "Agent run", "agent append", None)
+        mcp.mcp_create_daily_attachment("2026-08-04", "Agent run", "agent append", None, None)
             .unwrap();
 
         let updated = gui.replace_document_body(daily.id, 2, "user edit").unwrap();

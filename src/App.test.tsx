@@ -2,11 +2,16 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import {
+  addDocumentToProject,
   createNote,
+  createProject,
+  deleteNote,
   getDocument,
   getOrCreateDaily,
   listDailyAttachments,
+  listProjectDocuments,
   removePresence,
+  searchDocuments,
   syncDocument,
   updateDocument,
   updatePresence,
@@ -22,10 +27,13 @@ vi.mock("@tauri-apps/api/window", () => ({
 
 vi.mock("./lib/archive", () => ({
   createNote: vi.fn(),
+  createProject: vi.fn(),
+  addDocumentToProject: vi.fn(),
   deleteNote: vi.fn(),
   getDocument: vi.fn(),
   getOrCreateDaily: vi.fn(),
   listDailyAttachments: vi.fn(),
+  listProjectDocuments: vi.fn(),
   searchDocuments: vi.fn(),
   resolveReferences: vi.fn().mockResolvedValue([]),
   updateDocument: vi.fn(),
@@ -56,6 +64,16 @@ const daily = {
   revision: 1,
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 describe("Archive document canvas", () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -78,7 +96,10 @@ describe("Archive document canvas", () => {
     });
     vi.mocked(getOrCreateDaily).mockResolvedValue(daily);
     vi.mocked(createNote).mockResolvedValue({ ...daily, id: 2, kind: "note" });
+    vi.mocked(createProject).mockResolvedValue({ ...daily, id: 20, kind: "project" });
     vi.mocked(listDailyAttachments).mockResolvedValue([]);
+    vi.mocked(listProjectDocuments).mockResolvedValue([]);
+    vi.mocked(addDocumentToProject).mockResolvedValue(undefined);
     vi.mocked(getDocument).mockImplementation(async (id) => ({
       ...daily,
       id,
@@ -333,5 +354,138 @@ describe("Archive document canvas", () => {
     await act(async () => Promise.resolve());
     expect(getDocument).toHaveBeenCalledWith(9);
     expect(screen.getByRole("heading", { name: "CLOB portfolio projection writer E2E" })).toBeTruthy();
+  });
+
+  it("creates and opens a project with its empty shelf and project metadata", async () => {
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getByText("New project"));
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(createProject).toHaveBeenCalledWith("2026-08-03");
+    expect(screen.getByRole("heading", { name: "Untitled project" })).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Project documents" })).toBeTruthy();
+    expect(screen.getByText("Add notes, daily documents, or artifacts to this project.")).toBeTruthy();
+    expect(screen.getByText(/Project/, { selector: "footer *" })).toBeTruthy();
+    expect(document.activeElement).toBe(container.querySelector(".cm-content"));
+  });
+
+  it("selects the first visible add result, suppresses Ctrl-Enter references, adds once, and opens the member", async () => {
+    const project = { ...daily, id: 20, kind: "project" as const };
+    const member = { ...daily, id: 21, kind: "note" as const, body: "# Member note" };
+    vi.mocked(createProject).mockResolvedValue(project);
+    vi.mocked(searchDocuments).mockResolvedValue([project, member]);
+    vi.mocked(listProjectDocuments).mockResolvedValueOnce([]).mockResolvedValue([member]);
+    vi.mocked(getDocument).mockResolvedValue(member);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getByText("New project"));
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByRole("button", { name: "Add document" }));
+    expect(screen.getByRole("dialog", { name: "Add document to project" })).toBeTruthy();
+    await act(async () => vi.advanceTimersByTimeAsync(101));
+    expect(screen.queryByText("Untitled project", { selector: '[data-slot="command-item"] *' })).toBeNull();
+    const input = screen.getByPlaceholderText("Search documents…");
+    fireEvent.keyDown(input, { ctrlKey: true, key: "Enter" });
+    expect(addDocumentToProject).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Add document to project" })).toBeTruthy();
+    fireEvent.keyDown(input, { key: "Enter" });
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(addDocumentToProject).toHaveBeenCalledWith(20, 21);
+    expect(listProjectDocuments).toHaveBeenCalledWith(20);
+    expect(screen.queryByRole("dialog", { name: "Add document to project" })).toBeNull();
+    expect(document.activeElement).toBe(container.querySelector(".cm-content"));
+    fireEvent.click(screen.getByRole("button", { name: /Member note/ }));
+    await act(async () => Promise.resolve());
+    expect(getDocument).toHaveBeenCalledWith(21);
+    expect(screen.getByRole("heading", { name: "Member note" })).toBeTruthy();
+  });
+
+  it("ignores late project poll successes and errors after leaving and re-entering", async () => {
+    const project = { ...daily, id: 20, kind: "project" as const };
+    const stale = { ...daily, id: 21, kind: "note" as const, body: "# Stale member" };
+    const fresh = { ...daily, id: 22, kind: "note" as const, body: "# Fresh member" };
+    const oldSuccess = deferred<Awaited<ReturnType<typeof listProjectDocuments>>>();
+    const oldError = deferred<Awaited<ReturnType<typeof listProjectDocuments>>>();
+    vi.mocked(createProject).mockResolvedValue(project);
+    vi.mocked(listProjectDocuments)
+      .mockReturnValueOnce(oldSuccess.promise)
+      .mockReturnValueOnce(oldError.promise)
+      .mockResolvedValue([fresh]);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getByText("New project"));
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(2_000));
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { shiftKey: true, key: "H" });
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("button", { name: /Fresh member/ })).toBeTruthy();
+
+    await act(async () => oldSuccess.resolve([stale]));
+    await act(async () => oldError.reject(new Error("stale poll failure")));
+    expect(screen.queryByRole("button", { name: /Stale member/ })).toBeNull();
+    expect(screen.getByRole("button", { name: /Fresh member/ })).toBeTruthy();
+    expect(screen.queryByText(/stale poll failure/)).toBeNull();
+  });
+
+  it("invalidates a pending add when Explorer closes and reopens", async () => {
+    const project = { ...daily, id: 20, kind: "project" as const };
+    const member = { ...daily, id: 21, kind: "note" as const, body: "# Member note" };
+    const pending = deferred<void>();
+    vi.mocked(createProject).mockResolvedValue(project);
+    vi.mocked(searchDocuments).mockResolvedValue([project, member]);
+    vi.mocked(addDocumentToProject).mockReturnValue(pending.promise);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getByText("New project"));
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByRole("button", { name: "Add document" }));
+    await act(async () => vi.advanceTimersByTimeAsync(101));
+    const firstDialog = screen.getByRole("dialog", { name: "Add document to project" });
+    const firstInput = screen.getByPlaceholderText("Search documents…");
+    fireEvent.keyDown(firstInput, { key: "Enter" });
+    fireEvent.keyDown(firstInput, { key: "Enter" });
+    expect(addDocumentToProject).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(firstDialog, { key: "Escape" });
+    fireEvent.click(screen.getByRole("button", { name: "Add document" }));
+    await act(async () => vi.advanceTimersByTimeAsync(101));
+    const reopenedInput = screen.getByPlaceholderText("Search documents…");
+    reopenedInput.focus();
+
+    await act(async () => pending.reject(new Error("stale add failure")));
+    await act(async () => vi.advanceTimersByTimeAsync(2));
+    expect(screen.getByRole("dialog", { name: "Add document to project" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Member note/ })).toBeNull();
+    expect(screen.queryByText(/stale add failure/)).toBeNull();
+    expect(document.activeElement).toBe(reopenedInput);
+  });
+
+  it("uses project deletion copy and stops project polling after leaving", async () => {
+    vi.mocked(createProject).mockResolvedValue({ ...daily, id: 20, kind: "project" });
+    vi.mocked(deleteNote).mockResolvedValue(undefined);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getByText("New project"));
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByText("Delete project permanently…"));
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("alertdialog", { name: "Permanently delete this project?" })).toBeTruthy();
+    expect(screen.getByText("This project will be removed immediately. Member documents will be retained.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Delete project" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    const callsBeforeLeaving = vi.mocked(listProjectDocuments).mock.calls.length;
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    await act(async () => Promise.resolve());
+    await act(async () => vi.advanceTimersByTimeAsync(4_100));
+    expect(listProjectDocuments).toHaveBeenCalledTimes(callsBeforeLeaving);
   });
 });

@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type DocumentKind = "daily" | "note" | "artifact";
+export type DocumentKind = "daily" | "note" | "artifact" | "project";
 export type DocumentVisibility = "shared" | "private";
 export type DocumentAuthor = "user" | "agent";
 
@@ -58,6 +58,15 @@ export function getOrCreateDaily(day: string): Promise<Document> {
 
 export function createNote(day: string, visibility: DocumentVisibility): Promise<Document> {
   return invoke("create_note", { day, visibility });
+}
+export function createProject(day: string, visibility: DocumentVisibility = "shared"): Promise<Document> {
+  return invoke("create_project", { day, visibility });
+}
+export function addDocumentToProject(projectId: number, documentId: number): Promise<void> {
+  return invoke("add_document_to_project", { projectId, documentId });
+}
+export function listProjectDocuments(projectId: number): Promise<Document[]> {
+  return invoke("list_project_documents", { projectId });
 }
 
 export function getDocument(id: number): Promise<Document> {

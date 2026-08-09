@@ -41,6 +41,7 @@ struct CreateArtifactArgs {
     title: String,
     body: String,
     related_document_ids: Option<Vec<i64>>,
+    project_id: Option<i64>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct CreateDailyAttachmentArgs {
@@ -49,6 +50,12 @@ struct CreateDailyAttachmentArgs {
     body: String,
     /// One of: completed, blocked, failed. Defaults to completed.
     status: Option<String>,
+    project_id: Option<i64>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ProjectContextArgs {
+    project_id: i64,
+    limit: Option<usize>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ValidateMermaidArgs {
@@ -67,6 +74,11 @@ struct DocumentSummary {
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct SearchDocumentsResult {
+    documents: Vec<DocumentSummary>,
+}
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct ProjectContextResult {
+    project: SharedDocument,
     documents: Vec<DocumentSummary>,
 }
 
@@ -209,6 +221,7 @@ impl ArchiveMcp {
                 &args.title,
                 &args.body,
                 args.related_document_ids.as_deref().unwrap_or(&[]),
+                args.project_id,
             )
             .map_err(tool_error)
             .map(|document| {
@@ -225,11 +238,44 @@ impl ArchiveMcp {
         Parameters(args): Parameters<CreateDailyAttachmentArgs>,
     ) -> Result<Json<SharedDocument>, String> {
         self.database
-            .mcp_create_daily_attachment(&args.day, &args.title, &args.body, args.status.as_deref())
+            .mcp_create_daily_attachment(
+                &args.day,
+                &args.title,
+                &args.body,
+                args.status.as_deref(),
+                args.project_id,
+            )
             .map_err(tool_error)
             .map(|document| {
                 self.claim(document.id);
                 Json(document.into())
+            })
+    }
+
+    #[tool(description = "Read bounded shared context for one shared Archive project")]
+    fn get_project_context(
+        &self,
+        Parameters(args): Parameters<ProjectContextArgs>,
+    ) -> Result<Json<ProjectContextResult>, String> {
+        self.database
+            .mcp_project_context(args.project_id, args.limit.unwrap_or(20))
+            .map_err(tool_error)
+            .map(|(project, documents)| {
+                self.claim(project.id);
+                Json(ProjectContextResult {
+                    project: project.into(),
+                    documents: documents
+                        .into_iter()
+                        .map(|document| DocumentSummary {
+                            label: label(&document),
+                            id: document.id,
+                            kind: document.kind,
+                            author: document.author,
+                            day: document.day,
+                            updated_at: document.updated_at,
+                        })
+                        .collect(),
+                })
             })
     }
 
@@ -279,9 +325,9 @@ mod tests {
     }
 
     #[test]
-    fn generated_router_has_exactly_five_structured_tools() {
+    fn generated_router_has_exactly_six_structured_tools() {
         let tools = ArchiveMcp::tool_router().list_all();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         assert_eq!(
             tools
                 .iter()
@@ -290,6 +336,7 @@ mod tests {
             [
                 "create_artifact",
                 "create_daily_attachment",
+                "get_project_context",
                 "read_document",
                 "search_documents",
                 "validate_mermaid"
@@ -298,6 +345,94 @@ mod tests {
             .collect()
         );
         assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
+        for name in ["create_artifact", "create_daily_attachment"] {
+            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
+            assert!(tool.input_schema["properties"]["project_id"].is_object());
+        }
+        let context = tools
+            .iter()
+            .find(|tool| tool.name == "get_project_context")
+            .unwrap();
+        assert!(context.input_schema["properties"]["project_id"].is_object());
+        assert!(context.input_schema["properties"]["limit"].is_object());
+    }
+
+    #[test]
+    fn project_context_enforces_privacy_limits_and_associations() {
+        let archive = server();
+        let project = archive
+            .database
+            .create_project("2026-08-04", "shared")
+            .unwrap();
+        let private = archive
+            .database
+            .create_note("2026-08-04", "private")
+            .unwrap();
+        archive
+            .database
+            .add_document_to_project(project.id, private.id, "user")
+            .unwrap();
+        let artifact = archive
+            .create_artifact(Parameters(CreateArtifactArgs {
+                title: "Project artifact".into(),
+                body: "body".into(),
+                related_document_ids: None,
+                project_id: Some(project.id),
+            }))
+            .unwrap()
+            .0;
+        let context = archive
+            .get_project_context(Parameters(ProjectContextArgs {
+                project_id: project.id,
+                limit: Some(20),
+            }))
+            .unwrap()
+            .0;
+        assert_eq!(context.project.id, project.id);
+        assert_eq!(context.documents.len(), 1);
+        assert_eq!(context.documents[0].id, artifact.id);
+        assert_eq!(
+            archive
+                .database
+                .list_project_documents(project.id)
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            archive
+                .get_project_context(Parameters(ProjectContextArgs {
+                    project_id: project.id,
+                    limit: Some(0)
+                }))
+                .err()
+                .unwrap(),
+            "limit must be between 1 and 50"
+        );
+        let private_project = archive
+            .database
+            .create_project("2026-08-04", "private")
+            .unwrap();
+        assert_eq!(
+            archive
+                .get_project_context(Parameters(ProjectContextArgs {
+                    project_id: private_project.id,
+                    limit: None
+                }))
+                .err()
+                .unwrap(),
+            "document not found"
+        );
+        assert_eq!(
+            archive
+                .get_project_context(Parameters(ProjectContextArgs {
+                    project_id: 9999,
+                    limit: None
+                }))
+                .err()
+                .unwrap(),
+            "document not found"
+        );
     }
 
     #[test]

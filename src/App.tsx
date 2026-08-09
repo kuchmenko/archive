@@ -25,10 +25,13 @@ import {
 } from "@/components/MarkdownEditor";
 import {
   createNote,
+  createProject,
+  addDocumentToProject,
   deleteNote,
   getDocument,
   getOrCreateDaily,
   listDailyAttachments,
+  listProjectDocuments,
   removePresence,
   resolveReferences,
   searchDocuments,
@@ -97,6 +100,7 @@ export function App() {
   const [explorerResults, setExplorerResults] = useState<Document[]>([]);
   const [explorerSelectedId, setExplorerSelectedId] = useState<number | null>(null);
   const [explorerOrigin, setExplorerOrigin] = useState<ExplorerOrigin | null>(null);
+  const [explorerPurpose, setExplorerPurpose] = useState<"open" | "add-to-project">("open");
   const [deleteTargetId, setDeleteTargetId] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(true);
@@ -105,6 +109,7 @@ export function App() {
   const [resolvingConflict, setResolvingConflict] = useState(false);
   const [presence, setPresence] = useState<Presence>({ userCount: 1, agentPresent: false });
   const [attachments, setAttachments] = useState<DailyAttachment[]>([]);
+  const [projectDocuments, setProjectDocuments] = useState<Document[]>([]);
   const [shelfExpanded, setShelfExpanded] = useState(false);
   const activeRef = useRef(active);
   const todayRef = useRef(today);
@@ -113,8 +118,13 @@ export function App() {
   const searchToken = useRef(0);
   const referenceToken = useRef(0);
   const attachmentToken = useRef(0);
+  const projectToken = useRef(0);
+  const explorerGeneration = useRef(0);
+  const addGeneration = useRef<number | null>(null);
   const buffersRef = useRef(buffers);
   const conflictRef = useRef(conflict);
+  const explorerOpenRef = useRef(explorerOpen);
+  const explorerPurposeRef = useRef(explorerPurpose);
   const syncGeneration = useRef(0);
   const sessionId = useRef(
     `archive-gui-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`,
@@ -122,6 +132,8 @@ export function App() {
   activeRef.current = active;
   buffersRef.current = buffers;
   conflictRef.current = conflict;
+  explorerOpenRef.current = explorerOpen;
+  explorerPurposeRef.current = explorerPurpose;
 
   const autosaveRef = useRef<AutosaveController | null>(null);
   if (!autosaveRef.current) {
@@ -173,6 +185,8 @@ export function App() {
 
   const showDocument = useCallback(
     (document: Document) => {
+      explorerGeneration.current += 1;
+      addGeneration.current = null;
       referenceToken.current += 1;
       setReferences([]);
       activeRef.current = document;
@@ -225,6 +239,33 @@ export function App() {
       clearInterval(timer);
     };
   }, [active?.id, active?.kind, active?.day]);
+
+  useEffect(() => {
+    const token = ++projectToken.current;
+    if (!active || active.kind !== "project") {
+      setProjectDocuments([]);
+      return;
+    }
+    const projectId = active.id;
+    let latestRequest = 0;
+    const load = () => {
+      const request = ++latestRequest;
+      void listProjectDocuments(projectId).then((rows) => {
+        if (token !== projectToken.current || request !== latestRequest) return;
+        if (activeRef.current?.id === projectId) setProjectDocuments(rows);
+      }).catch((error) => {
+        if (token === projectToken.current && request === latestRequest) {
+          setNotice(`Project documents: ${message(error)}`);
+        }
+      });
+    };
+    load();
+    const timer = setInterval(load, 2_000);
+    return () => {
+      projectToken.current += 1;
+      clearInterval(timer);
+    };
+  }, [active?.id, active?.kind]);
 
   useEffect(() => {
     const day = todayRef.current;
@@ -449,11 +490,12 @@ export function App() {
       void searchDocuments(active.day, explorerQuery)
         .then((documents) => {
           if (token !== searchToken.current) return;
-          setExplorerResults(documents);
+          const results = explorerPurpose === "add-to-project" ? documents.filter((document) => document.kind !== "project") : documents;
+          setExplorerResults(results);
           setExplorerSelectedId((current) =>
-            current !== null && documents.some((document) => document.id === current)
+            current !== null && results.some((document) => document.id === current)
               ? current
-              : (documents[0]?.id ?? null),
+              : (results[0]?.id ?? null),
           );
         })
         .catch((error) => {
@@ -461,7 +503,7 @@ export function App() {
         });
     }, 100);
     return () => clearTimeout(timer);
-  }, [active, explorerOpen, explorerQuery]);
+  }, [active, explorerOpen, explorerQuery, explorerPurpose]);
 
   async function flush(): Promise<boolean> {
     const snapshot = editorRef.current?.snapshot();
@@ -510,6 +552,26 @@ export function App() {
       } catch (error) {
         setNotice(message(error));
       }
+    }
+    operation.current = false;
+    setBusy(false);
+  }
+  async function newProject() {
+    if (operation.current) return;
+    operation.current = true;
+    setBusy(true);
+    setNotice(null);
+    if (await flush()) {
+      try {
+        const project = await createProject(todayRef.current);
+        if (await flush()) {
+          showDocument(project);
+          setTimeout(() => {
+            if (activeRef.current?.id === project.id) editorRef.current?.focus();
+          }, 0);
+        }
+      }
+      catch (error) { setNotice(message(error)); }
     }
     operation.current = false;
     setBusy(false);
@@ -570,11 +632,22 @@ export function App() {
       return false;
     }
     setExplorerOrigin(origin);
+    setExplorerPurpose("open");
     setExplorerQuery("");
     setExplorerResults([]);
     setExplorerSelectedId(null);
     setExplorerOpen(true);
     return true;
+  }
+  function openAddToProject() {
+    const current = activeRef.current;
+    if (!current || current.kind !== "project") return;
+    explorerGeneration.current += 1;
+    addGeneration.current = null;
+    setCommandsOpen(false);
+    setExplorerPurpose("add-to-project");
+    setExplorerOrigin({ documentId: current.id, cursor: 0 });
+    setExplorerQuery(""); setExplorerResults([]); setExplorerSelectedId(null); setExplorerOpen(true);
   }
 
   function handleOpenReference(id: number) {
@@ -593,6 +666,8 @@ export function App() {
   }
 
   function closeExplorer(restoreFocus: boolean) {
+    const generation = ++explorerGeneration.current;
+    addGeneration.current = null;
     searchToken.current += 1;
     const origin = explorerOrigin;
     setExplorerOpen(false);
@@ -600,11 +675,38 @@ export function App() {
     setExplorerResults([]);
     setExplorerSelectedId(null);
     if (restoreFocus && origin && activeRef.current?.id === origin.documentId) {
-      queueMicrotask(() => editorRef.current?.focus(origin.cursor));
+      setTimeout(() => {
+        if (generation === explorerGeneration.current && !explorerOpenRef.current && activeRef.current?.id === origin.documentId) {
+          editorRef.current?.focus(origin.cursor);
+        }
+      }, 1);
     }
   }
 
   function openExplorerSelection(id: number) {
+    if (explorerPurpose === "add-to-project") {
+      const project = activeRef.current;
+      if (!project || project.kind !== "project" || addGeneration.current !== null) return;
+      const generation = explorerGeneration.current;
+      addGeneration.current = generation;
+      void addDocumentToProject(project.id, id)
+        .then(() => {
+          if (generation !== explorerGeneration.current || activeRef.current?.id !== project.id) return null;
+          return listProjectDocuments(project.id);
+        })
+        .then((rows) => {
+          if (!rows || generation !== explorerGeneration.current || activeRef.current?.id !== project.id || !explorerOpenRef.current || explorerPurposeRef.current !== "add-to-project") return;
+          setProjectDocuments(rows);
+          closeExplorer(true);
+        })
+        .catch((error) => {
+          if (generation === explorerGeneration.current) setNotice(message(error));
+        })
+        .finally(() => {
+          if (addGeneration.current === generation) addGeneration.current = null;
+        });
+      return;
+    }
     if (id === activeRef.current?.id) {
       closeExplorer(true);
       return;
@@ -614,6 +716,7 @@ export function App() {
   }
 
   function insertExplorerReference() {
+    if (explorerPurposeRef.current !== "open") return;
     const selected = explorerResults.find((document) => document.id === explorerSelectedId);
     const origin = explorerOrigin;
     if (!selected || !origin || activeRef.current?.id !== origin.documentId) return;
@@ -631,6 +734,7 @@ export function App() {
     setCommandsOpen(false);
     queueMicrotask(() => void newStandaloneNote("private"));
   }
+  function chooseNewProject() { setCommandsOpen(false); queueMicrotask(() => void newProject()); }
 
   function chooseDelete() {
     const current = activeRef.current;
@@ -795,6 +899,17 @@ export function App() {
                   )}
                 </div>
               )}
+              {active.kind === "project" && (
+                <div className="mt-10 border-t border-border/60 pt-4">
+                  <div className="flex items-center justify-between gap-4">
+                    <h2 className="text-sm font-medium text-[#f3efe7]">Project documents</h2>
+                    <button type="button" className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-white/5 hover:text-foreground" onClick={openAddToProject}>Add document</button>
+                  </div>
+                  {projectDocuments.length === 0 ? <p className="mt-3 text-sm text-muted-foreground">Add notes, daily documents, or artifacts to this project.</p> : (
+                    <ul className="mt-2 space-y-1">{projectDocuments.map((document) => <li key={document.id}><button type="button" className="flex w-full items-center justify-between gap-3 rounded-md px-2 py-2 text-left hover:bg-white/5" onClick={() => void openDocument(document.id)}><span className="truncate text-sm">{documentLabel(document)}</span><span className="shrink-0 text-xs text-muted-foreground">{document.kind === "daily" ? "Daily" : document.kind === "artifact" ? "Artifact" : "Note"} · {document.day} · {document.author === "agent" ? "Agent" : "You"}</span></button></li>)}</ul>
+                  )}
+                </div>
+              )}
             </section>
           )}
         </div>
@@ -817,6 +932,7 @@ export function App() {
             {activeIndex + 1}/{buffers.length} · {documentLabel(active)}
             {active.visibility === "private" ? " · Private" : ""}
             {active.kind === "artifact" ? " · Artifact" : ""}
+            {active.kind === "project" ? " · Project" : ""}
             {active.author === "agent" ? " · Agent" : ""}
             {presence.userCount > 1 ? ` · ${presence.userCount} viewers` : ""}
             {active.visibility === "shared" && presence.agentPresent ? " · ✦ Agent present" : ""}
@@ -837,8 +953,8 @@ export function App() {
         onOpenChange={(open) => {
           if (!open) closeExplorer(true);
         }}
-        title="Explore notes"
-        description="Search and open Archive documents"
+        title={explorerPurpose === "add-to-project" ? "Add document to project" : "Explore notes"}
+        description={explorerPurpose === "add-to-project" ? "Search for a document to add" : "Search and open Archive documents"}
         className="sm:max-w-2xl"
       >
         <Command
@@ -849,7 +965,7 @@ export function App() {
             if (event.ctrlKey && event.key === "Enter") {
               event.preventDefault();
               event.stopPropagation();
-              insertExplorerReference();
+              if (explorerPurpose === "open") insertExplorerReference();
             }
           }}
         >
@@ -861,11 +977,11 @@ export function App() {
               setExplorerSelectedId(null);
               setExplorerQuery(value);
             }}
-            placeholder="Search notes…"
+            placeholder={explorerPurpose === "add-to-project" ? "Search documents…" : "Search notes…"}
           />
           <div className="grid min-h-72 grid-cols-[minmax(0,1fr)_minmax(0,1fr)] border-t border-border/60">
             <CommandList className="max-h-80 border-r border-border/60 p-1">
-              <CommandEmpty>No matching notes.</CommandEmpty>
+              <CommandEmpty>{explorerPurpose === "add-to-project" ? "No matching documents." : "No matching notes."}</CommandEmpty>
               <CommandGroup heading="Documents">
                 {explorerResults.map((document) => (
                   <CommandItem
@@ -876,7 +992,7 @@ export function App() {
                   >
                     <span className="min-w-0 flex-1 truncate">{documentLabel(document)}</span>
                     <span className="shrink-0 text-[10px] uppercase text-muted-foreground">
-                      {document.kind === "daily" ? "Daily" : document.kind === "artifact" ? "Artifact" : "Note"}
+                      {document.kind === "daily" ? "Daily" : document.kind === "artifact" ? "Artifact" : document.kind === "project" ? "Project" : "Note"}
                       {document.visibility === "private" ? " · Private" : ""}
                       {document.author === "agent" ? " · Agent" : ""} · {document.day}
                     </span>
@@ -888,7 +1004,7 @@ export function App() {
               {selectedExplorerDocument ? (
                 <>
                   <div className="mb-3 text-xs text-muted-foreground">
-                    {selectedExplorerDocument.kind === "daily" ? "Daily" : selectedExplorerDocument.kind === "artifact" ? "Artifact" : "Note"}
+                    {selectedExplorerDocument.kind === "daily" ? "Daily" : selectedExplorerDocument.kind === "artifact" ? "Artifact" : selectedExplorerDocument.kind === "project" ? "Project" : "Note"}
                     {selectedExplorerDocument.visibility === "private" ? " · Private" : ""}
                     {selectedExplorerDocument.author === "agent" ? " · Agent" : ""} · {selectedExplorerDocument.day}
                   </div>
@@ -902,8 +1018,8 @@ export function App() {
             </div>
           </div>
           <div className="flex justify-end gap-4 border-t border-border/60 px-3 py-2 text-[10px] text-muted-foreground">
-            <span>Enter open</span>
-            <span>Ctrl Enter reference</span>
+            <span>Enter {explorerPurpose === "add-to-project" ? "add" : "open"}</span>
+            {explorerPurpose === "open" && <span>Ctrl Enter reference</span>}
             <span>Esc close</span>
           </div>
         </Command>
@@ -925,6 +1041,8 @@ export function App() {
                 Private note
                 <CommandShortcut>Ctrl Shift N</CommandShortcut>
               </CommandItem>
+              <CommandItem onSelect={chooseNewProject} disabled={busy}><FilePlus2 />New project</CommandItem>
+              {active?.kind === "project" && <CommandItem onSelect={openAddToProject} disabled={busy}><FilePlus2 />Add document</CommandItem>}
               <CommandItem onSelect={chooseDelete} disabled={active?.kind === "daily" || busy}>
                 <Trash2 />
                 {active?.kind === "daily" ? "Daily documents cannot be deleted" : `Delete ${active?.kind ?? "note"} permanently…`}
@@ -970,9 +1088,9 @@ export function App() {
       >
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Permanently delete this note?</AlertDialogTitle>
+            <AlertDialogTitle>Permanently delete this {active?.kind === "project" ? "project" : "note"}?</AlertDialogTitle>
             <AlertDialogDescription>
-              This standalone note will be removed immediately. Trash and recovery are not available yet.
+              {active?.kind === "project" ? "This project will be removed immediately. Member documents will be retained." : "This standalone note will be removed immediately. Trash and recovery are not available yet."}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -984,7 +1102,7 @@ export function App() {
                 setDeleteTargetId(null);
               }}
             >
-              Delete permanently
+              {active?.kind === "project" ? "Delete project" : "Delete permanently"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>

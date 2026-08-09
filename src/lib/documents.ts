@@ -15,7 +15,9 @@ export function noteTitle(body: string): string {
 }
 
 export function documentLabel(document: Document): string {
-  return document.kind === "daily" ? formatLocalDay(document.day) : noteTitle(document.body);
+  if (document.kind === "daily") return formatLocalDay(document.day);
+  const title = noteTitle(document.body);
+  return document.kind === "project" && title === "Untitled note" ? "Untitled project" : title;
 }
 
 export function escapeReferenceLabel(label: string): string {
