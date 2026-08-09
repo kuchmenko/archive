@@ -10,7 +10,7 @@ use chrono::{Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_SESSION_ID_BYTES: usize = 128;
 const PRESENCE_TTL_SECONDS: i64 = 10;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
@@ -49,13 +49,22 @@ pub struct ReferenceSummary {
     pub label: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DailyAttachment {
+    pub id: i64,
+    pub title: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug)]
 pub enum Error {
     InvalidDay,
     InvalidId,
     InvalidVisibility,
     InvalidTitle,
-    EmptyBody,
+    InvalidStatus,
     BodyTooLarge,
     TooManyReferenceIds,
     SearchQueryTooLarge,
@@ -81,7 +90,9 @@ impl fmt::Display for Error {
                 formatter,
                 "title must be a non-empty single line of at most {MAX_TITLE_BYTES} bytes"
             ),
-            Self::EmptyBody => write!(formatter, "body must not be empty"),
+            Self::InvalidStatus => {
+                write!(formatter, "status must be completed, blocked, or failed")
+            }
             Self::BodyTooLarge => write!(formatter, "body exceeds {MAX_BODY_BYTES} bytes"),
             Self::TooManyReferenceIds => write!(
                 formatter,
@@ -386,6 +397,31 @@ impl Database {
         Ok(matches)
     }
 
+    pub fn list_daily_attachments(&self, day: &str) -> Result<Vec<DailyAttachment>, Error> {
+        validate_day(day)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT a.id, a.body, COALESCE(da.status, 'completed'), a.created_at, a.updated_at
+             FROM document_attachments da
+             JOIN documents parent ON parent.id = da.parent_document_id
+             JOIN documents a ON a.id = da.attached_document_id
+             WHERE parent.kind = 'daily' AND parent.day = ?1
+               AND a.kind = 'artifact' AND a.author = 'agent'
+             ORDER BY a.created_at DESC, a.id DESC",
+        )?;
+        let rows = statement.query_map([day], |row| {
+            let body: String = row.get(1)?;
+            Ok(DailyAttachment {
+                id: row.get(0)?,
+                title: note_label(&body),
+                status: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn mcp_create_artifact(
         &self,
         title: &str,
@@ -437,30 +473,48 @@ impl Database {
         Ok(document)
     }
 
-    pub fn mcp_append_to_daily(&self, day: &str, body: &str) -> Result<Document, Error> {
+    pub fn mcp_create_daily_attachment(
+        &self,
+        day: &str,
+        title: &str,
+        body: &str,
+        status: Option<&str>,
+    ) -> Result<Document, Error> {
         validate_day(day)?;
-        if body.trim().is_empty() {
-            return Err(Error::EmptyBody);
-        }
+        validate_title(title)?;
         validate_body_size(body)?;
+        let status = status.unwrap_or("completed");
+        validate_status(status)?;
         crate::merman::validate_markdown_fences(body).map_err(Error::InvalidMermaid)?;
+        let mut markdown = format!("# {}", title.trim());
+        if !body.is_empty() {
+            markdown.push_str("\n\n");
+            markdown.push_str(body);
+        }
+        validate_body_size(&markdown)?;
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let timestamp = now();
-        let inserted = transaction.execute("INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body) VALUES ('daily', 'shared', 'user', ?1, ?2, ?2, '') ON CONFLICT(day) WHERE kind = 'daily' DO NOTHING", params![day, timestamp])?;
-        let current = get_daily(&transaction, day)?.ok_or(Error::MissingDocument(0))?;
-        let joined = if current.body.is_empty() {
-            body.to_owned()
-        } else {
-            format!("{}\n\n{}", current.body, body)
-        };
-        validate_body_size(&joined)?;
         transaction.execute(
-            "UPDATE documents SET body = ?1, updated_at = ?2, revision = revision + ?4 WHERE id = ?3",
-            params![joined, now(), current.id, i64::from(inserted == 0)],
+            "INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body)
+             VALUES ('daily', 'shared', 'user', ?1, ?2, ?2, '')
+             ON CONFLICT(day) WHERE kind = 'daily' DO NOTHING",
+            params![day, timestamp],
         )?;
-        let document = get_document_from(&transaction, current.id)?
-            .ok_or(Error::MissingDocument(current.id))?;
+        let daily = get_daily(&transaction, day)?.ok_or(Error::MissingDocument(0))?;
+        transaction.execute(
+            "INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body)
+             VALUES ('artifact', 'shared', 'agent', ?1, ?2, ?2, ?3)",
+            params![day, timestamp, markdown],
+        )?;
+        let artifact_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO document_attachments (parent_document_id, attached_document_id, status)
+             VALUES (?1, ?2, ?3)",
+            params![daily.id, artifact_id, status],
+        )?;
+        let document = get_document_from(&transaction, artifact_id)?
+            .ok_or(Error::MissingDocument(artifact_id))?;
         let document = sanitize_mcp_document(&transaction, document)?;
         transaction.commit()?;
         Ok(document)
@@ -495,7 +549,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
     }
     if version == 0 {
         create_v3_schema(&transaction)?;
-    } else if version < SCHEMA_VERSION {
+    } else if version == 1 || version == 2 {
         if version == 1 {
             create_v2_schema(&transaction)?;
             let migrated = {
@@ -555,6 +609,20 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
              PRAGMA user_version = 4;",
         )?;
     }
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 4 {
+        transaction.execute_batch(
+            "CREATE TABLE document_attachments (
+                parent_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                attached_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK (status IN ('completed', 'blocked', 'failed')),
+                PRIMARY KEY (parent_document_id, attached_document_id),
+                UNIQUE (attached_document_id)
+             );
+             CREATE INDEX document_attachments_parent ON document_attachments(parent_document_id);
+             PRAGMA user_version = 5;",
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -599,6 +667,13 @@ fn validate_title(title: &str) -> Result<(), Error> {
         Err(Error::InvalidTitle)
     } else {
         Ok(())
+    }
+}
+fn validate_status(status: &str) -> Result<(), Error> {
+    if matches!(status, "completed" | "blocked" | "failed") {
+        Ok(())
+    } else {
+        Err(Error::InvalidStatus)
     }
 }
 fn validate_body_size(body: &str) -> Result<(), Error> {
@@ -871,15 +946,71 @@ mod tests {
     }
 
     #[test]
-    fn fresh_schema_is_v4_with_constraints() {
+    fn fresh_schema_is_v5_with_constraints() {
         let database = database();
         let connection = database.connection.lock().unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','private','user','2026-01-01','a','a','')", []).is_err());
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','shared','agent','2026-01-01','a','a','')", []).is_err());
+        let table: String = connection
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='document_attachments'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(table.contains("completed"));
+        assert!(table.contains("blocked"));
+        assert!(table.contains("failed"));
+    }
+
+    #[test]
+    fn v4_migration_adds_document_attachments() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.sqlite3");
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            {
+                let tx = connection.transaction().unwrap();
+                create_v3_schema(&tx).unwrap();
+                tx.execute(
+                    "INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body)
+                     VALUES('daily','shared','user','2026-08-04','a','b','user body')",
+                    [],
+                )
+                .unwrap();
+                tx.execute_batch(
+                    "ALTER TABLE documents ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+                     CREATE TABLE presence (
+                        session_id TEXT PRIMARY KEY,
+                        actor TEXT NOT NULL CHECK(actor IN ('user', 'agent')),
+                        document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                        last_heartbeat INTEGER NOT NULL
+                     );
+                     PRAGMA user_version = 4;",
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+        }
+        let database = Database::open(&path).unwrap();
+        let version: i64 = database
+            .connection
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
+        assert_eq!(database.get_document(1).unwrap().body, "user body");
+        assert!(
+            database
+                .list_daily_attachments("2026-08-04")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1133,7 +1264,7 @@ mod tests {
         d.update_document_body(note.id, &"x".repeat(MAX_BODY_BYTES + 1))
             .unwrap();
         assert!(matches!(
-            d.mcp_append_to_daily("2026-08-04", &"x".repeat(MAX_BODY_BYTES + 1)),
+            d.mcp_create_daily_attachment("2026-08-04", "x", &"x".repeat(MAX_BODY_BYTES + 1), None),
             Err(Error::BodyTooLarge)
         ));
         assert!(matches!(
@@ -1143,18 +1274,33 @@ mod tests {
     }
 
     #[test]
-    fn append_uses_blank_paragraph_and_preserves_daily_contract() {
+    fn daily_attachment_leaves_daily_body_untouched() {
         let d = database();
-        let first = d.mcp_append_to_daily("2026-08-04", "one").unwrap();
-        let second = d.mcp_append_to_daily("2026-08-04", "two").unwrap();
-        assert_eq!(first.id, second.id);
-        assert_eq!(first.revision, 1);
-        assert_eq!(second.revision, 2);
-        assert_eq!(second.body, "one\n\ntwo");
-        assert_eq!(
-            (&second.visibility, &second.author),
-            (&"shared".to_owned(), &"user".to_owned())
-        );
+        let daily = d.get_or_create_daily("2026-08-04").unwrap();
+        d.update_document_body(daily.id, "user thoughts").unwrap();
+        let first = d
+            .mcp_create_daily_attachment("2026-08-04", "Run A", "details a", Some("blocked"))
+            .unwrap();
+        let second = d
+            .mcp_create_daily_attachment("2026-08-04", "Run B", "details b", Some("failed"))
+            .unwrap();
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.kind, "artifact");
+        assert_eq!(first.author, "agent");
+        assert_eq!(first.body, "# Run A\n\ndetails a");
+        assert_eq!(d.get_document(daily.id).unwrap().body, "user thoughts");
+        assert_eq!(d.get_document(daily.id).unwrap().revision, 2);
+        let attachments = d.list_daily_attachments("2026-08-04").unwrap();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].id, second.id);
+        assert_eq!(attachments[0].title, "Run B");
+        assert_eq!(attachments[0].status, "failed");
+        assert_eq!(attachments[1].id, first.id);
+        assert_eq!(attachments[1].status, "blocked");
+        assert!(matches!(
+            d.mcp_create_daily_attachment("2026-08-04", "Bad", "x", Some("running")),
+            Err(Error::InvalidStatus)
+        ));
     }
 
     #[test]
@@ -1220,17 +1366,21 @@ mod tests {
     }
 
     #[test]
-    fn invalid_mermaid_rejects_create_and_append_without_mutation() {
+    fn invalid_mermaid_rejects_create_and_attachment_without_mutation() {
         let d = database();
         let invalid = "```mermaid\nflowchart TD\nA-->\n```";
         let create_error = d.mcp_create_artifact("Rejected", invalid, &[]).unwrap_err();
         assert!(create_error.to_string().contains("Mermaid block 1"));
         assert!(d.mcp_search_documents("Rejected", 50).unwrap().is_empty());
 
-        let daily = d.mcp_append_to_daily("2026-08-04", "before").unwrap();
-        let append_error = d.mcp_append_to_daily("2026-08-04", invalid).unwrap_err();
-        assert!(append_error.to_string().contains("Mermaid block 1"));
+        let daily = d.get_or_create_daily("2026-08-04").unwrap();
+        d.update_document_body(daily.id, "before").unwrap();
+        let attach_error = d
+            .mcp_create_daily_attachment("2026-08-04", "Rejected", invalid, None)
+            .unwrap_err();
+        assert!(attach_error.to_string().contains("Mermaid block 1"));
         assert_eq!(d.get_document(daily.id).unwrap().body, "before");
+        assert!(d.list_daily_attachments("2026-08-04").unwrap().is_empty());
     }
 
     #[test]
@@ -1247,29 +1397,29 @@ mod tests {
         d.update_document_body(daily.id, "```mermaid\ninvalid")
             .unwrap();
         assert!(
-            d.mcp_append_to_daily("2026-08-04", "plain addition")
+            d.mcp_create_daily_attachment("2026-08-04", "Plain", "plain addition", None)
                 .is_ok()
+        );
+        assert_eq!(
+            d.get_document(daily.id).unwrap().body,
+            "```mermaid\ninvalid"
         );
     }
 
     #[test]
-    fn gui_replace_rejects_a_stale_body_after_mcp_append() {
+    fn gui_replace_is_unaffected_by_mcp_daily_attachment() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("archive.sqlite3");
         let gui = Database::open(&path).unwrap();
         let mcp = Database::open(&path).unwrap();
         let daily = gui.get_or_create_daily("2026-08-04").unwrap();
         gui.update_document_body(daily.id, "user text").unwrap();
-        mcp.mcp_append_to_daily("2026-08-04", "agent append")
+        mcp.mcp_create_daily_attachment("2026-08-04", "Agent run", "agent append", None)
             .unwrap();
 
-        assert!(matches!(
-            gui.replace_document_body(daily.id, 2, "user edit"),
-            Err(Error::WriteConflict)
-        ));
-        assert_eq!(
-            gui.get_document(daily.id).unwrap().body,
-            "user text\n\nagent append"
-        );
+        let updated = gui.replace_document_body(daily.id, 2, "user edit").unwrap();
+        assert_eq!(updated.body, "user edit");
+        assert_eq!(gui.get_document(daily.id).unwrap().body, "user edit");
+        assert_eq!(gui.list_daily_attachments("2026-08-04").unwrap().len(), 1);
     }
 }

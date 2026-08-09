@@ -28,12 +28,14 @@ import {
   deleteNote,
   getDocument,
   getOrCreateDaily,
+  listDailyAttachments,
   removePresence,
   resolveReferences,
   searchDocuments,
   syncDocument,
   updateDocument,
   updatePresence,
+  type DailyAttachment,
   type Document,
   type ReferenceSummary,
 } from "@/lib/archive";
@@ -44,11 +46,31 @@ import { addBuffer, adjacentBufferId, removeBuffer, type DocumentBuffer } from "
 import { parseNoteReferences } from "@/lib/documents";
 import { appShortcut } from "@/lib/shortcuts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { FilePlus2, Settings, Trash2 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { ChevronRight, FilePlus2, Settings, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 function message(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+function formatAttachmentTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function statusLabel(status: DailyAttachment["status"]): string {
+  switch (status) {
+    case "blocked":
+      return "Blocked";
+    case "failed":
+      return "Failed";
+    default:
+      return "Completed";
+  }
 }
 
 type DocumentConflict = {
@@ -82,12 +104,15 @@ export function App() {
   const [conflict, setConflict] = useState<DocumentConflict | null>(null);
   const [resolvingConflict, setResolvingConflict] = useState(false);
   const [presence, setPresence] = useState<Presence>({ userCount: 1, agentPresent: false });
+  const [attachments, setAttachments] = useState<DailyAttachment[]>([]);
+  const [shelfExpanded, setShelfExpanded] = useState(false);
   const activeRef = useRef(active);
   const todayRef = useRef(today);
   const operation = useRef(true);
   const editorRef = useRef<MarkdownEditorHandle>(null);
   const searchToken = useRef(0);
   const referenceToken = useRef(0);
+  const attachmentToken = useRef(0);
   const buffersRef = useRef(buffers);
   const conflictRef = useRef(conflict);
   const syncGeneration = useRef(0);
@@ -174,6 +199,32 @@ export function App() {
         if (token === referenceToken.current) setNotice(`References: ${message(error)}`);
       });
   }, [active?.id, activeReferenceIdsKey]);
+
+  useEffect(() => {
+    if (!active || active.kind !== "daily") {
+      setAttachments([]);
+      setShelfExpanded(false);
+      return;
+    }
+    const day = active.day;
+    const token = ++attachmentToken.current;
+    const load = () => {
+      void listDailyAttachments(day)
+        .then((rows) => {
+          if (token !== attachmentToken.current) return;
+          if (activeRef.current?.kind !== "daily" || activeRef.current.day !== day) return;
+          setAttachments(rows);
+        })
+        .catch((error) => {
+          if (token === attachmentToken.current) setNotice(`Agent work: ${message(error)}`);
+        });
+    };
+    load();
+    const timer = setInterval(load, 2_000);
+    return () => {
+      clearInterval(timer);
+    };
+  }, [active?.id, active?.kind, active?.day]);
 
   useEffect(() => {
     const day = todayRef.current;
@@ -648,6 +699,11 @@ export function App() {
       : documentLabel(active)
     : formatLocalDay(today);
   const activeIndex = active ? buffers.findIndex((buffer) => buffer.document.id === active.id) : -1;
+  const actionableAttachmentCount = useMemo(
+    () => attachments.filter((item) => item.status === "blocked" || item.status === "failed").length,
+    [attachments],
+  );
+  const showAgentShelf = active?.kind === "daily" && attachments.length > 0;
 
   return (
     <div className="grid h-screen grid-rows-[minmax(0,1fr)_28px] overflow-hidden bg-background text-foreground">
@@ -684,6 +740,61 @@ export function App() {
                 onPreviousBuffer={() => switchBuffer(-1)}
                 onNextBuffer={() => switchBuffer(1)}
               />
+              {showAgentShelf && (
+                <div className="mt-10 border-t border-border/60 pt-4">
+                  <button
+                    type="button"
+                    className="flex w-full items-center gap-2 rounded-md px-1 py-1.5 text-left text-sm text-muted-foreground transition-colors hover:bg-white/5 hover:text-foreground"
+                    onClick={() => setShelfExpanded((value) => !value)}
+                    aria-expanded={shelfExpanded}
+                  >
+                    <ChevronRight
+                      className={`size-3.5 shrink-0 transition-transform ${shelfExpanded ? "rotate-90" : ""}`}
+                    />
+                    <span className="min-w-0 flex-1 truncate">
+                      Agent work · {attachments.length}{" "}
+                      {attachments.length === 1 ? "subnote" : "subnotes"}
+                    </span>
+                    {actionableAttachmentCount > 0 && (
+                      <span className="shrink-0 text-xs text-amber-200/90">
+                        {actionableAttachmentCount} blocked
+                      </span>
+                    )}
+                  </button>
+                  {shelfExpanded && (
+                    <ul className="mt-2 space-y-1">
+                      {attachments.map((attachment) => (
+                        <li key={attachment.id}>
+                          <button
+                            type="button"
+                            className="flex w-full items-start gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-white/5"
+                            onClick={() => void openDocument(attachment.id)}
+                            disabled={busy || conflict !== null}
+                          >
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate text-sm text-[#f3efe7]">
+                                {attachment.title}
+                              </span>
+                              <span className="mt-0.5 block truncate text-xs text-muted-foreground">
+                                {formatAttachmentTime(attachment.updated_at)}
+                              </span>
+                            </span>
+                            <span
+                              className={`shrink-0 pt-0.5 text-[11px] uppercase tracking-[0.06em] ${
+                                attachment.status === "completed"
+                                  ? "text-muted-foreground"
+                                  : "text-amber-200/90"
+                              }`}
+                            >
+                              {statusLabel(attachment.status)}
+                            </span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
             </section>
           )}
         </div>

@@ -69,7 +69,7 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
             .unwrap()
             .iter()
             .all(|tool| {
-                tool.get("inputSchema").is_some() && tool.get("outputSchema").is_some()
+                tool.get("inputSchema").is_some() && tool["outputSchema"]["type"] == "object"
             })
     );
 
@@ -135,15 +135,10 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
         .unwrap();
     assert_eq!(agent_document, id);
 
-    for (request_id, expected_revision, expected_body) in [
-        (7, 1, "first append"),
-        (8, 2, "first append\n\nsecond append"),
+    for (request_id, title, body, status) in [
+        (7, "First run", "first attachment", "blocked"),
+        (8, "Second run", "second attachment", "failed"),
     ] {
-        let addition = if request_id == 7 {
-            "first append"
-        } else {
-            "second append"
-        };
         send(
             &mut stdin,
             json!({
@@ -151,36 +146,70 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
                 "id": request_id,
                 "method": "tools/call",
                 "params": {
-                    "name": "append_to_daily",
-                    "arguments": {"day": "2026-08-04", "body": addition}
+                    "name": "create_daily_attachment",
+                    "arguments": {
+                        "day": "2026-08-04",
+                        "title": title,
+                        "body": body,
+                        "status": status
+                    }
                 }
             }),
         );
-        let appended = response(&mut stdout, request_id);
+        let attached = response(&mut stdout, request_id);
+        let content = &attached["result"]["structuredContent"];
+        assert_eq!(content["kind"], "artifact");
+        assert_eq!(content["author"], "agent");
         assert_eq!(
-            appended["result"]["structuredContent"]["body"],
-            expected_body
-        );
-        let (revision, stored_body): (i64, String) = observer
-            .query_row(
-                "SELECT revision, body FROM documents WHERE kind='daily' AND day='2026-08-04'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            (revision, stored_body.as_str()),
-            (expected_revision, expected_body)
+            content["body"].as_str().unwrap(),
+            format!("# {title}\n\n{body}")
         );
     }
-    let daily_agent_count: i64 = observer
+    let (daily_revision, daily_body): (i64, String) = observer
         .query_row(
-            "SELECT count(*) FROM presence p JOIN documents d ON d.id=p.document_id WHERE p.actor='agent' AND d.kind='daily' AND d.day='2026-08-04'",
+            "SELECT revision, body FROM documents WHERE kind='daily' AND day='2026-08-04'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((daily_revision, daily_body.as_str()), (1, ""));
+    let attachment_count: i64 = observer
+        .query_row(
+            "SELECT count(*) FROM document_attachments da
+             JOIN documents parent ON parent.id = da.parent_document_id
+             WHERE parent.kind='daily' AND parent.day='2026-08-04'",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(daily_agent_count, 1);
+    assert_eq!(attachment_count, 2);
+    let agent_on_artifact: i64 = observer
+        .query_row(
+            "SELECT count(*) FROM presence p JOIN documents d ON d.id=p.document_id WHERE p.actor='agent' AND d.kind='artifact'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(agent_on_artifact, 1);
+
+    send(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "search_documents",
+                "arguments": {"query": "Validated diagram", "limit": 1}
+            }
+        }),
+    );
+    let search = response(&mut stdout, 9);
+    assert_eq!(
+        search["result"]["structuredContent"]["documents"][0]["id"],
+        id
+    );
+    assert!(search.get("error").is_none());
 
     drop(stdin);
     let mut remaining_stdout = String::new();

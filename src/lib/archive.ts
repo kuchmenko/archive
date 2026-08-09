@@ -29,6 +29,16 @@ export type ReferenceSummary = {
   label: string;
 };
 
+export type AttachmentStatus = "completed" | "blocked" | "failed";
+
+export type DailyAttachment = {
+  id: number;
+  title: string;
+  status: AttachmentStatus;
+  created_at: string;
+  updated_at: string;
+};
+
 export type MermaidDiagnostic = {
   line?: number;
   column?: number;
@@ -80,6 +90,10 @@ export function searchDocuments(activeDay: string, query: string): Promise<Docum
 
 export function resolveReferences(ids: number[]): Promise<ReferenceSummary[]> {
   return invoke("resolve_references", { ids });
+}
+
+export function listDailyAttachments(day: string): Promise<DailyAttachment[]> {
+  return invoke("list_daily_attachments", { day });
 }
 
 export function renderMermaid(source: string, diagramId: string): Promise<MermaidRender> {

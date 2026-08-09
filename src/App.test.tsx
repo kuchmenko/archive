@@ -1,7 +1,16 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
-import { createNote, getOrCreateDaily, removePresence, syncDocument, updateDocument, updatePresence } from "./lib/archive";
+import {
+  createNote,
+  getDocument,
+  getOrCreateDaily,
+  listDailyAttachments,
+  removePresence,
+  syncDocument,
+  updateDocument,
+  updatePresence,
+} from "./lib/archive";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
 
 vi.mock("@tauri-apps/api/window", () => ({
@@ -16,6 +25,7 @@ vi.mock("./lib/archive", () => ({
   deleteNote: vi.fn(),
   getDocument: vi.fn(),
   getOrCreateDaily: vi.fn(),
+  listDailyAttachments: vi.fn(),
   searchDocuments: vi.fn(),
   resolveReferences: vi.fn().mockResolvedValue([]),
   updateDocument: vi.fn(),
@@ -68,6 +78,14 @@ describe("Archive document canvas", () => {
     });
     vi.mocked(getOrCreateDaily).mockResolvedValue(daily);
     vi.mocked(createNote).mockResolvedValue({ ...daily, id: 2, kind: "note" });
+    vi.mocked(listDailyAttachments).mockResolvedValue([]);
+    vi.mocked(getDocument).mockImplementation(async (id) => ({
+      ...daily,
+      id,
+      kind: id === 1 ? "daily" : "artifact",
+      author: id === 1 ? "user" : "agent",
+      body: id === 1 ? daily.body : "# Agent run",
+    }));
     vi.mocked(syncDocument).mockResolvedValue({
       document: null,
       user_count: 1,
@@ -270,5 +288,50 @@ describe("Archive document canvas", () => {
     fireEvent.click(screen.getByRole("button", { name: "Use remote" }));
     expect(container.querySelector(".cm-content")?.textContent).toContain("REMOTEbase");
     expect(updateDocument).not.toHaveBeenCalled();
+  });
+
+  it("shows a collapsed agent-work shelf and opens an attachment as a document", async () => {
+    const artifact = {
+      ...daily,
+      id: 9,
+      kind: "artifact" as const,
+      author: "agent" as const,
+      body: "# CLOB portfolio projection writer E2E",
+      revision: 1,
+    };
+    vi.mocked(listDailyAttachments).mockResolvedValue([
+      {
+        id: 9,
+        title: "CLOB portfolio projection writer E2E",
+        status: "blocked",
+        created_at: "2026-08-03T10:42:00.000Z",
+        updated_at: "2026-08-03T10:42:00.000Z",
+      },
+      {
+        id: 10,
+        title: "Credential capture was too old",
+        status: "failed",
+        created_at: "2026-08-03T09:18:00.000Z",
+        updated_at: "2026-08-03T09:18:00.000Z",
+      },
+    ]);
+    vi.mocked(getDocument).mockResolvedValue(artifact);
+    render(<App />);
+    await act(async () => Promise.resolve());
+
+    expect(listDailyAttachments).toHaveBeenCalledWith("2026-08-03");
+    expect(screen.getByRole("button", { name: /Agent work · 2 subnotes/ })).toBeTruthy();
+    expect(screen.getByText("2 blocked")).toBeTruthy();
+    expect(screen.queryByText("CLOB portfolio projection writer E2E")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Agent work · 2 subnotes/ }));
+    expect(screen.getByText("CLOB portfolio projection writer E2E")).toBeTruthy();
+    expect(screen.getByText("Blocked")).toBeTruthy();
+    expect(screen.getByText("Failed")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /CLOB portfolio projection writer E2E/ }));
+    await act(async () => Promise.resolve());
+    expect(getDocument).toHaveBeenCalledWith(9);
+    expect(screen.getByRole("heading", { name: "CLOB portfolio projection writer E2E" })).toBeTruthy();
   });
 });

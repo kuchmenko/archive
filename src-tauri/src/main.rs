@@ -2,7 +2,9 @@ mod database;
 mod mcp;
 mod merman;
 
-use database::{Database, Document, DocumentSummary, ReferenceSummary, SyncSnapshot};
+use database::{
+    DailyAttachment, Database, Document, DocumentSummary, ReferenceSummary, SyncSnapshot,
+};
 use tauri::{Manager, State};
 
 #[tauri::command]
@@ -105,6 +107,16 @@ fn resolve_references(
         .map_err(|error| error.to_string())
 }
 
+#[tauri::command]
+fn list_daily_attachments(
+    database: State<'_, Database>,
+    day: String,
+) -> Result<Vec<DailyAttachment>, String> {
+    database
+        .list_daily_attachments(&day)
+        .map_err(|error| error.to_string())
+}
+
 fn app_database_path() -> Result<std::path::PathBuf, String> {
     dirs::data_dir()
         .map(|path| path.join("dev.kuchmenko.archive").join("archive.sqlite3"))
@@ -135,6 +147,7 @@ fn run_gui() {
             delete_note,
             search_documents,
             resolve_references,
+            list_daily_attachments,
             render_mermaid
         ])
         .run(tauri::generate_context!())

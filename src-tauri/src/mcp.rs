@@ -43,9 +43,12 @@ struct CreateArtifactArgs {
     related_document_ids: Option<Vec<i64>>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct AppendArgs {
+struct CreateDailyAttachmentArgs {
     day: String,
+    title: String,
     body: String,
+    /// One of: completed, blocked, failed. Defaults to completed.
+    status: Option<String>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct ValidateMermaidArgs {
@@ -60,6 +63,11 @@ struct DocumentSummary {
     day: String,
     label: String,
     updated_at: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct SearchDocumentsResult {
+    documents: Vec<DocumentSummary>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -154,12 +162,12 @@ impl ArchiveMcp {
     fn search_documents(
         &self,
         Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<Json<Vec<DocumentSummary>>, String> {
+    ) -> Result<Json<SearchDocumentsResult>, String> {
         self.database
             .mcp_search_documents(&args.query, args.limit.unwrap_or(20))
             .map(|documents| {
-                Json(
-                    documents
+                Json(SearchDocumentsResult {
+                    documents: documents
                         .into_iter()
                         .map(|document| DocumentSummary {
                             label: label(&document),
@@ -170,7 +178,7 @@ impl ArchiveMcp {
                             updated_at: document.updated_at,
                         })
                         .collect(),
-                )
+                })
             })
             .map_err(tool_error)
     }
@@ -209,13 +217,15 @@ impl ArchiveMcp {
             })
     }
 
-    #[tool(description = "Append content to the shared user daily for an explicit YYYY-MM-DD day")]
-    fn append_to_daily(
+    #[tool(
+        description = "Create an agent-authored artifact attached to the daily note for an explicit YYYY-MM-DD day without mutating the daily body"
+    )]
+    fn create_daily_attachment(
         &self,
-        Parameters(args): Parameters<AppendArgs>,
+        Parameters(args): Parameters<CreateDailyAttachmentArgs>,
     ) -> Result<Json<SharedDocument>, String> {
         self.database
-            .mcp_append_to_daily(&args.day, &args.body)
+            .mcp_create_daily_attachment(&args.day, &args.title, &args.body, args.status.as_deref())
             .map_err(tool_error)
             .map(|document| {
                 self.claim(document.id);
@@ -278,8 +288,8 @@ mod tests {
                 .map(|tool| tool.name.as_ref())
                 .collect::<std::collections::BTreeSet<_>>(),
             [
-                "append_to_daily",
                 "create_artifact",
+                "create_daily_attachment",
                 "read_document",
                 "search_documents",
                 "validate_mermaid"
@@ -350,16 +360,24 @@ mod tests {
         assert_eq!(valid.structured_content.unwrap()["valid"], true);
         let result = client
             .call_tool(
-                CallToolRequestParams::new("append_to_daily").with_arguments(
-                    serde_json::json!({"day":"2026-08-04","body":"hello"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+                CallToolRequestParams::new("create_daily_attachment").with_arguments(
+                    serde_json::json!({
+                        "day":"2026-08-04",
+                        "title":"Run",
+                        "body":"hello",
+                        "status":"blocked"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
                 ),
             )
             .await
             .unwrap();
-        assert_eq!(result.structured_content.unwrap()["body"], "hello");
+        let content = result.structured_content.unwrap();
+        assert_eq!(content["kind"], "artifact");
+        assert_eq!(content["author"], "agent");
+        assert_eq!(content["body"], "# Run\n\nhello");
         let malformed = client
             .call_tool(
                 CallToolRequestParams::new("read_document").with_arguments(
