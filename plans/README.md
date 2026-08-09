@@ -7,12 +7,14 @@ Generated on 2026-08-09. Execute in the order below unless dependencies say othe
 | Plan | Title | Priority | Effort | Depends on | Status |
 |------|-------|----------|--------|------------|--------|
 | 001 | Establish project-centered knowledge | P1 | L | — | DONE |
+| 002 | Add human journal, reading, and agent-review workflows | P1 | L | 001 | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED
 
 ## Dependency notes
 
-- Human reading, journal, agent-review, and Vim milestones will be planned after the project model and MCP contract are established.
+- Plan 002 builds on project documents and the attachment contract established by plan 001.
+- Vim ownership and runner-wide Archive adoption remain later milestones after plan 002.
 
 ## Findings considered and rejected
 
