@@ -4,13 +4,13 @@ import { Annotation, Compartment, EditorState, RangeSetBuilder, StateEffect, Sta
 import { Decoration, drawSelection, EditorView, keymap, ViewPlugin, WidgetType } from "@codemirror/view";
 import { getCM, vim } from "@replit/codemirror-vim";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
-import DOMPurify from "dompurify";
 import { noteReferenceAt, parseNoteReferences } from "@/lib/documents";
 import { renderMermaid, type MermaidRender, type ReferenceSummary } from "@/lib/archive";
 import { mermaidBlockKey, mermaidBlocks, selectionIntersectsBlock, type MermaidBlock } from "@/lib/mermaid";
 import type { EditorSnapshot } from "@/lib/buffers";
 import { formatLocalDay } from "@/lib/date";
 import { appShortcut } from "@/lib/shortcuts";
+import { sanitizeSvg } from "@/lib/sanitize";
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 
 export type MarkdownEditorHandle = {
@@ -146,18 +146,6 @@ function referenceDecorations(references: ReferenceSummary[], open: (id: number)
   }, { decorations: (plugin) => plugin.decorations });
 }
 
-function safeSvg(svg: string) {
-  const sanitized = DOMPurify.sanitize(svg, {
-    USE_PROFILES: { svg: true, svgFilters: true },
-    FORBID_TAGS: ["foreignObject", "script"],
-    FORBID_ATTR: ["href", "xlink:href"],
-  });
-  const parsed = new DOMParser().parseFromString(sanitized, "image/svg+xml");
-  const root = parsed.documentElement;
-  if (root.localName !== "svg" || parsed.querySelector("parsererror")) return null;
-  return document.importNode(root, true);
-}
-
 class MermaidWidget extends WidgetType {
   constructor(
     readonly block: MermaidBlock,
@@ -191,7 +179,7 @@ class MermaidWidget extends WidgetType {
       });
     }
     if (valid) {
-      const imported = safeSvg(this.result!.svg!);
+      const imported = sanitizeSvg(this.result!.svg!);
       if (imported) element.append(imported);
     } else if (this.result) {
       const diagnostic = document.createElement("div");

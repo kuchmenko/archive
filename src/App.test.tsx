@@ -6,9 +6,13 @@ import {
   createNote,
   createProject,
   deleteNote,
+  dailyNeighbors,
+  getAttachmentByArtifactId,
   getDocument,
   getOrCreateDaily,
   listDailyAttachments,
+  listUnreviewedAttachments,
+  markAttachmentReviewed,
   listProjectDocuments,
   removePresence,
   searchDocuments,
@@ -33,6 +37,12 @@ vi.mock("./lib/archive", () => ({
   getDocument: vi.fn(),
   getOrCreateDaily: vi.fn(),
   listDailyAttachments: vi.fn(),
+  dailyNeighbors: vi.fn().mockResolvedValue({ previous: null, next: null }),
+  getAttachmentByArtifactId: vi.fn().mockResolvedValue(null),
+  listUnreviewedAttachments: vi.fn().mockResolvedValue([]),
+  markAttachmentReviewed: vi.fn(),
+  renderMarkdown: vi.fn().mockResolvedValue("<h1>Rendered</h1>"),
+  renderMermaid: vi.fn(),
   listProjectDocuments: vi.fn(),
   searchDocuments: vi.fn(),
   resolveReferences: vi.fn().mockResolvedValue([]),
@@ -138,6 +148,186 @@ describe("Archive document canvas", () => {
     await act(async () => Promise.resolve());
     expect(createNote).toHaveBeenCalledWith("2026-08-03", "shared");
     expect(screen.getByRole("heading", { name: "Untitled note" })).toBeTruthy();
+  });
+
+  it("toggles user documents through visible and command actions but forces artifacts to Read", async () => {
+    vi.mocked(listUnreviewedAttachments).mockResolvedValue([{ artifact_id: 8, title: "Agent output", day: daily.day, status: "completed", created_at: daily.created_at, updated_at: daily.updated_at, reviewed_at: null }]);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    expect(container.querySelector(".cm-editor")).toBeTruthy();
+    expect(container.querySelector("footer")?.textContent).toContain("Edit");
+
+    fireEvent.click(screen.getByRole("button", { name: "Read" }));
+    await act(async () => Promise.resolve());
+    expect(screen.getByText("This document is empty.")).toBeTruthy();
+    expect(container.querySelector("footer")?.textContent).toContain("Read");
+
+    fireEvent.keyDown(document, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getByText("Edit document"));
+    await act(async () => Promise.resolve());
+    expect(container.querySelector(".cm-editor")).toBeTruthy();
+
+    vi.mocked(getDocument).mockResolvedValueOnce({
+      ...daily, id: 8, kind: "artifact", author: "agent", body: "# Agent output",
+    });
+    fireEvent.keyDown(document, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getAllByText("Review agent work").at(-1)!);
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByText("Agent output"));
+    await act(async () => Promise.resolve());
+    expect(container.querySelector(".cm-editor")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
+  });
+
+  it("keeps Edit when the Read flush fails", async () => {
+    vi.mocked(updateDocument).mockRejectedValueOnce(new Error("disk full"));
+    vi.mocked(readText).mockResolvedValue("changed");
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByRole("button", { name: "Read" }));
+    await act(async () => Promise.resolve());
+    expect(container.querySelector(".cm-editor")).toBeTruthy();
+    expect(screen.getByText(/Could not save note: disk full/)).toBeTruthy();
+  });
+
+  it("navigates existing daily gaps without creation and returns through canonical Today", async () => {
+    vi.mocked(dailyNeighbors).mockResolvedValueOnce({
+      previous: { id: 3, day: "2026-08-01" }, next: null,
+    });
+    vi.mocked(getDocument).mockResolvedValueOnce({ ...daily, id: 3, day: "2026-08-01" });
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByRole("button", { name: /Previous daily/ }));
+    await act(async () => Promise.resolve());
+    expect(getDocument).toHaveBeenCalledWith(3);
+    expect(getOrCreateDaily).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "Today" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Today" }));
+    await act(async () => Promise.resolve());
+    expect(getOrCreateDaily).toHaveBeenLastCalledWith("2026-08-03");
+    expect(container.querySelector("footer")?.textContent).toContain("Monday, August 3, 2026");
+  });
+
+  it("ignores stale daily neighbor success after switching documents", async () => {
+    const pending = deferred<Awaited<ReturnType<typeof dailyNeighbors>>>();
+    vi.mocked(dailyNeighbors).mockReturnValueOnce(pending.promise);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    await act(async () => Promise.resolve());
+    await act(async () => pending.resolve({ previous: { id: 3, day: "2026-08-01" }, next: null }));
+
+    expect(screen.getByRole("heading", { name: "Untitled note" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Previous daily/ })).toBeNull();
+  });
+
+  it("ignores stale daily neighbor errors after switching documents", async () => {
+    const pending = deferred<Awaited<ReturnType<typeof dailyNeighbors>>>();
+    vi.mocked(dailyNeighbors).mockReturnValueOnce(pending.promise);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+
+    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    await act(async () => Promise.resolve());
+    await act(async () => pending.reject(new Error("stale neighbor failure")));
+
+    expect(screen.queryByText(/stale neighbor failure/)).toBeNull();
+  });
+
+  it("ignores stale attachment metadata success after switching documents", async () => {
+    const pending = deferred<Awaited<ReturnType<typeof getAttachmentByArtifactId>>>();
+    const row = { artifact_id: 8, title: "Agent output", day: daily.day, status: "blocked" as const, created_at: daily.created_at, updated_at: daily.updated_at, reviewed_at: null };
+    vi.mocked(listUnreviewedAttachments).mockResolvedValue([row]);
+    vi.mocked(getAttachmentByArtifactId).mockReturnValueOnce(pending.promise);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(document, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getAllByText("Review agent work").at(-1)!);
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByText("Agent output"));
+    await act(async () => Promise.resolve());
+
+    fireEvent.keyDown(document, { ctrlKey: true, key: "n" });
+    await act(async () => Promise.resolve());
+    await act(async () => pending.resolve(row));
+
+    expect(screen.getByRole("heading", { name: "Untitled note" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Mark reviewed" })).toBeNull();
+    expect(container.textContent).not.toContain("Blocked");
+  });
+
+  it("ignores stale attachment metadata errors after switching documents", async () => {
+    const pending = deferred<Awaited<ReturnType<typeof getAttachmentByArtifactId>>>();
+    const row = { artifact_id: 8, title: "Agent output", day: daily.day, status: "completed" as const, created_at: daily.created_at, updated_at: daily.updated_at, reviewed_at: null };
+    vi.mocked(listUnreviewedAttachments).mockResolvedValue([row]);
+    vi.mocked(getAttachmentByArtifactId).mockReturnValueOnce(pending.promise);
+    render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(document, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getAllByText("Review agent work").at(-1)!);
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByText("Agent output"));
+    await act(async () => Promise.resolve());
+
+    fireEvent.keyDown(document, { ctrlKey: true, key: "n" });
+    await act(async () => Promise.resolve());
+    await act(async () => pending.reject(new Error("stale metadata failure")));
+
+    expect(screen.queryByText(/stale metadata failure/)).toBeNull();
+  });
+
+  it("invalidates a pending review load as soon as the dialog closes", async () => {
+    const pending = deferred<Awaited<ReturnType<typeof listUnreviewedAttachments>>>();
+    const stale = { artifact_id: 8, title: "Stale review", day: daily.day, status: "completed" as const, created_at: daily.created_at, updated_at: daily.updated_at, reviewed_at: null };
+    vi.mocked(listUnreviewedAttachments).mockReturnValueOnce(pending.promise).mockResolvedValueOnce([]);
+    render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.keyDown(document, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getAllByText("Review agent work").at(-1)!);
+    const dialog = screen.getByRole("dialog", { name: "Review agent work" });
+    fireEvent.keyDown(dialog, { key: "Escape" });
+    await act(async () => pending.resolve([stale]));
+
+    fireEvent.keyDown(document, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getAllByText("Review agent work").at(-1)!);
+    await act(async () => Promise.resolve());
+    expect(screen.queryByText("Stale review")).toBeNull();
+    expect(screen.getByText("No agent work is waiting for review.")).toBeTruthy();
+  });
+
+  it("shows truthful Agent work summaries and reviews only on explicit activation", async () => {
+    const rows = [
+      { artifact_id: 8, title: "Blocked run", day: daily.day, status: "blocked" as const, created_at: daily.created_at, updated_at: daily.updated_at, reviewed_at: null },
+      { artifact_id: 9, title: "Failed run", day: "2026-08-02", status: "failed" as const, created_at: daily.created_at, updated_at: daily.updated_at, reviewed_at: null },
+    ];
+    vi.mocked(listDailyAttachments).mockResolvedValue(rows);
+    vi.mocked(listUnreviewedAttachments).mockResolvedValue(rows);
+    vi.mocked(getDocument).mockImplementation(async (id) => ({ ...daily, id, kind: "artifact", author: "agent", body: `# ${id === 8 ? "Blocked run" : "Failed run"}` }));
+    vi.mocked(getAttachmentByArtifactId).mockImplementation(async (id) => rows.find((row) => row.artifact_id === id) ?? null);
+    vi.mocked(markAttachmentReviewed).mockResolvedValue({ ...rows[0], reviewed_at: "2026-08-03T11:00:00.000Z" });
+    render(<App />);
+    await act(async () => Promise.resolve());
+    expect(screen.getByText("1 blocked")).toBeTruthy();
+    expect(screen.getByText("1 failed")).toBeTruthy();
+    expect(screen.getByText("2 New")).toBeTruthy();
+
+    fireEvent.keyDown(document, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getAllByText("Review agent work").at(-1)!);
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("dialog", { name: "Review agent work" })).toBeTruthy();
+    expect(screen.getByText(/Sunday, August 2, 2026 · Failed · New/)).toBeTruthy();
+    fireEvent.click(screen.getByText("Blocked run"));
+    await act(async () => Promise.resolve());
+    expect(markAttachmentReviewed).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Mark reviewed" }));
+    fireEvent.click(screen.getByRole("button", { name: /Mark/ }));
+    await act(async () => Promise.resolve());
+    expect(markAttachmentReviewed).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/Reviewed/)).toBeTruthy();
+    expect(screen.getAllByText(/Blocked/).length).toBeGreaterThan(0);
   });
 
   it("keeps identity, document, and transient persistence in stable footer regions", async () => {
@@ -322,18 +512,22 @@ describe("Archive document canvas", () => {
     };
     vi.mocked(listDailyAttachments).mockResolvedValue([
       {
-        id: 9,
+        artifact_id: 9,
         title: "CLOB portfolio projection writer E2E",
+        day: "2026-08-03",
         status: "blocked",
         created_at: "2026-08-03T10:42:00.000Z",
         updated_at: "2026-08-03T10:42:00.000Z",
+        reviewed_at: null,
       },
       {
-        id: 10,
+        artifact_id: 10,
         title: "Credential capture was too old",
+        day: "2026-08-03",
         status: "failed",
         created_at: "2026-08-03T09:18:00.000Z",
         updated_at: "2026-08-03T09:18:00.000Z",
+        reviewed_at: null,
       },
     ]);
     vi.mocked(getDocument).mockResolvedValue(artifact);
@@ -341,11 +535,12 @@ describe("Archive document canvas", () => {
     await act(async () => Promise.resolve());
 
     expect(listDailyAttachments).toHaveBeenCalledWith("2026-08-03");
-    expect(screen.getByRole("button", { name: /Agent work · 2 subnotes/ })).toBeTruthy();
-    expect(screen.getByText("2 blocked")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Agent work · 2/ })).toBeTruthy();
+    expect(screen.getByText("1 blocked")).toBeTruthy();
+    expect(screen.getByText("1 failed")).toBeTruthy();
     expect(screen.queryByText("CLOB portfolio projection writer E2E")).toBeNull();
 
-    fireEvent.click(screen.getByRole("button", { name: /Agent work · 2 subnotes/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Agent work · 2/ }));
     expect(screen.getByText("CLOB portfolio projection writer E2E")).toBeTruthy();
     expect(screen.getByText("Blocked")).toBeTruthy();
     expect(screen.getByText("Failed")).toBeTruthy();

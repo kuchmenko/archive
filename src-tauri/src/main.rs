@@ -1,9 +1,11 @@
 mod database;
+mod markdown;
 mod mcp;
 mod merman;
 
 use database::{
-    DailyAttachment, Database, Document, DocumentSummary, ReferenceSummary, SyncSnapshot,
+    AttachmentSummary, DailyNeighbors, Database, Document, DocumentSummary, ReferenceSummary,
+    SyncSnapshot,
 };
 use tauri::{Manager, State};
 
@@ -140,10 +142,47 @@ fn resolve_references(
 fn list_daily_attachments(
     database: State<'_, Database>,
     day: String,
-) -> Result<Vec<DailyAttachment>, String> {
+) -> Result<Vec<AttachmentSummary>, String> {
     database
         .list_daily_attachments(&day)
         .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn daily_neighbors(database: State<'_, Database>, day: String) -> Result<DailyNeighbors, String> {
+    database
+        .daily_neighbors(&day)
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn list_unreviewed_attachments(
+    database: State<'_, Database>,
+) -> Result<Vec<AttachmentSummary>, String> {
+    database
+        .list_unreviewed_attachments()
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn get_attachment_by_artifact_id(
+    database: State<'_, Database>,
+    artifact_id: i64,
+) -> Result<Option<AttachmentSummary>, String> {
+    database
+        .get_attachment_by_artifact_id(artifact_id)
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn mark_attachment_reviewed(
+    database: State<'_, Database>,
+    artifact_id: i64,
+) -> Result<AttachmentSummary, String> {
+    database
+        .mark_attachment_reviewed(artifact_id)
+        .map_err(|error| error.to_string())
+}
+#[tauri::command]
+fn render_markdown(markdown: String) -> String {
+    markdown::render(&markdown)
 }
 
 fn app_database_path() -> Result<std::path::PathBuf, String> {
@@ -180,6 +219,11 @@ fn run_gui() {
             search_documents,
             resolve_references,
             list_daily_attachments,
+            daily_neighbors,
+            list_unreviewed_attachments,
+            get_attachment_by_artifact_id,
+            mark_attachment_reviewed,
+            render_markdown,
             render_mermaid
         ])
         .run(tauri::generate_context!())

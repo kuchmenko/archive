@@ -23,6 +23,7 @@ import {
   type ExplorerOrigin,
   type MarkdownEditorHandle,
 } from "@/components/MarkdownEditor";
+import { MarkdownReader } from "@/components/MarkdownReader";
 import {
   createNote,
   createProject,
@@ -31,6 +32,10 @@ import {
   getDocument,
   getOrCreateDaily,
   listDailyAttachments,
+  dailyNeighbors,
+  getAttachmentByArtifactId,
+  listUnreviewedAttachments,
+  markAttachmentReviewed,
   listProjectDocuments,
   removePresence,
   resolveReferences,
@@ -39,6 +44,7 @@ import {
   updateDocument,
   updatePresence,
   type DailyAttachment,
+  type DailyNeighbors,
   type Document,
   type ReferenceSummary,
 } from "@/lib/archive";
@@ -49,7 +55,7 @@ import { addBuffer, adjacentBufferId, removeBuffer, type DocumentBuffer } from "
 import { parseNoteReferences } from "@/lib/documents";
 import { appShortcut } from "@/lib/shortcuts";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { ChevronRight, FilePlus2, Settings, Trash2 } from "lucide-react";
+import { ChevronLeft, ChevronRight, FilePlus2, Settings, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 function message(error: unknown) {
@@ -111,6 +117,13 @@ export function App() {
   const [attachments, setAttachments] = useState<DailyAttachment[]>([]);
   const [projectDocuments, setProjectDocuments] = useState<Document[]>([]);
   const [shelfExpanded, setShelfExpanded] = useState(false);
+  const [mode, setMode] = useState<"edit" | "read">("edit");
+  const [neighbors, setNeighbors] = useState<DailyNeighbors>({ previous: null, next: null });
+  const [activeAttachment, setActiveAttachment] = useState<DailyAttachment | null>(null);
+  const [reviewOpen, setReviewOpen] = useState(false);
+  const [reviewQueue, setReviewQueue] = useState<DailyAttachment[]>([]);
+  const [reviewLoading, setReviewLoading] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
   const activeRef = useRef(active);
   const todayRef = useRef(today);
   const operation = useRef(true);
@@ -126,6 +139,13 @@ export function App() {
   const explorerOpenRef = useRef(explorerOpen);
   const explorerPurposeRef = useRef(explorerPurpose);
   const syncGeneration = useRef(0);
+  const neighborToken = useRef(0);
+  const metadataToken = useRef(0);
+  const reviewToken = useRef(0);
+  const modeToken = useRef(0);
+  const todayToken = useRef(0);
+  const markReviewToken = useRef(0);
+  const reviewPending = useRef(false);
   const sessionId = useRef(
     `archive-gui-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`,
   ).current;
@@ -188,10 +208,23 @@ export function App() {
       explorerGeneration.current += 1;
       addGeneration.current = null;
       referenceToken.current += 1;
+      neighborToken.current += 1;
+      metadataToken.current += 1;
+      attachmentToken.current += 1;
       setReferences([]);
+      setNeighbors({ previous: null, next: null });
+      setActiveAttachment(null);
+      setAttachments([]);
+      setShelfExpanded(false);
       activeRef.current = document;
       setBuffers((current) => addBuffer(current, document));
       setActive(document);
+      modeToken.current += 1;
+      todayToken.current += 1;
+      markReviewToken.current += 1;
+      reviewPending.current = false;
+      setMode(document.author === "agent" || document.kind === "artifact" ? "read" : "edit");
+      setReviewing(false);
       setVimMode("NORMAL");
       setConflict(null);
       setPresence({ userCount: 1, agentPresent: false });
@@ -215,6 +248,46 @@ export function App() {
   }, [active?.id, activeReferenceIdsKey]);
 
   useEffect(() => {
+    const token = ++neighborToken.current;
+    setNeighbors({ previous: null, next: null });
+    if (active?.kind !== "daily") return;
+    void dailyNeighbors(active.day).then((value) => {
+      if (token === neighborToken.current && activeRef.current?.id === active.id) setNeighbors(value);
+    }).catch((error) => {
+      if (token === neighborToken.current && activeRef.current?.id === active.id) setNotice(`Journal: ${message(error)}`);
+    });
+  }, [active?.id, active?.kind, active?.day]);
+
+  useEffect(() => {
+    const token = ++metadataToken.current;
+    setActiveAttachment(null);
+    if (!active || (active.kind !== "artifact" && active.author !== "agent")) return;
+    void getAttachmentByArtifactId(active.id).then((value) => {
+      if (token === metadataToken.current && activeRef.current?.id === active.id) setActiveAttachment(value);
+    }).catch((error) => {
+      if (token === metadataToken.current && activeRef.current?.id === active.id) setNotice(`Agent work: ${message(error)}`);
+    });
+  }, [active?.id, active?.kind, active?.author]);
+
+  useEffect(() => {
+    if (!reviewOpen) {
+      reviewToken.current += 1;
+      setReviewLoading(false);
+      return;
+    }
+    const token = ++reviewToken.current;
+    setReviewQueue([]);
+    setReviewLoading(true);
+    void listUnreviewedAttachments().then((rows) => {
+      if (token === reviewToken.current) setReviewQueue(rows);
+    }).catch((error) => {
+      if (token === reviewToken.current) setNotice(`Review: ${message(error)}`);
+    }).finally(() => {
+      if (token === reviewToken.current) setReviewLoading(false);
+    });
+  }, [reviewOpen]);
+
+  useEffect(() => {
     if (!active || active.kind !== "daily") {
       setAttachments([]);
       setShelfExpanded(false);
@@ -230,7 +303,9 @@ export function App() {
           setAttachments(rows);
         })
         .catch((error) => {
-          if (token === attachmentToken.current) setNotice(`Agent work: ${message(error)}`);
+          if (token === attachmentToken.current && activeRef.current?.kind === "daily" && activeRef.current.day === day) {
+            setNotice(`Agent work: ${message(error)}`);
+          }
         });
     };
     load();
@@ -540,6 +615,57 @@ export function App() {
     setBusy(false);
   }
 
+  async function setReading(next: "edit" | "read") {
+    if (next === mode || !active || active.author !== "user" || active.kind === "artifact") return;
+    const id = active.id;
+    const token = ++modeToken.current;
+    if (next === "read" && !(await flush())) return;
+    if (token !== modeToken.current || activeRef.current?.id !== id) return;
+    setMode(next);
+  }
+
+  async function openToday() {
+    if (operation.current || activeRef.current?.kind !== "daily") return;
+    const sourceId = activeRef.current.id;
+    const token = ++todayToken.current;
+    operation.current = true; setBusy(true);
+    if (await flush()) {
+      try {
+        const daily = await getOrCreateDaily(todayRef.current);
+        if (token === todayToken.current && activeRef.current?.id === sourceId && await flush()) {
+          if (token === todayToken.current && activeRef.current?.id === sourceId) showDocument(daily);
+        }
+      }
+      catch (error) {
+        if (token === todayToken.current && activeRef.current?.id === sourceId) setNotice(message(error));
+      }
+    }
+    operation.current = false; setBusy(false);
+  }
+
+  async function markReviewed() {
+    const current = activeRef.current;
+    if (!current || !activeAttachment || activeAttachment.artifact_id !== current.id || reviewPending.current || activeAttachment.reviewed_at) return;
+    reviewPending.current = true;
+    const token = ++markReviewToken.current;
+    setReviewing(true);
+    const id = current.id;
+    try {
+      const updated = await markAttachmentReviewed(id);
+      if (token !== markReviewToken.current || activeRef.current?.id !== id) return;
+      setActiveAttachment(updated);
+      setAttachments((rows) => rows.map((row) => row.artifact_id === id ? updated : row));
+      setReviewQueue((rows) => rows.filter((row) => row.artifact_id !== id));
+    } catch (error) {
+      if (token === markReviewToken.current && activeRef.current?.id === id) setNotice(`Review: ${message(error)}`);
+    } finally {
+      if (token === markReviewToken.current && activeRef.current?.id === id) {
+        reviewPending.current = false;
+        setReviewing(false);
+      }
+    }
+  }
+
   async function newStandaloneNote(visibility: "shared" | "private") {
     if (operation.current) return;
     operation.current = true;
@@ -803,17 +929,35 @@ export function App() {
       : documentLabel(active)
     : formatLocalDay(today);
   const activeIndex = active ? buffers.findIndex((buffer) => buffer.document.id === active.id) : -1;
-  const actionableAttachmentCount = useMemo(
-    () => attachments.filter((item) => item.status === "blocked" || item.status === "failed").length,
-    [attachments],
-  );
+  const attachmentCounts = useMemo(() => ({
+    blocked: attachments.filter((item) => item.status === "blocked").length,
+    failed: attachments.filter((item) => item.status === "failed").length,
+    new: attachments.filter((item) => item.reviewed_at === null).length,
+  }), [attachments]);
   const showAgentShelf = active?.kind === "daily" && attachments.length > 0;
+  const currentAttachment = activeAttachment?.artifact_id === active?.id ? activeAttachment : null;
+
+  function setReviewDialogOpen(open: boolean) {
+    if (!open) {
+      reviewToken.current += 1;
+      setReviewLoading(false);
+    }
+    setReviewOpen(open);
+  }
 
   return (
     <div className="grid h-screen grid-rows-[minmax(0,1fr)_28px] overflow-hidden bg-background text-foreground">
       <main className="min-h-0 overflow-y-auto bg-[radial-gradient(circle_at_50%_-15%,#292d37_0,transparent_38%)]">
         <div className="mx-auto w-full max-w-[820px] px-6 pb-32 pt-12">
-          <h1 className="text-3xl font-semibold tracking-[-0.035em] text-[#f3efe7]">{title}</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="min-w-0 flex-1 text-3xl font-semibold tracking-[-0.035em] text-[#f3efe7]">{title}</h1>
+            {active?.kind === "daily" && <>
+              <button type="button" className="rounded-md p-2 hover:bg-white/5 disabled:opacity-40" disabled={!neighbors.previous || busy} aria-label={neighbors.previous ? `Previous daily: ${formatLocalDay(neighbors.previous.day)}` : "No previous daily"} onClick={() => neighbors.previous && void openDocument(neighbors.previous.id)}><ChevronLeft className="size-4" /></button>
+              <button type="button" className="rounded-md p-2 hover:bg-white/5 disabled:opacity-40" disabled={!neighbors.next || busy} aria-label={neighbors.next ? `Next daily: ${formatLocalDay(neighbors.next.day)}` : "No next daily"} onClick={() => neighbors.next && void openDocument(neighbors.next.id)}><ChevronRight className="size-4" /></button>
+              {active.day !== today && <button type="button" className="rounded-md px-3 py-2 text-sm hover:bg-white/5" onClick={() => void openToday()}>Today</button>}
+            </>}
+            {active?.author === "user" && active.kind !== "artifact" && <button type="button" className="rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-white/5 hover:text-foreground" onClick={() => void setReading(mode === "edit" ? "read" : "edit")}>{mode === "edit" ? "Read" : "Edit"}</button>}
+          </div>
 
           {notice && (
             <div className="mt-4 rounded-md border border-destructive/25 bg-destructive/10 px-3 py-2 text-xs text-destructive">
@@ -825,7 +969,7 @@ export function App() {
             <p className="mt-12 text-sm text-muted-foreground">Loading note…</p>
           ) : (
             <section className="mt-10 min-h-40">
-              <MarkdownEditor
+              {mode === "read" ? <MarkdownReader documentId={active.id} body={active.body} onOpenReference={(id) => void openDocument(id)} /> : <MarkdownEditor
                 key={active.id}
                 ref={editorRef}
                 entryId={active.id}
@@ -843,7 +987,11 @@ export function App() {
                 initialSnapshot={buffers.find((buffer) => buffer.document.id === active.id)?.editor}
                 onPreviousBuffer={() => switchBuffer(-1)}
                 onNextBuffer={() => switchBuffer(1)}
-              />
+              />}
+              {(active.kind === "artifact" || active.author === "agent") && <div className="mt-6 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                <span>Agent</span>
+                {currentAttachment && <><span>· {formatLocalDay(currentAttachment.day)}</span><span>· {statusLabel(currentAttachment.status)}</span><span>· {currentAttachment.reviewed_at ? "Reviewed" : "New"}</span>{!currentAttachment.reviewed_at && <button type="button" className="ml-auto rounded-md border border-border px-3 py-2 text-sm text-foreground hover:bg-white/5 disabled:opacity-50" disabled={reviewing} onClick={() => void markReviewed()}>{reviewing ? "Marking…" : "Mark reviewed"}</button>}</>}
+              </div>}
               {showAgentShelf && (
                 <div className="mt-10 border-t border-border/60 pt-4">
                   <button
@@ -856,23 +1004,18 @@ export function App() {
                       className={`size-3.5 shrink-0 transition-transform ${shelfExpanded ? "rotate-90" : ""}`}
                     />
                     <span className="min-w-0 flex-1 truncate">
-                      Agent work · {attachments.length}{" "}
-                      {attachments.length === 1 ? "subnote" : "subnotes"}
+                      Agent work · {attachments.length}
                     </span>
-                    {actionableAttachmentCount > 0 && (
-                      <span className="shrink-0 text-xs text-amber-200/90">
-                        {actionableAttachmentCount} blocked
-                      </span>
-                    )}
+                    <span className="flex shrink-0 gap-2 text-xs text-amber-200/90">{attachmentCounts.blocked > 0 && <span>{attachmentCounts.blocked} blocked</span>}{attachmentCounts.failed > 0 && <span>{attachmentCounts.failed} failed</span>}{attachmentCounts.new > 0 && <span>{attachmentCounts.new} New</span>}</span>
                   </button>
                   {shelfExpanded && (
                     <ul className="mt-2 space-y-1">
                       {attachments.map((attachment) => (
-                        <li key={attachment.id}>
+                        <li key={attachment.artifact_id}>
                           <button
                             type="button"
                             className="flex w-full items-start gap-3 rounded-md px-2 py-2 text-left transition-colors hover:bg-white/5"
-                            onClick={() => void openDocument(attachment.id)}
+                            onClick={() => void openDocument(attachment.artifact_id)}
                             disabled={busy || conflict !== null}
                           >
                             <span className="min-w-0 flex-1">
@@ -892,6 +1035,7 @@ export function App() {
                             >
                               {statusLabel(attachment.status)}
                             </span>
+                            {attachment.reviewed_at === null && <span className="shrink-0 pt-0.5 text-[11px] uppercase text-foreground">New</span>}
                           </button>
                         </li>
                       ))}
@@ -929,7 +1073,7 @@ export function App() {
         >
           {active && (
             <>
-            {activeIndex + 1}/{buffers.length} · {documentLabel(active)}
+            {activeIndex + 1}/{buffers.length} · {documentLabel(active)} · {mode === "read" ? "Read" : "Edit"}
             {active.visibility === "private" ? " · Private" : ""}
             {active.kind === "artifact" ? " · Artifact" : ""}
             {active.kind === "project" ? " · Project" : ""}
@@ -1043,6 +1187,8 @@ export function App() {
               </CommandItem>
               <CommandItem onSelect={chooseNewProject} disabled={busy}><FilePlus2 />New project</CommandItem>
               {active?.kind === "project" && <CommandItem onSelect={openAddToProject} disabled={busy}><FilePlus2 />Add document</CommandItem>}
+              {active?.author === "user" && active.kind !== "artifact" && <CommandItem onSelect={() => { setCommandsOpen(false); queueMicrotask(() => void setReading(mode === "edit" ? "read" : "edit")); }}>{mode === "edit" ? "Read document" : "Edit document"}</CommandItem>}
+              <CommandItem onSelect={() => { setCommandsOpen(false); setReviewDialogOpen(true); }}>Review agent work</CommandItem>
               <CommandItem onSelect={chooseDelete} disabled={active?.kind === "daily" || busy}>
                 <Trash2 />
                 {active?.kind === "daily" ? "Daily documents cannot be deleted" : `Delete ${active?.kind ?? "note"} permanently…`}
@@ -1053,6 +1199,40 @@ export function App() {
                 <CommandShortcut>Coming later</CommandShortcut>
               </CommandItem>
             </CommandGroup>
+          </CommandList>
+        </Command>
+      </CommandDialog>
+
+      <CommandDialog open={reviewOpen} onOpenChange={setReviewDialogOpen} title="Review agent work" description="Unreviewed daily-attached agent work">
+        <Command>
+          <CommandInput placeholder="Filter agent work…" />
+          <CommandList>
+            {reviewLoading ? (
+              <div role="status" aria-busy="true" className="py-6 text-center text-sm text-muted-foreground">
+                Loading agent work…
+              </div>
+            ) : (
+              <>
+                <CommandEmpty>No agent work is waiting for review.</CommandEmpty>
+                <CommandGroup heading="New agent work">
+                  {reviewQueue.map((item) => (
+                    <CommandItem
+                      key={item.artifact_id}
+                      value={`${item.title} ${item.day} ${item.status}`}
+                      onSelect={() => {
+                        setReviewDialogOpen(false);
+                        queueMicrotask(() => void openDocument(item.artifact_id));
+                      }}
+                    >
+                      <span className="min-w-0 flex-1 truncate">{item.title}</span>
+                      <span className="shrink-0 text-xs text-muted-foreground">
+                        {formatLocalDay(item.day)} · {statusLabel(item.status)} · New
+                      </span>
+                    </CommandItem>
+                  ))}
+                </CommandGroup>
+              </>
+            )}
           </CommandList>
         </Command>
       </CommandDialog>

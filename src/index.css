@@ -128,3 +128,26 @@
     @apply font-sans;
     }
 }
+
+.archive-reader {
+  max-width: 70ch;
+  font-size: 1rem;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+.archive-reader > h1:first-child { display: none; }
+.archive-reader h2 { margin: 2rem 0 .75rem; font-size: 1.5rem; font-weight: 600; }
+.archive-reader h3 { margin: 1.5rem 0 .5rem; font-size: 1.25rem; font-weight: 600; }
+.archive-reader p, .archive-reader ul, .archive-reader ol, .archive-reader blockquote, .archive-reader pre, .archive-reader table { margin-block: 1rem; }
+.archive-reader ul { list-style: disc; padding-inline-start: 1.5rem; }
+.archive-reader ol { list-style: decimal; padding-inline-start: 1.5rem; }
+.archive-reader blockquote { border-inline-start: 3px solid var(--border); padding-inline-start: 1rem; color: var(--muted-foreground); }
+.archive-reader code { border-radius: var(--radius-sm); background: var(--muted); padding: .1rem .3rem; font-family: monospace; font-size: .9em; }
+.archive-reader pre { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius-md); padding: 1rem; }
+.archive-reader pre code { background: transparent; padding: 0; }
+.archive-reader table { width: 100%; border-collapse: collapse; }
+.archive-reader th, .archive-reader td { border: 1px solid var(--border); padding: .5rem; text-align: start; }
+.archive-reader button[data-document-id] { border-radius: var(--radius-sm); color: var(--foreground); text-decoration: underline; text-underline-offset: 3px; }
+.archive-reader button[data-document-id]:focus-visible { outline: 2px solid var(--ring); outline-offset: 3px; }
+.archive-reader a { color: var(--muted-foreground); text-decoration: line-through; }
+.archive-reader svg { max-width: 100%; height: auto; }

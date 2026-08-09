@@ -31,13 +31,18 @@ export type ReferenceSummary = {
 
 export type AttachmentStatus = "completed" | "blocked" | "failed";
 
-export type DailyAttachment = {
-  id: number;
+export type AttachmentSummary = {
+  artifact_id: number;
   title: string;
+  day: string;
   status: AttachmentStatus;
   created_at: string;
   updated_at: string;
+  reviewed_at: string | null;
 };
+export type DailyAttachment = AttachmentSummary;
+export type DailyNeighbor = { id: number; day: string };
+export type DailyNeighbors = { previous: DailyNeighbor | null; next: DailyNeighbor | null };
 
 export type MermaidDiagnostic = {
   line?: number;
@@ -103,6 +108,21 @@ export function resolveReferences(ids: number[]): Promise<ReferenceSummary[]> {
 
 export function listDailyAttachments(day: string): Promise<DailyAttachment[]> {
   return invoke("list_daily_attachments", { day });
+}
+export function dailyNeighbors(day: string): Promise<DailyNeighbors> {
+  return invoke("daily_neighbors", { day });
+}
+export function listUnreviewedAttachments(): Promise<AttachmentSummary[]> {
+  return invoke("list_unreviewed_attachments");
+}
+export function getAttachmentByArtifactId(artifactId: number): Promise<AttachmentSummary | null> {
+  return invoke("get_attachment_by_artifact_id", { artifactId });
+}
+export function markAttachmentReviewed(artifactId: number): Promise<AttachmentSummary> {
+  return invoke("mark_attachment_reviewed", { artifactId });
+}
+export function renderMarkdown(markdown: string): Promise<string> {
+  return invoke("render_markdown", { markdown });
 }
 
 export function renderMermaid(source: string, diagramId: string): Promise<MermaidRender> {

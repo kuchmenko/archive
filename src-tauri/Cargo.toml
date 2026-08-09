@@ -12,7 +12,7 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 merman = { version = "=0.8.0-alpha.3", features = ["render"] }
 merman-analysis = "=0.8.0-alpha.3"
-pulldown-cmark = { version = "=0.13.4", default-features = false }
+pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
 rmcp = { version = "3.1.0", features = ["transport-io"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

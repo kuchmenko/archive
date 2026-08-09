@@ -60,6 +60,17 @@ try {
         revision: 1,
       },
       {
+        id: 100,
+        kind: "daily",
+        visibility: "shared",
+        author: "user",
+        day: "2026-08-04",
+        created_at: "2026-08-04T10:00:00.000Z",
+        updated_at: "2026-08-04T10:00:00.000Z",
+        body: "Tuesday notes",
+        revision: 1,
+      },
+      {
         id: 4,
         kind: "artifact",
         visibility: "shared",
@@ -70,9 +81,36 @@ try {
         body: "# Agent research artifact\nUseful findings\n```mermaid\ngraph TD\nA-->B\n```",
         revision: 1,
       },
+      {
+        id: 50,
+        kind: "artifact",
+        visibility: "shared",
+        author: "agent",
+        day: "2026-08-03",
+        created_at: timestamp,
+        updated_at: timestamp,
+        body: "# Failed agent run\nFailure details",
+        revision: 1,
+      },
+      {
+        id: 51,
+        kind: "artifact",
+        visibility: "shared",
+        author: "agent",
+        day: "2026-08-03",
+        created_at: timestamp,
+        updated_at: timestamp,
+        body: "# Completed agent run\nCompleted details",
+        revision: 1,
+      },
     ];
     let nextId = 5;
     const projectDocuments = new Map();
+    const attachments = [
+      { artifact_id: 4, title: "Agent research artifact", day: "2026-08-03", status: "blocked", created_at: timestamp, updated_at: timestamp, reviewed_at: timestamp },
+      { artifact_id: 50, title: "Failed agent run", day: "2026-08-03", status: "failed", created_at: timestamp, updated_at: timestamp, reviewed_at: timestamp },
+      { artifact_id: 51, title: "Completed agent run", day: "2026-08-03", status: "completed", created_at: timestamp, updated_at: timestamp, reviewed_at: null },
+    ];
     window.__archiveCalls = [];
     window.__tauriCallbacks = [];
     window.__clipboardFailure = false;
@@ -191,6 +229,28 @@ try {
               : (document.body.match(/^\s*#{1,6}\s+(.+)$/m)?.[1] ?? "Untitled note");
             return [{ id, kind: document.kind, day: document.day, label }];
           });
+        }
+        if (command === "daily_neighbors") {
+          const days = documents.filter((document) => document.kind === "daily").sort((left, right) => left.day.localeCompare(right.day));
+          const previous = [...days].reverse().find((document) => document.day < args.day);
+          const next = days.find((document) => document.day > args.day);
+          return {
+            previous: previous ? { id: previous.id, day: previous.day } : null,
+            next: next ? { id: next.id, day: next.day } : null,
+          };
+        }
+        if (command === "list_daily_attachments") return attachments.filter((item) => item.day === args.day).map((item) => ({ ...item }));
+        if (command === "list_unreviewed_attachments") return attachments.filter((item) => item.reviewed_at === null).map((item) => ({ ...item }));
+        if (command === "get_attachment_by_artifact_id") return attachments.find((item) => item.artifact_id === args.artifactId) ?? null;
+        if (command === "mark_attachment_reviewed") {
+          const attachment = attachments.find((item) => item.artifact_id === args.artifactId);
+          if (!attachment) throw new Error("Attachment does not exist");
+          attachment.reviewed_at ??= timestamp;
+          return { ...attachment };
+        }
+        if (command === "render_markdown") {
+          const escaped = args.markdown.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+          return escaped.replace(/^# (.+)$/gm, "<h1>$1</h1>").replace(/```mermaid\n([\s\S]*?)```/g, '<pre><code class="language-mermaid">$1</code></pre>').replaceAll("\n", "<br>");
         }
         if (command === "render_mermaid") {
           if (args.source.includes("INVALID")) return { valid: false, diagnostics: [{ line: 1, column: 1, message: "Invalid test diagram" }] };
@@ -377,6 +437,12 @@ try {
   await page.getByRole("heading", { name: "Project note" }).waitFor();
   await page.locator(".cm-reference-broken", { hasText: "Missing" }).waitFor();
   assert((await calls("resolve_references")).some((call) => call.args.ids.includes(999)), "Active references were not batch resolved");
+  await page.getByRole("button", { name: "Read" }).click();
+  await page.locator(".archive-reader").waitFor();
+  assert((await editor.count()) === 0, "Read mode left the user document editor mounted");
+  await page.getByRole("button", { name: "Edit" }).click();
+  await editor.waitFor();
+  assert((await page.locator(".archive-reader").count()) === 0, "Edit mode left the user document reader mounted");
 
   const createCountBefore = (await calls("create_note")).length;
   await page.keyboard.press("Control+n");
@@ -490,6 +556,28 @@ try {
   assert((await dailyDelete.getAttribute("data-disabled")) === "true", "Daily delete became available after deletion");
   await page.keyboard.press("Escape");
 
+  const dailyLookupsBeforeBrowsing = (await calls("get_or_create_daily")).length;
+  await page.getByRole("button", { name: /Previous daily/ }).click();
+  await page.getByRole("heading", { name: "Sunday, August 2, 2026" }).waitFor();
+  await page.getByRole("button", { name: /Next daily/ }).click();
+  await page.getByRole("heading", { name: "Monday, August 3, 2026" }).waitFor();
+  await page.getByRole("button", { name: /Next daily/ }).click();
+  await page.getByRole("heading", { name: "Tuesday, August 4, 2026" }).waitFor();
+  assert((await calls("get_or_create_daily")).length === dailyLookupsBeforeBrowsing, "Existing daily browsing called get_or_create_daily");
+  await page.getByRole("button", { name: "Today" }).click();
+  await page.getByRole("heading", { name: "Monday, August 3, 2026" }).waitFor();
+  const dailyLookupsAfterToday = await calls("get_or_create_daily");
+  assert(dailyLookupsAfterToday.length === dailyLookupsBeforeBrowsing + 1 && dailyLookupsAfterToday.at(-1).args.day === "2026-08-03", "Today was not the explicit canonical daily lookup");
+  const shelf = page.getByRole("button", { name: /Agent work · 3/ });
+  await shelf.waitFor();
+  const shelfSummary = await shelf.innerText();
+  assert(shelfSummary.includes("1 blocked") && shelfSummary.includes("1 failed") && shelfSummary.includes("1 New"), `Agent shelf summaries are not independent: ${shelfSummary}`);
+  await shelf.click();
+  const blockedShelfRow = await page.getByRole("button", { name: /Agent research artifact/ }).innerText();
+  const failedShelfRow = await page.getByRole("button", { name: /Failed agent run/ }).innerText();
+  const newShelfRow = await page.getByRole("button", { name: /Completed agent run/ }).innerText();
+  assert(blockedShelfRow.toLowerCase().includes("blocked") && failedShelfRow.toLowerCase().includes("failed") && newShelfRow.toLowerCase().includes("new"), `Agent shelf rows do not distinguish blocked, failed, and New states: ${blockedShelfRow} | ${failedShelfRow} | ${newShelfRow}`);
+
   await content.click();
   await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
   await page.keyboard.type("  ");
@@ -502,31 +590,24 @@ try {
   await page.keyboard.press("Enter");
   await page.getByRole("heading", { name: "Agent research artifact" }).waitFor();
   assert((await page.locator("footer").innerText()).includes("Artifact · Agent"), "Agent artifact status is not distinguished");
-  const diagram = page.locator("button.cm-mermaid");
-  await diagram.locator("svg").waitFor();
-  assert((await calls("render_mermaid")).some((call) => call.args.source === "graph TD\nA-->B"), "Inactive Mermaid source was not rendered lazily");
+  assert((await page.locator(".cm-editor").count()) === 0, "Agent artifact instantiated CodeMirror");
+  const reader = page.locator(".archive-reader");
+  await reader.locator("svg").waitFor();
+  assert((await calls("render_mermaid")).length > 0, "Reader Mermaid source was not rendered");
   assert((await page.locator(".editor-toolbar, .editor-topbar, .editor-split, [data-mermaid-toolbar]").count()) === 0, "Mermaid added application chrome");
-  await diagram.click();
-  await page.locator(".cm-mermaid-preview svg").waitFor();
-  assert((await editorBody()).includes("```mermaid\ngraph TD\nA-->B\n```"), "Click did not reveal canonical Mermaid source");
-  await page.keyboard.press("Escape");
-  await page.keyboard.press("k");
-  await diagram.waitFor();
-  await page.keyboard.press("v");
-  await page.keyboard.press("j");
-  await page.locator(".cm-mermaid-preview").waitFor();
-  assert((await editorBody()).includes("```mermaid"), "Visual selection intersecting Mermaid did not reveal source");
-  await page.keyboard.press("Escape");
-  await page.keyboard.press("j");
-  await page.keyboard.press("i");
-  await page.keyboard.type("INVALID ");
-  await page.waitForTimeout(300);
-  await page.locator(".cm-mermaid-diagnostic", { hasText: "Invalid test diagram" }).waitFor();
-  const invalidBody = await editorBody();
-  assert(invalidBody.includes("INVALID") && invalidBody.includes("```mermaid"), "Invalid Mermaid edit did not preserve raw source");
-  const mermaidCalls = await calls("render_mermaid");
-  assert(mermaidCalls.some((call) => call.args.source.includes("INVALID")), "Debounced active Mermaid preview did not render the edited source");
-  await page.keyboard.press("Escape");
+  assert((await page.getByText("· Reviewed").count()) === 1, "Attached artifact review provenance is missing");
+  await page.keyboard.press("Control+o");
+  await page.locator('[data-slot="command-item"]', { hasText: "Review agent work" }).click();
+  const reviewDialog = page.getByRole("dialog", { name: "Review agent work" });
+  await reviewDialog.waitFor();
+  await reviewDialog.locator('[data-slot="command-item"]', { hasText: "Completed agent run" }).click();
+  assert((await calls("mark_attachment_reviewed")).length === 0, "Opening agent work marked it reviewed");
+  await page.getByRole("button", { name: "Mark reviewed" }).click();
+  await page.getByText("· Reviewed").waitFor();
+  const reviewCalls = await calls("mark_attachment_reviewed");
+  assert(reviewCalls.length === 1 && reviewCalls[0].args.artifactId === 51, "Mark reviewed did not mutate exactly one attachment");
+  assert((await page.locator("section").innerText()).includes("Completed"), "Review changed execution status");
+  assert((await page.getByText("· New").count()) === 0, "Reviewed attachment kept its New indicator");
 
   const privateCountBefore = (await calls("create_note")).length;
   await page.keyboard.press("Control+Shift+n");
@@ -565,6 +646,17 @@ try {
   await page.keyboard.type("  ");
   await explorer.waitFor();
   assert((await explorer.innerText()).includes("Enter open") && (await explorer.innerText()).includes("Ctrl Enter reference"), "Ordinary Explorer behavior was not restored after adding a project member");
+  await page.keyboard.press("Escape");
+  await page.setViewportSize({ width: 320, height: 720 });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), "Changed canvas overflows at 320px");
+  const readButton = page.getByRole("button", { name: "Read" });
+  await page.evaluate(() => { document.body.tabIndex = -1; document.body.focus(); });
+  for (let index = 0; index < 20 && !await readButton.evaluate((element) => element === document.activeElement); index += 1) {
+    await page.keyboard.press("Tab");
+  }
+  assert(await readButton.evaluate((element) => element === document.activeElement), "Keyboard did not focus the Read/Edit control");
+  const focusedOutline = await readButton.evaluate((element) => getComputedStyle(element).outlineStyle);
+  assert(focusedOutline !== "none", "Read/Edit control has no visible keyboard focus indicator");
 
   await browser.close();
 } finally {

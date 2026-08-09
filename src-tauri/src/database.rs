@@ -10,7 +10,7 @@ use chrono::{Local, NaiveDate, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 use serde::Serialize;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_SESSION_ID_BYTES: usize = 128;
 const PRESENCE_TTL_SECONDS: i64 = 10;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
@@ -50,12 +50,26 @@ pub struct ReferenceSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DailyAttachment {
-    pub id: i64,
+pub struct AttachmentSummary {
+    pub artifact_id: i64,
     pub title: String,
+    pub day: String,
     pub status: String,
     pub created_at: String,
     pub updated_at: String,
+    pub reviewed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DailyNeighbor {
+    pub id: i64,
+    pub day: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DailyNeighbors {
+    pub previous: Option<DailyNeighbor>,
+    pub next: Option<DailyNeighbor>,
 }
 
 #[derive(Debug)]
@@ -74,6 +88,7 @@ pub enum Error {
     MissingDocument(i64),
     CannotDeleteDaily,
     WriteConflict,
+    ReadOnlyDocument,
     UnsupportedSchema(i64),
     Lock,
     Io(std::io::Error),
@@ -117,6 +132,7 @@ impl fmt::Display for Error {
                 formatter,
                 "document changed outside this editor; reload before saving"
             ),
+            Self::ReadOnlyDocument => write!(formatter, "document is read-only"),
             Self::UnsupportedSchema(version) => write!(
                 formatter,
                 "database schema version {version} is not supported"
@@ -289,6 +305,11 @@ impl Database {
     ) -> Result<Document, Error> {
         validate_id(id)?;
         let connection = self.connection()?;
+        let stored = get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))?;
+        if stored.author != "user" || !matches!(stored.kind.as_str(), "daily" | "note" | "project")
+        {
+            return Err(Error::ReadOnlyDocument);
+        }
         let updated = connection
             .query_row(
                 "UPDATE documents SET body = ?1, updated_at = ?2, revision = revision + 1
@@ -466,11 +487,11 @@ impl Database {
         Ok(matches)
     }
 
-    pub fn list_daily_attachments(&self, day: &str) -> Result<Vec<DailyAttachment>, Error> {
+    pub fn list_daily_attachments(&self, day: &str) -> Result<Vec<AttachmentSummary>, Error> {
         validate_day(day)?;
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT a.id, a.body, COALESCE(da.status, 'completed'), a.created_at, a.updated_at
+            "SELECT a.id, a.body, parent.day, da.status, a.created_at, a.updated_at, da.reviewed_at
              FROM document_attachments da
              JOIN documents parent ON parent.id = da.parent_document_id
              JOIN documents a ON a.id = da.attached_document_id
@@ -480,15 +501,95 @@ impl Database {
         )?;
         let rows = statement.query_map([day], |row| {
             let body: String = row.get(1)?;
-            Ok(DailyAttachment {
-                id: row.get(0)?,
+            Ok(AttachmentSummary {
+                artifact_id: row.get(0)?,
                 title: note_label(&body),
-                status: row.get(2)?,
-                created_at: row.get(3)?,
-                updated_at: row.get(4)?,
+                day: row.get(2)?,
+                status: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                reviewed_at: row.get(6)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_unreviewed_attachments(&self) -> Result<Vec<AttachmentSummary>, Error> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT a.id, a.body, parent.day, da.status, a.created_at, a.updated_at, da.reviewed_at
+             FROM document_attachments da
+             JOIN documents parent ON parent.id = da.parent_document_id
+             JOIN documents a ON a.id = da.attached_document_id
+             WHERE parent.kind = 'daily' AND a.kind = 'artifact' AND a.author = 'agent'
+               AND da.reviewed_at IS NULL
+             ORDER BY parent.day DESC, a.created_at DESC, a.id DESC LIMIT 50",
+        )?;
+        Ok(statement
+            .query_map([], attachment_summary_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_attachment_by_artifact_id(
+        &self,
+        artifact_id: i64,
+    ) -> Result<Option<AttachmentSummary>, Error> {
+        validate_id(artifact_id)?;
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT a.id, a.body, parent.day, da.status, a.created_at, a.updated_at, da.reviewed_at
+                 FROM document_attachments da
+                 JOIN documents parent ON parent.id = da.parent_document_id
+                 JOIN documents a ON a.id = da.attached_document_id
+                 WHERE parent.kind = 'daily' AND a.kind = 'artifact' AND a.author = 'agent'
+                   AND a.id = ?1",
+                [artifact_id],
+                attachment_summary_from_row,
+            )
+            .optional()
+            .map_err(Error::from)
+    }
+
+    pub fn mark_attachment_reviewed(&self, artifact_id: i64) -> Result<AttachmentSummary, Error> {
+        validate_id(artifact_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = transaction.execute(
+            "UPDATE document_attachments SET reviewed_at = COALESCE(reviewed_at, ?1)
+             WHERE attached_document_id = ?2 AND EXISTS (
+               SELECT 1 FROM documents a, documents parent
+               WHERE a.id = attached_document_id AND parent.id = parent_document_id
+                 AND a.kind = 'artifact' AND a.author = 'agent' AND parent.kind = 'daily')",
+            params![now(), artifact_id],
+        )?;
+        if changed == 0 {
+            return Err(Error::MissingDocument(artifact_id));
+        }
+        let summary = transaction.query_row(
+            "SELECT a.id, a.body, parent.day, da.status, a.created_at, a.updated_at, da.reviewed_at
+             FROM document_attachments da
+             JOIN documents parent ON parent.id = da.parent_document_id
+             JOIN documents a ON a.id = da.attached_document_id
+             WHERE parent.kind = 'daily' AND a.kind = 'artifact' AND a.author = 'agent'
+               AND a.id = ?1",
+            [artifact_id],
+            attachment_summary_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(summary)
+    }
+
+    pub fn daily_neighbors(&self, day: &str) -> Result<DailyNeighbors, Error> {
+        validate_day(day)?;
+        let connection = self.connection()?;
+        let previous = connection.query_row(
+            "SELECT id, day FROM documents WHERE kind='daily' AND day < ?1 ORDER BY day DESC, id DESC LIMIT 1",
+            [day], |row| Ok(DailyNeighbor { id: row.get(0)?, day: row.get(1)? })).optional()?;
+        let next = connection.query_row(
+            "SELECT id, day FROM documents WHERE kind='daily' AND day > ?1 ORDER BY day ASC, id ASC LIMIT 1",
+            [day], |row| Ok(DailyNeighbor { id: row.get(0)?, day: row.get(1)? })).optional()?;
+        Ok(DailyNeighbors { previous, next })
     }
 
     pub fn mcp_create_artifact(
@@ -760,6 +861,13 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
             return Err(Error::Sqlite(rusqlite::Error::ExecuteReturnedResults));
         }
     }
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 6 {
+        transaction.execute_batch(
+            "ALTER TABLE document_attachments ADD COLUMN reviewed_at TEXT;
+             PRAGMA user_version = 7;",
+        )?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -867,6 +975,18 @@ fn note_label(body: &str) -> String {
     } else {
         label.to_owned()
     }
+}
+fn attachment_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentSummary> {
+    let body: String = row.get(1)?;
+    Ok(AttachmentSummary {
+        artifact_id: row.get(0)?,
+        title: note_label(&body),
+        day: row.get(2)?,
+        status: row.get(3)?,
+        created_at: row.get(4)?,
+        updated_at: row.get(5)?,
+        reviewed_at: row.get(6)?,
+    })
 }
 fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
     Ok(Document {
@@ -1121,13 +1241,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_schema_is_v6_with_constraints() {
+    fn fresh_schema_is_v7_with_constraints() {
         let database = database();
         let connection = database.connection.lock().unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','private','user','2026-01-01','a','a','')", []).is_err());
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','shared','agent','2026-01-01','a','a','')", []).is_err());
         assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('project','shared','agent','2026-01-01','a','a','')", []).is_err());
@@ -1142,6 +1262,7 @@ mod tests {
         assert!(table.contains("completed"));
         assert!(table.contains("blocked"));
         assert!(table.contains("failed"));
+        assert!(table.contains("reviewed_at"));
     }
 
     #[test]
@@ -1180,7 +1301,7 @@ mod tests {
             .unwrap()
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         assert_eq!(database.get_document(1).unwrap().body, "user body");
         assert!(
             database
@@ -1256,7 +1377,7 @@ mod tests {
         let reopened = Database::open(&path).unwrap();
         assert_eq!(reopened.get_document(project.id).unwrap(), project);
         assert_eq!(
-            reopened.list_daily_attachments("2026-08-04").unwrap()[0].id,
+            reopened.list_daily_attachments("2026-08-04").unwrap()[0].artifact_id,
             11
         );
     }
@@ -1702,15 +1823,146 @@ mod tests {
         assert_eq!(d.get_document(daily.id).unwrap().revision, 2);
         let attachments = d.list_daily_attachments("2026-08-04").unwrap();
         assert_eq!(attachments.len(), 2);
-        assert_eq!(attachments[0].id, second.id);
+        assert_eq!(attachments[0].artifact_id, second.id);
         assert_eq!(attachments[0].title, "Run B");
         assert_eq!(attachments[0].status, "failed");
-        assert_eq!(attachments[1].id, first.id);
+        assert_eq!(attachments[1].artifact_id, first.id);
         assert_eq!(attachments[1].status, "blocked");
         assert!(matches!(
             d.mcp_create_daily_attachment("2026-08-04", "Bad", "x", Some("running"), None),
             Err(Error::InvalidStatus)
         ));
+    }
+
+    #[test]
+    fn v6_attachment_migrates_unreviewed_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, visibility TEXT NOT NULL, author TEXT NOT NULL, day TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
+             CREATE UNIQUE INDEX documents_daily_day ON documents(day) WHERE kind='daily';
+             CREATE INDEX documents_day ON documents(day);
+             CREATE TABLE presence (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, last_heartbeat INTEGER NOT NULL);
+             CREATE INDEX presence_document ON presence(document_id);
+             CREATE TABLE document_attachments (parent_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, attached_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, status TEXT NOT NULL, PRIMARY KEY(parent_document_id,attached_document_id), UNIQUE(attached_document_id));
+             CREATE INDEX document_attachments_parent ON document_attachments(parent_document_id);
+             CREATE TABLE project_documents (project_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, added_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project_document_id,document_id));
+             CREATE INDEX project_documents_document ON project_documents(document_id);
+             INSERT INTO documents VALUES(3,'daily','shared','user','2026-08-01','a','b','daily',2);
+             INSERT INTO documents VALUES(8,'artifact','shared','agent','2026-08-01','c','d','# Work',4);
+             INSERT INTO document_attachments VALUES(3,8,'blocked');
+             PRAGMA user_version=6;",
+        ).unwrap();
+        drop(connection);
+        let database = Database::open(&path).unwrap();
+        let row = database
+            .list_daily_attachments("2026-08-01")
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            (row.artifact_id, row.status, row.reviewed_at),
+            (8, "blocked".to_owned(), None)
+        );
+        drop(database);
+        let reopened = Database::open(&path).unwrap();
+        assert_eq!(
+            reopened.list_unreviewed_attachments().unwrap()[0].artifact_id,
+            8
+        );
+    }
+
+    #[test]
+    fn review_queue_is_cross_day_bounded_and_review_is_exact() {
+        let d = database();
+        let mut newest = 0;
+        for index in 0..55 {
+            let day = format!("2026-07-{:02}", index % 28 + 1);
+            newest = d
+                .mcp_create_daily_attachment(
+                    &day,
+                    &format!("Work {index}"),
+                    "body",
+                    Some("failed"),
+                    None,
+                )
+                .unwrap()
+                .id;
+        }
+        let standalone = d
+            .mcp_create_artifact("Standalone", "body", &[], None)
+            .unwrap();
+        assert!(
+            d.get_attachment_by_artifact_id(standalone.id)
+                .unwrap()
+                .is_none()
+        );
+        let queue = d.list_unreviewed_attachments().unwrap();
+        assert_eq!(queue.len(), 50);
+        assert!(queue.windows(2).all(|pair| pair[0].day >= pair[1].day));
+        let before = d.get_document(newest).unwrap();
+        let first = d.mark_attachment_reviewed(newest).unwrap();
+        let second = d.mark_attachment_reviewed(newest).unwrap();
+        assert_eq!(first.reviewed_at, second.reviewed_at);
+        assert_eq!(first.status, "failed");
+        assert_eq!(d.get_document(newest).unwrap(), before);
+        assert!(matches!(
+            d.mark_attachment_reviewed(0),
+            Err(Error::InvalidId)
+        ));
+        assert!(d.mark_attachment_reviewed(standalone.id).is_err());
+    }
+
+    #[test]
+    fn gui_writes_allow_user_documents_and_preserve_agent_artifacts() {
+        let d = database();
+        let daily = d.get_or_create_daily("2026-08-01").unwrap();
+        let note = d.create_note("2026-08-01", "shared").unwrap();
+        let project = d.create_project("2026-08-01", "shared").unwrap();
+        for document in [daily, note, project] {
+            assert_eq!(
+                d.replace_document_body(document.id, 1, "changed")
+                    .unwrap()
+                    .body,
+                "changed"
+            );
+        }
+        let artifact = d
+            .mcp_create_artifact("Immutable", "body", &[], None)
+            .unwrap();
+        let before = artifact.clone();
+        assert!(matches!(
+            d.replace_document_body(artifact.id, artifact.revision, "changed"),
+            Err(Error::ReadOnlyDocument)
+        ));
+        assert_eq!(d.get_document(artifact.id).unwrap(), before);
+    }
+
+    #[test]
+    fn daily_neighbors_cross_gaps_without_creating_rows() {
+        let d = database();
+        let first = d.get_or_create_daily("2026-08-01").unwrap();
+        let last = d.get_or_create_daily("2026-08-09").unwrap();
+        let count = || {
+            d.connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM documents", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let before = count();
+        let middle = d.daily_neighbors("2026-08-05").unwrap();
+        assert_eq!(middle.previous.unwrap().id, first.id);
+        assert_eq!(middle.next.unwrap().id, last.id);
+        assert!(d.daily_neighbors("2026-08-01").unwrap().previous.is_none());
+        assert!(d.daily_neighbors("2026-08-09").unwrap().next.is_none());
+        assert!(matches!(
+            d.daily_neighbors("2026-02-30"),
+            Err(Error::InvalidDay)
+        ));
+        assert_eq!(count(), before);
     }
 
     #[test]
