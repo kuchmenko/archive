@@ -127,7 +127,8 @@ export function App() {
   const activeRef = useRef(active);
   const todayRef = useRef(today);
   const operation = useRef(true);
-  const editorRef = useRef<MarkdownEditorHandle>(null);
+  const editorHandles = useRef(new Map<number, MarkdownEditorHandle>());
+  const editorModes = useRef(new Map<number, string>());
   const searchToken = useRef(0);
   const referenceToken = useRef(0);
   const attachmentToken = useRef(0);
@@ -198,6 +199,7 @@ export function App() {
     );
   }
   const autosave = autosaveRef.current;
+  const editorHandle = (documentId: number) => editorHandles.current.get(documentId);
   const activeReferenceIds = active
     ? [...new Set(parseNoteReferences(active.body).map((reference) => reference.id))]
     : [];
@@ -216,8 +218,11 @@ export function App() {
       setActiveAttachment(null);
       setAttachments([]);
       setShelfExpanded(false);
+      editorHandle(document.id)?.replaceBody(document.body);
       activeRef.current = document;
-      setBuffers((current) => addBuffer(current, document));
+      setBuffers((current) => current.some((buffer) => buffer.document.id === document.id)
+        ? current.map((buffer) => buffer.document.id === document.id ? { ...buffer, document } : buffer)
+        : addBuffer(current, document));
       setActive(document);
       modeToken.current += 1;
       todayToken.current += 1;
@@ -225,7 +230,9 @@ export function App() {
       reviewPending.current = false;
       setMode(document.author === "agent" || document.kind === "artifact" ? "read" : "edit");
       setReviewing(false);
-      setVimMode("NORMAL");
+      setVimMode(document.author === "user" && document.kind !== "artifact"
+        ? (editorModes.current.get(document.id) ?? "NORMAL")
+        : "READ");
       setConflict(null);
       setPresence({ userCount: 1, agentPresent: false });
       autosave.load(document.id, document.body, document.revision);
@@ -343,16 +350,25 @@ export function App() {
   }, [active?.id, active?.kind]);
 
   useEffect(() => {
+    let cancelled = false;
     const day = todayRef.current;
     void getOrCreateDaily(day)
-      .then(showDocument)
-      .catch((error) => setNotice(message(error)))
+      .then((document) => {
+        if (!cancelled) showDocument(document);
+      })
+      .catch((error) => {
+        if (!cancelled) setNotice(message(error));
+      })
       .finally(() => {
+        if (cancelled) return;
         operation.current = false;
         setBusy(false);
         setLoading(false);
       });
-    return () => autosave.dispose();
+    return () => {
+      cancelled = true;
+      autosave.dispose();
+    };
   }, [autosave, showDocument]);
 
   useEffect(() => {
@@ -372,7 +388,7 @@ export function App() {
       !disposed && generation === syncGeneration.current && activeRef.current?.id === documentId;
     const applyDocument = (document: Document) => {
       if (!current()) return;
-      editorRef.current?.replaceBody(document.body);
+      editorHandle(documentId)?.replaceBody(document.body);
       activeRef.current = document;
       setActive(document);
       setBuffers((buffers) => buffers.map((buffer) =>
@@ -542,6 +558,7 @@ export function App() {
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
+      if (event.target instanceof Element && event.target.closest(".cm-editor")) return;
       const shortcut = appShortcut(event);
       if (shortcut === "new-note" && !operation.current) {
         event.preventDefault();
@@ -581,8 +598,8 @@ export function App() {
   }, [active, explorerOpen, explorerQuery, explorerPurpose]);
 
   async function flush(): Promise<boolean> {
-    const snapshot = editorRef.current?.snapshot();
     const id = activeRef.current?.id;
+    const snapshot = id === undefined ? null : editorHandle(id)?.snapshot();
     if (snapshot && id !== undefined) {
       setBuffers((current) => current.map((buffer) =>
         buffer.document.id === id ? { ...buffer, editor: snapshot } : buffer,
@@ -621,6 +638,7 @@ export function App() {
     const token = ++modeToken.current;
     if (next === "read" && !(await flush())) return;
     if (token !== modeToken.current || activeRef.current?.id !== id) return;
+    setVimMode(next === "read" ? "READ" : (editorModes.current.get(id) ?? "NORMAL"));
     setMode(next);
   }
 
@@ -693,7 +711,7 @@ export function App() {
         if (await flush()) {
           showDocument(project);
           setTimeout(() => {
-            if (activeRef.current?.id === project.id) editorRef.current?.focus();
+            if (activeRef.current?.id === project.id) editorHandle(project.id)?.focus();
           }, 0);
         }
       }
@@ -803,7 +821,7 @@ export function App() {
     if (restoreFocus && origin && activeRef.current?.id === origin.documentId) {
       setTimeout(() => {
         if (generation === explorerGeneration.current && !explorerOpenRef.current && activeRef.current?.id === origin.documentId) {
-          editorRef.current?.focus(origin.cursor);
+          editorHandle(origin.documentId)?.focus(origin.cursor);
         }
       }, 1);
     }
@@ -848,7 +866,9 @@ export function App() {
     if (!selected || !origin || activeRef.current?.id !== origin.documentId) return;
     const reference = formatNoteReference(selected);
     closeExplorer(false);
-    queueMicrotask(() => editorRef.current?.insertAt(origin.cursor, reference));
+    queueMicrotask(() => {
+      if (activeRef.current?.id === origin.documentId) editorHandle(origin.documentId)?.insertAt(origin.cursor, reference);
+    });
   }
 
   function chooseNewNote() {
@@ -879,7 +899,7 @@ export function App() {
     autosave.resume();
     autosave.rebase(localBody, currentConflict.remote);
     const localDocument = { ...currentConflict.remote, body: localBody };
-    editorRef.current?.replaceBody(localBody);
+    editorHandle(currentConflict.documentId)?.replaceBody(localBody);
     activeRef.current = localDocument;
     setActive(localDocument);
     setBuffers((current) => current.map((buffer) =>
@@ -888,7 +908,9 @@ export function App() {
     try {
       await autosave.flush();
       setConflict(null);
-      queueMicrotask(() => editorRef.current?.focus());
+      queueMicrotask(() => {
+        if (activeRef.current?.id === currentConflict.documentId) editorHandle(currentConflict.documentId)?.focus();
+      });
     } catch (error) {
       autosave.pause();
       setNotice(`Could not keep local version: ${message(error)}`);
@@ -903,14 +925,16 @@ export function App() {
     const remote = currentConflict.remote;
     autosave.resume();
     autosave.adoptRemote(remote.body, remote.revision);
-    editorRef.current?.replaceBody(remote.body);
+    editorHandle(remote.id)?.replaceBody(remote.body);
     activeRef.current = remote;
     setActive(remote);
     setBuffers((current) => current.map((buffer) =>
       buffer.document.id === remote.id ? { ...buffer, document: remote } : buffer,
     ));
     setConflict(null);
-    queueMicrotask(() => editorRef.current?.focus());
+    queueMicrotask(() => {
+      if (activeRef.current?.id === remote.id) editorHandle(remote.id)?.focus();
+    });
   }
 
   const selectedExplorerDocument =
@@ -969,25 +993,46 @@ export function App() {
             <p className="mt-12 text-sm text-muted-foreground">Loading note…</p>
           ) : (
             <section className="mt-10 min-h-40">
-              {mode === "read" ? <MarkdownReader documentId={active.id} body={active.body} onOpenReference={(id) => void openDocument(id)} /> : <MarkdownEditor
-                key={active.id}
-                ref={editorRef}
-                entryId={active.id}
-                body={active.body}
-                readOnly={busy || conflict !== null}
-                onChange={editorChanged}
-                onClipboardError={(error) => setNotice(`Clipboard: ${error}`)}
-                onModeChange={setVimMode}
-                onNewNote={handleNewNoteShortcut}
-                onNewPrivateNote={handleNewPrivateNoteShortcut}
-                onOpenCommands={handleOpenCommandsShortcut}
-                onOpenExplorer={handleOpenExplorer}
-                onOpenReference={handleOpenReference}
-                references={references}
-                initialSnapshot={buffers.find((buffer) => buffer.document.id === active.id)?.editor}
-                onPreviousBuffer={() => switchBuffer(-1)}
-                onNextBuffer={() => switchBuffer(1)}
-              />}
+              {mode === "read" && <MarkdownReader documentId={active.id} body={active.body} onOpenReference={(id) => void openDocument(id)} />}
+              {buffers.filter((buffer) =>
+                buffer.document.author === "user" &&
+                (buffer.document.kind === "daily" || buffer.document.kind === "note" || buffer.document.kind === "project")
+              ).sort((left, right) =>
+                Number(right.document.id === active.id) - Number(left.document.id === active.id)
+              ).map((buffer) => {
+                const editorActive = active.id === buffer.document.id && mode === "edit";
+                return <div
+                  key={buffer.document.id}
+                  data-document-id={buffer.document.id}
+                  data-editor-active={editorActive}
+                  hidden={!editorActive}
+                >
+                  <MarkdownEditor
+                    ref={(handle) => {
+                      if (handle) editorHandles.current.set(buffer.document.id, handle);
+                      else editorHandles.current.delete(buffer.document.id);
+                    }}
+                    entryId={buffer.document.id}
+                    body={buffer.document.body}
+                    active={editorActive}
+                    readOnly={!editorActive || busy || conflict !== null}
+                    onChange={editorChanged}
+                    onModeChange={(documentId, nextMode) => {
+                      editorModes.current.set(documentId, nextMode);
+                      if (activeRef.current?.id === documentId && mode === "edit") setVimMode(nextMode);
+                    }}
+                    onNewNote={handleNewNoteShortcut}
+                    onNewPrivateNote={handleNewPrivateNoteShortcut}
+                    onOpenCommands={handleOpenCommandsShortcut}
+                    onOpenExplorer={handleOpenExplorer}
+                    onOpenReference={handleOpenReference}
+                    references={editorActive ? references : []}
+                    initialSnapshot={buffer.editor}
+                    onPreviousBuffer={() => switchBuffer(-1)}
+                    onNextBuffer={() => switchBuffer(1)}
+                  />
+                </div>;
+              })}
               {(active.kind === "artifact" || active.author === "agent") && <div className="mt-6 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                 <span>Agent</span>
                 {currentAttachment && <><span>· {formatLocalDay(currentAttachment.day)}</span><span>· {statusLabel(currentAttachment.status)}</span><span>· {currentAttachment.reviewed_at ? "Reviewed" : "New"}</span>{!currentAttachment.reviewed_at && <button type="button" className="ml-auto rounded-md border border-border px-3 py-2 text-sm text-foreground hover:bg-white/5 disabled:opacity-50" disabled={reviewing} onClick={() => void markReviewed()}>{reviewing ? "Marking…" : "Mark reviewed"}</button>}</>}

@@ -1,4 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { EditorView, ViewPlugin } from "@codemirror/view";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "./App";
 import {
@@ -21,6 +23,10 @@ import {
   updatePresence,
 } from "./lib/archive";
 import { readText } from "@tauri-apps/plugin-clipboard-manager";
+
+const vimMock = vi.hoisted(() => ({
+  actions: new Map<string, (adapter: { cm6: EditorView }) => void>(),
+}));
 
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -53,8 +59,13 @@ vi.mock("./lib/archive", () => ({
 }));
 
 vi.mock("@replit/codemirror-vim", () => ({
+  Vim: {
+    defineAction: (name: string, action: (adapter: { cm6: EditorView }) => void) => vimMock.actions.set(name, action),
+    map: vi.fn(),
+    mapCommand: vi.fn(),
+  },
   getCM: () => undefined,
-  vim: () => [],
+  vim: () => ViewPlugin.define(() => ({})),
 }));
 
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
@@ -82,6 +93,29 @@ function deferred<T>() {
     reject = rejectPromise;
   });
   return { promise, resolve, reject };
+}
+
+function editorView(container: HTMLElement, documentId?: number) {
+  const root = documentId === undefined
+    ? container.querySelector('[data-editor-active="true"] .cm-editor')
+    : container.querySelector(`[data-document-id="${documentId}"] .cm-editor`);
+  if (!(root instanceof HTMLElement)) throw new Error(`Editor ${documentId ?? "active"} not found`);
+  const view = EditorView.findFromDOM(root);
+  if (!view) throw new Error(`EditorView ${documentId ?? "active"} not found`);
+  return view;
+}
+
+function invokeEditorAction(container: HTMLElement, name: string, documentId?: number) {
+  const action = vimMock.actions.get(name);
+  if (!action) throw new Error(`Vim action ${name} not found`);
+  act(() => action({ cm6: editorView(container, documentId) }));
+}
+
+function insertLocally(container: HTMLElement, text: string, documentId?: number) {
+  act(() => {
+    const view = editorView(container, documentId);
+    view.dispatch({ changes: { from: view.state.selection.main.head, insert: text } });
+  });
 }
 
 describe("Archive document canvas", () => {
@@ -136,7 +170,7 @@ describe("Archive document canvas", () => {
     vi.useRealTimers();
   });
 
-  it("opens today's canonical daily and Ctrl+N creates a standalone note", async () => {
+  it("opens today's canonical daily and the Vim note action creates a standalone note", async () => {
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
 
@@ -144,10 +178,106 @@ describe("Archive document canvas", () => {
     expect(screen.getByRole("heading", { name: "Monday, August 3, 2026" })).toBeTruthy();
     expect(screen.queryByRole("navigation")).toBeNull();
 
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    invokeEditorAction(container, "archive.newSharedNote");
     await act(async () => Promise.resolve());
     expect(createNote).toHaveBeenCalledWith("2026-08-03", "shared");
     expect(screen.getByRole("heading", { name: "Untitled note" })).toBeTruthy();
+  });
+
+  it("ignores a stale StrictMode startup result without resetting local edits or autosave", async () => {
+    const stale = deferred<Awaited<ReturnType<typeof getOrCreateDaily>>>();
+    const current = deferred<Awaited<ReturnType<typeof getOrCreateDaily>>>();
+    vi.mocked(getOrCreateDaily)
+      .mockReturnValueOnce(stale.promise)
+      .mockReturnValueOnce(current.promise);
+    const currentDaily = { ...daily, body: "current", revision: 4 };
+    const { container } = render(<StrictMode><App /></StrictMode>);
+    expect(getOrCreateDaily).toHaveBeenCalledTimes(2);
+
+    await act(async () => current.resolve(currentDaily));
+    insertLocally(container, "local ");
+    expect(editorView(container).state.doc.toString()).toBe("local current");
+
+    await act(async () => stale.resolve({ ...daily, body: "stale", revision: 2 }));
+    expect(editorView(container).state.doc.toString()).toBe("local current");
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(updateDocument).toHaveBeenCalledWith(1, 4, "local current");
+  });
+
+  it("retains exact editor identities across buffer and Read mode switches", async () => {
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    const dailyRoot = container.querySelector('[data-document-id="1"] .cm-editor');
+
+    invokeEditorAction(container, "archive.newSharedNote");
+    await act(async () => Promise.resolve());
+    const noteRoot = container.querySelector('[data-document-id="2"] .cm-editor');
+    expect(container.querySelectorAll(".cm-editor")).toHaveLength(2);
+    expect(container.querySelector('[data-document-id="1"]')?.hasAttribute("hidden")).toBe(true);
+
+    invokeEditorAction(container, "archive.previousBuffer");
+    await act(async () => Promise.resolve());
+    expect(container.querySelector('[data-document-id="1"] .cm-editor')).toBe(dailyRoot);
+    expect(container.querySelector('[data-document-id="2"] .cm-editor')).toBe(noteRoot);
+    fireEvent.click(screen.getByRole("button", { name: "Read" }));
+    await act(async () => Promise.resolve());
+    expect(container.querySelector('[data-document-id="1"] .cm-editor')).toBe(dailyRoot);
+    expect(container.querySelector('[data-document-id="1"]')?.hasAttribute("hidden")).toBe(true);
+    fireEvent.click(screen.getByRole("button", { name: "Edit" }));
+    await act(async () => Promise.resolve());
+    expect(container.querySelector('[data-document-id="1"] .cm-editor')).toBe(dailyRoot);
+    expect(container.querySelector('[data-document-id="1"]')?.getAttribute("data-editor-active")).toBe("true");
+  });
+
+  it("replaces a retained editor and buffer with a newer canonical Today result", async () => {
+    const yesterday = { ...daily, id: 3, day: "2026-08-02", body: "yesterday" };
+    const remote = { ...daily, body: "remote canonical", revision: 4 };
+    vi.mocked(dailyNeighbors).mockResolvedValue({ previous: { id: 3, day: yesterday.day }, next: null });
+    vi.mocked(getDocument).mockResolvedValue(yesterday);
+    vi.mocked(getOrCreateDaily).mockResolvedValueOnce(daily).mockResolvedValueOnce(remote);
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    const retained = editorView(container, 1);
+
+    fireEvent.click(screen.getByRole("button", { name: /Previous daily/ }));
+    await act(async () => Promise.resolve());
+    const other = editorView(container, 3);
+    fireEvent.click(screen.getByRole("button", { name: "Today" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(editorView(container, 1)).toBe(retained);
+    expect(editorView(container, 3)).toBe(other);
+    expect(retained.state.doc.toString()).toBe("remote canonical");
+    expect(other.state.doc.toString()).toBe("yesterday");
+    insertLocally(container, "!", 1);
+    await act(async () => vi.advanceTimersByTimeAsync(1_000));
+    expect(updateDocument).toHaveBeenCalledWith(1, 4, "!remote canonical");
+  });
+
+  it("keeps Ctrl shortcuts outside CodeMirror and routes editor actions through Vim", async () => {
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    const editor = container.querySelector('[data-editor-active="true"] .cm-content')!;
+
+    fireEvent.keyDown(editor, { ctrlKey: true, key: "n" });
+    fireEvent.keyDown(editor, { ctrlKey: true, shiftKey: true, key: "N" });
+    fireEvent.keyDown(editor, { ctrlKey: true, key: "o" });
+    expect(createNote).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: "Command Palette" })).toBeNull();
+
+    fireEvent.keyDown(document.body, { ctrlKey: true, key: "o" });
+    expect(screen.getByRole("dialog", { name: "Command Palette" })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    invokeEditorAction(container, "archive.openCommandPalette");
+    expect(screen.getByRole("dialog", { name: "Command Palette" })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    fireEvent.keyDown(window, { ctrlKey: true, shiftKey: true, key: "N" });
+    await act(async () => Promise.resolve());
+    expect(createNote).toHaveBeenCalledWith("2026-08-03", "private");
   });
 
   it("toggles user documents through visible and command actions but forces artifacts to Read", async () => {
@@ -175,16 +305,16 @@ describe("Archive document canvas", () => {
     await act(async () => Promise.resolve());
     fireEvent.click(screen.getByText("Agent output"));
     await act(async () => Promise.resolve());
-    expect(container.querySelector(".cm-editor")).toBeNull();
+    expect(container.querySelector('[data-document-id="8"] .cm-editor')).toBeNull();
+    expect(container.querySelectorAll(".cm-editor")).toHaveLength(1);
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 
   it("keeps Edit when the Read flush fails", async () => {
     vi.mocked(updateDocument).mockRejectedValueOnce(new Error("disk full"));
-    vi.mocked(readText).mockResolvedValue("changed");
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    insertLocally(container, "changed");
     await act(async () => Promise.resolve());
     fireEvent.click(screen.getByRole("button", { name: "Read" }));
     await act(async () => Promise.resolve());
@@ -216,7 +346,7 @@ describe("Archive document canvas", () => {
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
 
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    invokeEditorAction(container, "archive.newSharedNote");
     await act(async () => Promise.resolve());
     await act(async () => pending.resolve({ previous: { id: 3, day: "2026-08-01" }, next: null }));
 
@@ -230,7 +360,7 @@ describe("Archive document canvas", () => {
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
 
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    invokeEditorAction(container, "archive.newSharedNote");
     await act(async () => Promise.resolve());
     await act(async () => pending.reject(new Error("stale neighbor failure")));
 
@@ -331,7 +461,6 @@ describe("Archive document canvas", () => {
   });
 
   it("keeps identity, document, and transient persistence in stable footer regions", async () => {
-    vi.mocked(readText).mockResolvedValue("draft");
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
 
@@ -344,19 +473,19 @@ describe("Archive document canvas", () => {
     expect(document.textContent).toContain("1/1 · Monday, August 3, 2026");
     expect(persistence.textContent).toBe("");
 
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    insertLocally(container, "draft");
     await act(async () => Promise.resolve());
     expect(persistence.textContent).toBe("Saving…");
     expect(document.textContent).toContain("1/1 · Monday, August 3, 2026");
     expect(persistence.className).toContain("justify-self-end");
   });
 
-  it("Ctrl+Shift+N creates and focuses a private note", async () => {
+  it("the Vim private-note action creates and focuses a private note", async () => {
     vi.mocked(createNote).mockResolvedValue({ ...daily, id: 3, kind: "note", visibility: "private" });
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
 
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, shiftKey: true, key: "N" });
+    invokeEditorAction(container, "archive.newPrivateNote");
     await act(async () => Promise.resolve());
 
     expect(createNote).toHaveBeenCalledWith("2026-08-03", "private");
@@ -410,7 +539,7 @@ describe("Archive document canvas", () => {
     const { container, unmount } = render(<App />);
     await act(async () => Promise.resolve());
 
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    invokeEditorAction(container, "archive.newSharedNote");
     await act(async () => Promise.resolve());
     expect(screen.getByRole("heading", { name: "Untitled note" })).toBeTruthy();
     await act(async () => resolveOld?.({
@@ -437,10 +566,9 @@ describe("Archive document canvas", () => {
         user_count: 1,
         agent_present: false,
       });
-    vi.mocked(readText).mockResolvedValue("LOCAL\n");
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    insertLocally(container, "LOCAL\n");
     await act(async () => Promise.resolve());
 
     await act(async () => vi.advanceTimersByTimeAsync(400));
@@ -459,16 +587,15 @@ describe("Archive document canvas", () => {
         user_count: 1,
         agent_present: false,
       });
-    vi.mocked(readText).mockResolvedValue("LOCAL");
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    insertLocally(container, "LOCAL");
     await act(async () => Promise.resolve());
     await act(async () => vi.advanceTimersByTimeAsync(400));
 
     expect(screen.getByRole("alertdialog", { name: "Concurrent edits need your choice" })).toBeTruthy();
     expect(container.querySelector(".cm-content")?.textContent).toContain("LOCALbase");
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    invokeEditorAction(container, "archive.newSharedNote");
     await act(async () => Promise.resolve());
     expect(createNote).not.toHaveBeenCalled();
 
@@ -489,10 +616,9 @@ describe("Archive document canvas", () => {
         user_count: 1,
         agent_present: false,
       });
-    vi.mocked(readText).mockResolvedValue("LOCAL");
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "v" });
+    insertLocally(container, "LOCAL");
     await act(async () => Promise.resolve());
     await act(async () => vi.advanceTimersByTimeAsync(400));
 
@@ -554,7 +680,7 @@ describe("Archive document canvas", () => {
   it("creates and opens a project with its empty shelf and project metadata", async () => {
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    invokeEditorAction(container, "archive.openCommandPalette");
     fireEvent.click(screen.getByText("New project"));
     await act(async () => vi.advanceTimersByTimeAsync(1));
     expect(createProject).toHaveBeenCalledWith("2026-08-03");
@@ -574,7 +700,7 @@ describe("Archive document canvas", () => {
     vi.mocked(getDocument).mockResolvedValue(member);
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    invokeEditorAction(container, "archive.openCommandPalette");
     fireEvent.click(screen.getByText("New project"));
     await act(async () => Promise.resolve());
     fireEvent.click(screen.getByRole("button", { name: "Add document" }));
@@ -611,13 +737,13 @@ describe("Archive document canvas", () => {
       .mockResolvedValue([fresh]);
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    invokeEditorAction(container, "archive.openCommandPalette");
     fireEvent.click(screen.getByText("New project"));
     await act(async () => Promise.resolve());
     await act(async () => vi.advanceTimersByTimeAsync(2_000));
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    invokeEditorAction(container, "archive.newSharedNote");
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { shiftKey: true, key: "H" });
+    invokeEditorAction(container, "archive.previousBuffer");
     await act(async () => Promise.resolve());
     expect(screen.getByRole("button", { name: /Fresh member/ })).toBeTruthy();
 
@@ -637,7 +763,7 @@ describe("Archive document canvas", () => {
     vi.mocked(addDocumentToProject).mockReturnValue(pending.promise);
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    invokeEditorAction(container, "archive.openCommandPalette");
     fireEvent.click(screen.getByText("New project"));
     await act(async () => Promise.resolve());
     fireEvent.click(screen.getByRole("button", { name: "Add document" }));
@@ -666,10 +792,10 @@ describe("Archive document canvas", () => {
     vi.mocked(deleteNote).mockResolvedValue(undefined);
     const { container } = render(<App />);
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    invokeEditorAction(container, "archive.openCommandPalette");
     fireEvent.click(screen.getByText("New project"));
     await act(async () => Promise.resolve());
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "o" });
+    invokeEditorAction(container, "archive.openCommandPalette");
     await act(async () => Promise.resolve());
     fireEvent.click(screen.getByText("Delete project permanently…"));
     await act(async () => Promise.resolve());
@@ -678,7 +804,7 @@ describe("Archive document canvas", () => {
     expect(screen.getByRole("button", { name: "Delete project" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     const callsBeforeLeaving = vi.mocked(listProjectDocuments).mock.calls.length;
-    fireEvent.keyDown(container.querySelector(".cm-editor")!, { ctrlKey: true, key: "n" });
+    invokeEditorAction(container, "archive.newSharedNote");
     await act(async () => Promise.resolve());
     await act(async () => vi.advanceTimersByTimeAsync(4_100));
     expect(listProjectDocuments).toHaveBeenCalledTimes(callsBeforeLeaving);

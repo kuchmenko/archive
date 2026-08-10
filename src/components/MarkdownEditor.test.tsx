@@ -1,4 +1,5 @@
 import { act, render } from "@testing-library/react";
+import { EditorView } from "@codemirror/view";
 import { createRef } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
@@ -9,12 +10,19 @@ import {
 
 const vimMock = vi.hoisted(() => ({
   modeListener: null as ((event: { mode: string; subMode?: string }) => void) | null,
+  actions: new Map<string, (adapter: unknown) => void>(),
+  currentView: null as unknown,
 }));
 const invokeMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
 vi.mock("@replit/codemirror-vim", () => ({
+  Vim: {
+    defineAction: (name: string, action: (adapter: unknown) => void) => vimMock.actions.set(name, action),
+    map: vi.fn(),
+    mapCommand: vi.fn(),
+  },
   getCM: () => ({
     on: (_event: string, listener: (event: { mode: string; subMode?: string }) => void) => {
       vimMock.modeListener = listener;
@@ -23,7 +31,7 @@ vi.mock("@replit/codemirror-vim", () => ({
       vimMock.modeListener = null;
     },
   }),
-  vim: () => [],
+  vim: () => EditorView.updateListener.of((update) => { vimMock.currentView = update.view; }),
 }));
 
 vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
@@ -34,6 +42,7 @@ vi.mock("@tauri-apps/plugin-clipboard-manager", () => ({
 describe("MarkdownEditor application shortcuts", () => {
   beforeEach(() => {
     vimMock.modeListener = null;
+    vimMock.currentView = null;
     Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
     Range.prototype.getBoundingClientRect = () => new DOMRect();
     vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
@@ -42,60 +51,94 @@ describe("MarkdownEditor application shortcuts", () => {
     });
   });
 
-  it("handles Ctrl+N and Ctrl+O before editor keymaps", () => {
+  it("routes captured actions and uses current callback props", () => {
     const onNewNote = vi.fn(() => true);
-    const onOpenCommands = vi.fn(() => true);
-    const { container } = render(
+    const nextOnNewNote = vi.fn(() => true);
+    const onOpenExplorer = vi.fn(() => true);
+    const { rerender } = render(
       <MarkdownEditor
-        entryId={1}
+        entryId={7}
         body=""
+        active
         readOnly={false}
         onChange={vi.fn()}
-        onClipboardError={vi.fn()}
         onModeChange={vi.fn()}
         onNewNote={onNewNote}
         onNewPrivateNote={vi.fn(() => true)}
-        onOpenCommands={onOpenCommands}
-        onOpenExplorer={vi.fn(() => true)}
+        onOpenCommands={vi.fn(() => true)}
+        onOpenExplorer={onOpenExplorer}
         references={[]}
         onPreviousBuffer={() => false}
         onNextBuffer={() => false}
         onOpenReference={vi.fn(() => true)}
       />,
     );
-    const editor = container.querySelector(".cm-editor");
-    expect(editor).not.toBeNull();
-
-    const newNote = new KeyboardEvent("keydown", {
-      bubbles: true,
-      cancelable: true,
-      ctrlKey: true,
-      key: "n",
-    });
-    const commands = new KeyboardEvent("keydown", {
-      bubbles: true,
-      cancelable: true,
-      ctrlKey: true,
-      key: "o",
-    });
-    editor!.dispatchEvent(newNote);
-    editor!.dispatchEvent(commands);
-
+    vimMock.actions.get("archive.openExplorer")?.({ cm6: vimMock.currentView });
+    vimMock.actions.get("archive.newSharedNote")?.({ cm6: vimMock.currentView });
+    expect(onOpenExplorer).toHaveBeenCalledWith({ documentId: 7, cursor: 0 });
     expect(onNewNote).toHaveBeenCalledOnce();
-    expect(onOpenCommands).toHaveBeenCalledOnce();
-    expect(newNote.defaultPrevented).toBe(true);
-    expect(commands.defaultPrevented).toBe(true);
-  });
-
-  it("leaves unhandled shortcuts available to the editor", () => {
-    const { container } = render(
+    rerender(
       <MarkdownEditor
-        entryId={1}
+        entryId={7}
         body=""
+        active
         readOnly={false}
         onChange={vi.fn()}
-        onClipboardError={vi.fn()}
         onModeChange={vi.fn()}
+        onNewNote={nextOnNewNote}
+        onNewPrivateNote={() => false}
+        onOpenCommands={() => false}
+        onOpenExplorer={() => false}
+        references={[]}
+        onPreviousBuffer={() => false}
+        onNextBuffer={() => false}
+        onOpenReference={() => false}
+      />,
+    );
+    vimMock.actions.get("archive.newSharedNote")?.({ cm6: vimMock.currentView });
+    expect(onNewNote).toHaveBeenCalledOnce();
+    expect(nextOnNewNote).toHaveBeenCalledOnce();
+  });
+
+  it("opens the reference at the invoking view's current document and cursor", () => {
+    const editorRef = createRef<MarkdownEditorHandle>();
+    const onOpenReference = vi.fn(() => true);
+    render(
+      <MarkdownEditor
+        ref={editorRef}
+        entryId={7}
+        body="before [[note:9|Target]]"
+        active
+        readOnly={false}
+        onChange={vi.fn()}
+        onModeChange={vi.fn()}
+        onNewNote={() => false}
+        onNewPrivateNote={() => false}
+        onOpenCommands={() => false}
+        onOpenExplorer={() => false}
+        references={[]}
+        onPreviousBuffer={() => false}
+        onNextBuffer={() => false}
+        onOpenReference={onOpenReference}
+      />,
+    );
+    act(() => editorRef.current?.focus(12));
+    vimMock.actions.get("archive.openReference")?.({ cm6: vimMock.currentView });
+    expect(onOpenReference).toHaveBeenCalledWith(9);
+  });
+
+  it("reports mode with document identity and rejects inactive focus and insertion", async () => {
+    const editorRef = createRef<MarkdownEditorHandle>();
+    const onModeChange = vi.fn();
+    const { container, rerender } = render(
+      <MarkdownEditor
+        ref={editorRef}
+        entryId={7}
+        body="body"
+        active={false}
+        readOnly
+        onChange={vi.fn()}
+        onModeChange={onModeChange}
         onNewNote={() => false}
         onNewPrivateNote={() => false}
         onOpenCommands={() => false}
@@ -106,71 +149,73 @@ describe("MarkdownEditor application shortcuts", () => {
         onOpenReference={() => false}
       />,
     );
-    const event = new KeyboardEvent("keydown", {
-      bubbles: true,
-      cancelable: true,
-      ctrlKey: true,
-      key: "n",
+    act(() => {
+      editorRef.current?.focus();
+      editorRef.current?.insertAt(0, "stale ");
     });
-    container.querySelector(".cm-editor")!.dispatchEvent(event);
-    expect(event.defaultPrevented).toBe(false);
-  });
+    expect(container.querySelector(".cm-content")?.textContent).toContain("body");
+    expect(document.activeElement).not.toBe(container.querySelector(".cm-content"));
+    expect(onModeChange).not.toHaveBeenCalled();
 
-  it("gates Space Space and reference Enter to NORMAL mode", () => {
-    const editorRef = createRef<MarkdownEditorHandle>();
-    const onOpenExplorer = vi.fn(() => true);
-    const onOpenReference = vi.fn(() => true);
-    const { container } = render(
+    rerender(
       <MarkdownEditor
         ref={editorRef}
         entryId={7}
-        body="before [[note:9|Target]]"
+        body="body"
+        active
         readOnly={false}
         onChange={vi.fn()}
-        onClipboardError={vi.fn()}
-        onModeChange={vi.fn()}
+        onModeChange={onModeChange}
         onNewNote={() => false}
         onNewPrivateNote={() => false}
         onOpenCommands={() => false}
-        onOpenExplorer={onOpenExplorer}
+        onOpenExplorer={() => false}
         references={[]}
         onPreviousBuffer={() => false}
         onNextBuffer={() => false}
-        onOpenReference={onOpenReference}
+        onOpenReference={() => false}
       />,
     );
-    const editor = container.querySelector(".cm-editor")!;
-    const space = () =>
-      editor.dispatchEvent(
-        new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: " " }),
-      );
+    await act(async () => Promise.resolve());
+    expect(onModeChange).toHaveBeenCalledWith(7, "NORMAL");
+  });
 
-    space();
-    space();
-    expect(onOpenExplorer).toHaveBeenCalledWith({ documentId: 7, cursor: 0 });
-
-    act(() => vimMock.modeListener?.({ mode: "insert" }));
-    space();
-    space();
-    expect(onOpenExplorer).toHaveBeenCalledOnce();
-
-    act(() => vimMock.modeListener?.({ mode: "visual" }));
-    space();
-    space();
-    expect(onOpenExplorer).toHaveBeenCalledOnce();
-
-    act(() => vimMock.modeListener?.({ mode: "normal" }));
-    act(() => editorRef.current?.focus(12));
-    editor.dispatchEvent(
-      new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter" }),
+  it("cancels the mount frame before a disposed editor can restore selection or outer scroll", () => {
+    const frames = new Map<number, FrameRequestCallback>();
+    const cancel = vi.fn((id: number) => frames.delete(id));
+    vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+      frames.set(11, callback);
+      return 11;
+    });
+    vi.stubGlobal("cancelAnimationFrame", cancel);
+    const { container, unmount } = render(
+      <main>
+        <MarkdownEditor
+          entryId={7}
+          body="body"
+          active={false}
+          readOnly
+          onChange={vi.fn()}
+          onModeChange={vi.fn()}
+          onNewNote={() => false}
+          onNewPrivateNote={() => false}
+          onOpenCommands={() => false}
+          onOpenExplorer={() => false}
+          references={[]}
+          initialSnapshot={{ anchor: 3, head: 3, scrollTop: 80 }}
+          onPreviousBuffer={() => false}
+          onNextBuffer={() => false}
+          onOpenReference={() => false}
+        />
+      </main>,
     );
-    expect(onOpenReference).toHaveBeenCalledWith(9);
-
-    act(() => vimMock.modeListener?.({ mode: "insert" }));
-    editor.dispatchEvent(
-      new KeyboardEvent("keydown", { bubbles: true, cancelable: true, key: "Enter" }),
-    );
-    expect(onOpenReference).toHaveBeenCalledOnce();
+    const view = EditorView.findFromDOM(container.querySelector(".cm-editor") as HTMLElement)!;
+    const frame = frames.get(11)!;
+    expect(view.state.selection.main.head).toBe(0);
+    unmount();
+    frame(0);
+    expect(cancel).toHaveBeenCalledWith(11);
+    expect(container.querySelector("main")?.scrollTop ?? 0).toBe(0);
   });
 
   it("collapses resolved and broken references until selection intersects their source", async () => {
@@ -180,9 +225,9 @@ describe("MarkdownEditor application shortcuts", () => {
         ref={editorRef}
         entryId={1}
         body="[[note:2|Stored title]] and [[note:3|Deleted title]] [[note:4|Old daily label]]"
+        active
         readOnly={false}
         onChange={vi.fn()}
-        onClipboardError={vi.fn()}
         onModeChange={vi.fn()}
         onNewNote={() => false}
         onNewPrivateNote={() => false}
@@ -211,44 +256,6 @@ describe("MarkdownEditor application shortcuts", () => {
     expect(container.querySelector(".cm-reference-broken")).not.toBeNull();
   });
 
-  it("reserves NORMAL H and L for buffer navigation without handling them in other modes", () => {
-    const previous = vi.fn(() => false);
-    const next = vi.fn(() => false);
-    const { container } = render(
-      <MarkdownEditor
-        entryId={1}
-        body="body"
-        readOnly={false}
-        onChange={vi.fn()}
-        onClipboardError={vi.fn()}
-        onModeChange={vi.fn()}
-        onNewNote={() => false}
-        onNewPrivateNote={() => false}
-        onOpenCommands={() => false}
-        onOpenExplorer={() => false}
-        onOpenReference={() => false}
-        references={[]}
-        onPreviousBuffer={previous}
-        onNextBuffer={next}
-      />,
-    );
-    const editor = container.querySelector(".cm-editor")!;
-    const h = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, shiftKey: true, key: "H" });
-    const l = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, shiftKey: true, key: "L" });
-    editor.dispatchEvent(h);
-    editor.dispatchEvent(l);
-    expect(previous).toHaveBeenCalledOnce();
-    expect(next).toHaveBeenCalledOnce();
-    expect(h.defaultPrevented).toBe(true);
-    expect(l.defaultPrevented).toBe(true);
-
-    act(() => vimMock.modeListener?.({ mode: "insert" }));
-    const insertH = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, shiftKey: true, key: "H" });
-    editor.dispatchEvent(insertH);
-    expect(previous).toHaveBeenCalledOnce();
-    expect(insertH.defaultPrevented).toBe(false);
-  });
-
   it("keeps external document replacements out of undo history and change callbacks", async () => {
     const editorRef = createRef<MarkdownEditorHandle>();
     const onChange = vi.fn();
@@ -257,9 +264,9 @@ describe("MarkdownEditor application shortcuts", () => {
         ref={editorRef}
         entryId={1}
         body="local body"
+        active
         readOnly={false}
         onChange={onChange}
-        onClipboardError={vi.fn()}
         onModeChange={vi.fn()}
         onNewNote={() => false}
         onNewPrivateNote={() => false}
@@ -291,9 +298,9 @@ describe("MarkdownEditor application shortcuts", () => {
           ref={ref}
           entryId={1}
           body={body}
+          active
           readOnly={false}
           onChange={vi.fn()}
-          onClipboardError={vi.fn()}
           onModeChange={vi.fn()}
           onNewNote={() => false}
           onNewPrivateNote={() => false}
@@ -344,9 +351,9 @@ describe("Mermaid blocks", () => {
   const props = {
     entryId: 1,
     body,
+    active: true,
     readOnly: false,
     onChange: vi.fn(),
-    onClipboardError: vi.fn(),
     onModeChange: vi.fn(),
     onNewNote: () => false,
     onNewPrivateNote: () => false,

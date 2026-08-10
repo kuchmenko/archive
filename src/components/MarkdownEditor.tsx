@@ -3,14 +3,13 @@ import { markdown } from "@codemirror/lang-markdown";
 import { Annotation, Compartment, EditorState, RangeSetBuilder, StateEffect, StateField, Transaction } from "@codemirror/state";
 import { Decoration, drawSelection, EditorView, keymap, ViewPlugin, WidgetType } from "@codemirror/view";
 import { getCM, vim } from "@replit/codemirror-vim";
-import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { noteReferenceAt, parseNoteReferences } from "@/lib/documents";
 import { renderMermaid, type MermaidRender, type ReferenceSummary } from "@/lib/archive";
 import { mermaidBlockKey, mermaidBlocks, selectionIntersectsBlock, type MermaidBlock } from "@/lib/mermaid";
 import type { EditorSnapshot } from "@/lib/buffers";
 import { formatLocalDay } from "@/lib/date";
-import { appShortcut } from "@/lib/shortcuts";
 import { sanitizeSvg } from "@/lib/sanitize";
+import { registerArchiveVimActions } from "@/lib/vim";
 import { forwardRef, useEffect, useImperativeHandle, useRef } from "react";
 
 export type MarkdownEditorHandle = {
@@ -65,10 +64,10 @@ export type ExplorerOrigin = {
 type MarkdownEditorProps = {
   entryId: number;
   body: string;
+  active: boolean;
   readOnly: boolean;
   onChange: (entryId: number, body: string) => void;
-  onClipboardError: (message: string) => void;
-  onModeChange: (mode: string) => void;
+  onModeChange: (entryId: number, mode: string) => void;
   onNewNote: () => boolean;
   onNewPrivateNote: () => boolean;
   onOpenCommands: () => boolean;
@@ -293,9 +292,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
   {
     entryId,
     body,
+    active,
     readOnly,
     onChange,
-    onClipboardError,
     onModeChange,
     onNewNote,
     onNewPrivateNote,
@@ -311,10 +310,13 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
 ) {
   const mount = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
+  const activeRef = useRef(active);
+  const previousActive = useRef(active);
+  const retainedScrollTop = useRef(initialSnapshot?.scrollTop ?? 0);
+  const retainedMode = useRef("NORMAL");
   const readOnlyCompartment = useRef(new Compartment()).current;
   const referencesCompartment = useRef(new Compartment()).current;
   const onChangeRef = useRef(onChange);
-  const onClipboardErrorRef = useRef(onClipboardError);
   const onModeChangeRef = useRef(onModeChange);
   const onNewNoteRef = useRef(onNewNote);
   const onNewPrivateNoteRef = useRef(onNewPrivateNote);
@@ -324,7 +326,6 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
   const onPreviousBufferRef = useRef(onPreviousBuffer);
   const onNextBufferRef = useRef(onNextBuffer);
   onChangeRef.current = onChange;
-  onClipboardErrorRef.current = onClipboardError;
   onModeChangeRef.current = onModeChange;
   onNewNoteRef.current = onNewNote;
   onNewPrivateNoteRef.current = onNewPrivateNote;
@@ -333,11 +334,12 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
   onOpenReferenceRef.current = onOpenReference;
   onPreviousBufferRef.current = onPreviousBuffer;
   onNextBufferRef.current = onNextBuffer;
+  activeRef.current = active;
 
   useImperativeHandle(ref, () => ({
     focus(position) {
       const view = viewRef.current;
-      if (!view) return;
+      if (!view || !activeRef.current) return;
       if (position !== undefined) {
         const cursor = Math.max(0, Math.min(position, view.state.doc.length));
         view.dispatch({ selection: { anchor: cursor } });
@@ -346,7 +348,7 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
     },
     insertAt(position, text) {
       const view = viewRef.current;
-      if (!view) return;
+      if (!view || !activeRef.current) return;
       const cursor = Math.max(0, Math.min(position, view.state.doc.length));
       view.dispatch({
         changes: { from: cursor, insert: text },
@@ -373,21 +375,13 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       const view = viewRef.current;
       if (!view) return null;
       const { anchor, head } = view.state.selection.main;
-      return { anchor, head, scrollTop: pageScrollContainer(view)?.scrollTop ?? 0 };
+      retainedScrollTop.current = pageScrollContainer(view)?.scrollTop ?? retainedScrollTop.current;
+      return { anchor, head, scrollTop: retainedScrollTop.current };
     },
   }));
 
   useEffect(() => {
     if (!mount.current) return;
-    let disposed = false;
-    let vimMode = "normal";
-    let pendingSpace = false;
-    let spaceTimer: ReturnType<typeof setTimeout> | null = null;
-
-    const clipboardError = (error: unknown) => {
-      if (disposed) return;
-      onClipboardErrorRef.current(error instanceof Error ? error.message : String(error));
-    };
     const view = new EditorView({
       parent: mount.current,
       state: EditorState.create({
@@ -417,7 +411,9 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
           EditorView.theme({
             "&": { minHeight: "160px", backgroundColor: "transparent", color: "#ece8df" },
             ".cm-scroller": {
-              overflow: "visible",
+              maxHeight: "58vh",
+              overflowY: "auto",
+              overflowX: "hidden",
               fontFamily: '"Iosevka", "JetBrains Mono", "SFMono-Regular", Consolas, monospace',
               fontSize: "16px",
               lineHeight: "1.75",
@@ -448,121 +444,29 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
       }),
     });
     viewRef.current = view;
-    const appKeydown = (event: KeyboardEvent) => {
-      if (
-        vimMode === "normal" && !event.ctrlKey && !event.metaKey && !event.altKey && event.shiftKey &&
-        (event.key === "H" || event.key === "L")
-      ) {
-        event.key === "H" ? onPreviousBufferRef.current() : onNextBufferRef.current();
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      if (
-        vimMode === "normal" &&
-        !event.ctrlKey &&
-        !event.metaKey &&
-        !event.altKey &&
-        !event.shiftKey &&
-        event.key === " "
-      ) {
-        event.preventDefault();
-        event.stopPropagation();
-        if (pendingSpace) {
-          pendingSpace = false;
-          if (spaceTimer !== null) clearTimeout(spaceTimer);
-          spaceTimer = null;
-          onOpenExplorerRef.current({ documentId: entryId, cursor: view.state.selection.main.head });
-        } else {
-          pendingSpace = true;
-          spaceTimer = setTimeout(() => {
-            pendingSpace = false;
-            spaceTimer = null;
-          }, 500);
-        }
-        return;
-      }
-      if (pendingSpace) {
-        pendingSpace = false;
-        if (spaceTimer !== null) clearTimeout(spaceTimer);
-        spaceTimer = null;
-      }
-
-      if (
-        vimMode === "normal" &&
-        !event.ctrlKey &&
-        !event.metaKey &&
-        !event.altKey &&
-        event.key === "Enter"
-      ) {
+    const unregisterVimActions = registerArchiveVimActions(view, {
+      openExplorer: () => onOpenExplorerRef.current({ documentId: entryId, cursor: view.state.selection.main.head }),
+      newSharedNote: () => { onNewNoteRef.current(); },
+      newPrivateNote: () => { onNewPrivateNoteRef.current(); },
+      openCommandPalette: () => { onOpenCommandsRef.current(); },
+      openReference: () => {
         const reference = noteReferenceAt(view.state.doc.toString(), view.state.selection.main.head);
-        if (reference && onOpenReferenceRef.current(reference.id)) {
-          event.preventDefault();
-          event.stopPropagation();
-          return;
-        }
-      }
-
-      const shortcut = appShortcut(event);
-      const handled =
-        shortcut === "new-note"
-          ? onNewNoteRef.current()
-          : shortcut === "new-private-note"
-            ? onNewPrivateNoteRef.current()
-            : shortcut === "open-commands"
-              ? onOpenCommandsRef.current()
-              : false;
-      if (handled) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-
-      if ((!event.ctrlKey && !event.metaKey) || event.altKey) return;
-      const key = event.key.toLowerCase();
-      const selection = view.state.selection.main;
-      if ((key === "c" || key === "x") && selection.empty) return;
-      if (key !== "c" && key !== "x" && key !== "v") return;
-      event.preventDefault();
-      event.stopPropagation();
-
-      if (key === "c") {
-        void writeText(view.state.sliceDoc(selection.from, selection.to)).catch(clipboardError);
-      } else if (key === "x") {
-        const { from, to } = selection;
-        const selected = view.state.sliceDoc(from, to);
-        const originalDocument = view.state.doc;
-        void writeText(selected)
-          .then(() => {
-            if (disposed) return;
-            if (view.state.doc !== originalDocument) {
-              throw new Error("Selection changed; cut was canceled");
-            }
-            view.dispatch({ changes: { from, to, insert: "" } });
-          })
-          .catch(clipboardError);
-      } else {
-        void readText()
-          .then((text) => {
-            if (!disposed) view.dispatch(view.state.replaceSelection(text));
-          })
-          .catch(clipboardError);
-      }
-    };
-    view.dom.addEventListener("keydown", appKeydown, { capture: true });
+        if (reference) onOpenReferenceRef.current(reference.id);
+      },
+      previousBuffer: () => { onPreviousBufferRef.current(); },
+      nextBuffer: () => { onNextBufferRef.current(); },
+    });
     const cm = getCM(view);
     const modeChanged = (event: { mode: string; subMode?: string }) => {
-      vimMode = event.mode.toLowerCase();
-      pendingSpace = false;
-      if (spaceTimer !== null) clearTimeout(spaceTimer);
-      spaceTimer = null;
       const subMode = event.subMode ? ` ${event.subMode}` : "";
-      onModeChangeRef.current(`${event.mode}${subMode}`.toUpperCase());
+      retainedMode.current = `${event.mode}${subMode}`.toUpperCase();
+      if (activeRef.current) onModeChangeRef.current(entryId, retainedMode.current);
     };
     cm?.on("vim-mode-change", modeChanged);
 
-    onModeChangeRef.current("NORMAL");
-    requestAnimationFrame(() => {
+    if (activeRef.current) onModeChangeRef.current(entryId, retainedMode.current);
+    const mountFrame = requestAnimationFrame(() => {
+      if (!activeRef.current || viewRef.current !== view) return;
       if (initialSnapshot) {
         const anchor = Math.min(initialSnapshot.anchor, view.state.doc.length);
         const head = Math.min(initialSnapshot.head, view.state.doc.length);
@@ -570,17 +474,42 @@ export const MarkdownEditor = forwardRef<MarkdownEditorHandle, MarkdownEditorPro
         const scrollContainer = mount.current?.closest("main");
         if (scrollContainer) scrollContainer.scrollTop = initialSnapshot.scrollTop;
       }
-      view.focus();
+      view.requestMeasure({
+        read() {},
+        write() {
+          if (activeRef.current && viewRef.current === view) view.focus();
+        },
+      });
     });
     return () => {
-      disposed = true;
+      cancelAnimationFrame(mountFrame);
       viewRef.current = null;
-      if (spaceTimer !== null) clearTimeout(spaceTimer);
-      view.dom.removeEventListener("keydown", appKeydown, { capture: true });
+      unregisterVimActions();
       cm?.off("vim-mode-change", modeChanged);
       view.destroy();
     };
   }, []);
+
+  useEffect(() => {
+    const becameActive = active && !previousActive.current;
+    previousActive.current = active;
+    if (!becameActive) return;
+    const view = viewRef.current;
+    if (!view) return;
+    requestAnimationFrame(() => {
+      if (!activeRef.current || viewRef.current !== view) return;
+      const scrollContainer = pageScrollContainer(view);
+      if (scrollContainer) scrollContainer.scrollTop = retainedScrollTop.current;
+      view.requestMeasure({
+        read() {},
+        write() {
+          if (!activeRef.current || viewRef.current !== view) return;
+          onModeChangeRef.current(entryId, retainedMode.current);
+          view.focus();
+        },
+      });
+    });
+  }, [active, entryId]);
 
   useEffect(() => {
     viewRef.current?.dispatch({

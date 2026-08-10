@@ -1,12 +1,18 @@
 import { spawn } from "node:child_process";
 import { chromium } from "playwright-core";
 
-const server = spawn("npm", ["exec", "vite", "preview", "--", "--host", "127.0.0.1", "--port", "4173"], {
-  stdio: "ignore",
+const server = spawn("npm", ["exec", "vite", "preview", "--", "--host", "127.0.0.1", "--port", "4173", "--strictPort"], {
+  stdio: ["ignore", "pipe", "pipe"],
 });
+let serverExit = null;
+let serverOutput = "";
+server.stdout.on("data", (chunk) => { serverOutput += chunk; });
+server.stderr.on("data", (chunk) => { serverOutput += chunk; });
+server.once("exit", (code, signal) => { serverExit = { code, signal }; });
 
 async function waitForServer() {
   for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (serverExit) throw new Error(`Vite preview exited before readiness (${serverExit.code ?? serverExit.signal})\n${serverOutput}`);
     try {
       const response = await fetch("http://127.0.0.1:4173");
       if (response.ok) return;
@@ -36,7 +42,7 @@ try {
   await page.addInitScript(() => {
     const timestamp = "2026-08-03T10:00:00.000Z";
     const documents = [
-      { id: 1, kind: "daily", visibility: "shared", author: "user", day: "2026-08-03", created_at: timestamp, updated_at: timestamp, body: "", revision: 1 },
+      { id: 1, kind: "daily", visibility: "shared", author: "user", day: "2026-08-03", created_at: timestamp, updated_at: timestamp, body: Array.from({ length: 140 }, (_, index) => `viewport line ${String(index + 1).padStart(3, "0")}`).join("\n"), revision: 1 },
       {
         id: 2,
         kind: "note",
@@ -120,6 +126,9 @@ try {
     window.__archiveSync = {
       presence,
       queue: syncQueue,
+      revision(id) {
+        return documents.find((candidate) => candidate.id === id)?.revision;
+      },
       pushRemote(id, body, revision) {
         const document = documents.find((candidate) => candidate.id === id);
         if (!document) throw new Error(`Document ${id} does not exist`);
@@ -274,12 +283,27 @@ try {
   await page.goto("http://127.0.0.1:4173");
   await page.addStyleTag({ content: "*, *::before, *::after { animation: none !important; transition: none !important; }" });
 
-  const editor = page.locator(".cm-editor");
-  const content = page.locator(".cm-content");
+  const editor = page.locator('[data-editor-active="true"] .cm-editor');
+  const content = page.locator('[data-editor-active="true"] .cm-content');
+  const retainedEditors = page.locator("[data-document-id] .cm-editor");
   const explorer = page.getByRole("dialog", { name: "Explore notes" });
   const mode = (name) => page.locator("footer", { hasText: name });
   const editorBody = async () => (await content.innerText()).replace(/\n$/, "");
   const calls = (command) => page.evaluate((name) => window.__archiveCalls.filter((call) => call.command === name), command);
+  const cursorLine = () => editor.evaluate((root) => {
+    const cursor = root.querySelector(".cm-vimCursorLayer .cm-fat-cursor.cm-cursor-primary")?.getBoundingClientRect();
+    if (!cursor) return null;
+    const y = cursor.top + cursor.height / 2;
+    return [...root.querySelectorAll(".cm-line")].find((line) => {
+      const box = line.getBoundingClientRect();
+      return y >= box.top && y <= box.bottom;
+    })?.textContent ?? null;
+  });
+
+  async function leader(key) {
+    await page.keyboard.press("Space");
+    await page.keyboard.press(key);
+  }
 
   async function replaceAllInVim(body) {
     await content.click();
@@ -307,6 +331,104 @@ try {
   await page.getByRole("heading", { name: "Monday, August 3, 2026" }).waitFor();
   await editor.waitFor();
   assert((await editor.count()) === 1, "Startup did not render exactly one editor");
+  const scroller = editor.locator(".cm-scroller");
+  const viewport = await scroller.evaluate((element) => ({ scrollHeight: element.scrollHeight, clientHeight: element.clientHeight }));
+  assert(viewport.scrollHeight > viewport.clientHeight && viewport.clientHeight > 0, "Long active editor does not have a bounded viewport");
+  await content.click();
+  await page.keyboard.press("Escape");
+  const clipboardReadsBeforeVisualBlock = (await calls("plugin:clipboard-manager|read_text")).length;
+  await page.keyboard.press("Control+v");
+  await mode("VISUAL BLOCK").waitFor();
+  assert((await calls("plugin:clipboard-manager|read_text")).length === clipboardReadsBeforeVisualBlock, "Ctrl-V read the Tauri clipboard instead of entering Visual Block");
+  await page.keyboard.press("Escape");
+  await page.keyboard.type("gg10j");
+  const jumpTarget = await cursorLine();
+  await page.keyboard.press("Shift+G");
+  await page.keyboard.press("Control+o");
+  assert((await cursorLine()) === jumpTarget, "Same-editor Ctrl-O did not restore the seeded jump cursor");
+  const createCallsBeforeNativeKeys = (await calls("create_note")).length;
+  const commandCallsBeforeNativeKeys = (await calls("search_documents")).length;
+  const lineBeforeCtrlN = await cursorLine();
+  await page.keyboard.press("Control+n");
+  const lineAfterCtrlN = await cursorLine();
+  assert(lineAfterCtrlN !== lineBeforeCtrlN, "Ctrl-N did not perform native Vim cursor movement");
+  await page.keyboard.press("Enter");
+  assert((await cursorLine()) !== lineAfterCtrlN, "Enter did not perform native Vim line movement");
+  assert((await calls("create_note")).length === createCallsBeforeNativeKeys && (await calls("search_documents")).length === commandCallsBeforeNativeKeys, "Native Ctrl-N or Enter triggered an Archive action");
+  await page.keyboard.type("gg60j");
+  const scrollBeforeDown = await scroller.evaluate((element) => element.scrollTop);
+  await page.keyboard.press("Control+d");
+  await page.waitForTimeout(30);
+  const scrollAfterDown = await scroller.evaluate((element) => element.scrollTop);
+  assert(scrollAfterDown > scrollBeforeDown, "Ctrl-D did not move the active editor viewport down");
+  await page.keyboard.press("Control+u");
+  await page.waitForTimeout(30);
+  const scrollAfterUp = await scroller.evaluate((element) => element.scrollTop);
+  assert(scrollAfterUp < scrollAfterDown, "Ctrl-U did not move the active editor viewport up");
+  await page.keyboard.press("Control+f");
+  await page.waitForTimeout(30);
+  const scrollAfterForward = await scroller.evaluate((element) => element.scrollTop);
+  assert(scrollAfterForward > scrollAfterUp, "Ctrl-F did not move the active editor viewport down");
+  await page.keyboard.press("Control+b");
+  await page.waitForTimeout(30);
+  const scrollAfterBack = await scroller.evaluate((element) => element.scrollTop);
+  assert(scrollAfterBack < scrollAfterForward, "Ctrl-B did not move the active editor viewport up");
+
+  async function cursorViewportGeometry() {
+    return editor.evaluate((root) => {
+      const cursorElement = root.querySelector(".cm-vimCursorLayer .cm-fat-cursor.cm-cursor-primary");
+      const scrollerElement = root.querySelector(".cm-scroller");
+      if (!cursorElement || !scrollerElement) return null;
+      const cursor = cursorElement.getBoundingClientRect();
+      const scroll = scrollerElement.getBoundingClientRect();
+      return {
+        cursorWidth: cursor.width,
+        cursorHeight: cursor.height,
+        scrollerWidth: scroll.width,
+        scrollerHeight: scroll.height,
+        ratio: (cursor.top + cursor.height / 2 - scroll.top) / scroll.height,
+      };
+    });
+  }
+  async function waitForCursorBand(min, max) {
+    await page.waitForFunction(({ min, max }) => {
+      const cursorElement = document.querySelector('[data-editor-active="true"] .cm-vimCursorLayer .cm-fat-cursor.cm-cursor-primary');
+      const scrollerElement = document.querySelector('[data-editor-active="true"] .cm-scroller');
+      if (!cursorElement || !scrollerElement) return false;
+      const cursor = cursorElement.getBoundingClientRect();
+      const scroll = scrollerElement.getBoundingClientRect();
+      if (cursor.width <= 0 || cursor.height <= 0 || scroll.width <= 0 || scroll.height <= 0) return false;
+      const ratio = (cursor.top + cursor.height / 2 - scroll.top) / scroll.height;
+      return ratio > min && ratio < max;
+    }, { min, max });
+  }
+  const initialCursorGeometry = await cursorViewportGeometry();
+  assert(initialCursorGeometry !== null, "Visible primary Vim cursor or active editor scroller does not exist");
+  assert(initialCursorGeometry.cursorWidth > 0 && initialCursorGeometry.cursorHeight > 0 && initialCursorGeometry.scrollerWidth > 0 && initialCursorGeometry.scrollerHeight > 0, "Visible primary Vim cursor or active editor scroller has non-positive geometry");
+  await page.keyboard.press("Shift+H");
+  await waitForCursorBand(-Number.EPSILON, 0.25);
+  const highLine = await cursorLine();
+  await page.keyboard.press("Shift+L");
+  await waitForCursorBand(0.75, 1 + Number.EPSILON);
+  const lowLine = await cursorLine();
+  assert(highLine !== lowLine, "H and L did not move between actual high and low visible lines");
+  await page.keyboard.type("zz");
+  await waitForCursorBand(0.35, 0.65);
+  const centeredCursor = (await cursorViewportGeometry()).ratio;
+  assert(centeredCursor > 0.35 && centeredCursor < 0.65, `zz did not center the cursor (${centeredCursor})`);
+  await page.keyboard.type("zt");
+  await waitForCursorBand(-Number.EPSILON, 0.2);
+  const topCursor = (await cursorViewportGeometry()).ratio;
+  assert(topCursor >= 0 && topCursor < 0.2, `zt did not place the cursor near the top (${topCursor})`);
+  await page.keyboard.type("zb");
+  await waitForCursorBand(0.8, 1 + Number.EPSILON);
+  const bottomCursor = (await cursorViewportGeometry()).ratio;
+  assert(bottomCursor > 0.8 && bottomCursor <= 1, `zb did not place the cursor near the bottom (${bottomCursor})`);
+
+  const main = page.locator("main");
+  await main.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  await page.getByRole("button", { name: /Agent work · 3/ }).waitFor({ state: "visible" });
+  assert(await page.getByRole("button", { name: /Agent work · 3/ }).isVisible(), "Outer scrolling cannot reach the active daily shelf");
   const footer = page.locator("footer");
   const identityStatus = footer.locator('[data-status-region="identity"]');
   const documentStatus = footer.locator('[data-status-region="document"]');
@@ -317,7 +439,72 @@ try {
   assert(Math.abs(documentBox.x + documentBox.width / 2 - (footerBox.x + footerBox.width / 2)) < 1, "Document status is not centered against the full window");
   assert((await identityStatus.innerText()).includes("ARCHIVE") && (await documentStatus.innerText()).includes("1/1 · Monday, August 3, 2026"), "Stable status regions contain the wrong information");
   assert((await persistenceStatus.innerText()) === "", "Persistence status is not initially empty");
+  await scroller.evaluate((element) => { element.scrollTop = Math.floor(element.scrollHeight / 3); });
+  const dailyEditorRoot = await page.locator('[data-document-id="1"] .cm-editor').elementHandle();
+  await content.click();
+  await page.keyboard.press("Escape");
+  await page.keyboard.type("ggma");
+  const beforeRetainedAction = await editorBody();
+  await page.keyboard.press("x");
+  const afterRetainedAction = await editorBody();
+  assert(afterRetainedAction !== beforeRetainedAction, "Seed non-insert action did not change A");
+  const retainedScroll = await scroller.evaluate((element) => element.scrollTop);
+  await leader("Space");
+  await explorer.waitFor();
+  await explorer.getByPlaceholder("Search notes…").fill("Project");
+  await explorer.locator('[data-slot="command-item"]', { hasText: "Project note" }).waitFor();
+  await page.keyboard.press("Enter");
+  await page.getByRole("heading", { name: "Project note" }).waitFor();
+  await content.click();
+  await page.keyboard.press("Escape");
+  await page.keyboard.type("[b");
+  await page.getByRole("heading", { name: "Monday, August 3, 2026" }).waitFor();
+  await editor.waitFor();
+  assert(await dailyEditorRoot.evaluate((root) => root === document.querySelector('[data-document-id="1"] .cm-editor')), "A editor DOM identity changed across A to B to A");
+  const reactivatedGeometry = await editor.boundingBox();
+  assert(reactivatedGeometry && reactivatedGeometry.width > 0 && reactivatedGeometry.height > 0, "Reactivated A editor has zero geometry");
+  assert((await scroller.evaluate((element) => element.scrollTop)) === retainedScroll, "Reactivated A editor lost internal scroll");
+  const inactiveB = page.locator('[data-document-id="2"] .cm-content');
+  const inactiveBody = await inactiveB.innerText();
+  await inactiveB.evaluate((element) => element.focus());
+  await page.keyboard.press("x");
+  assert((await inactiveB.innerText()) === inactiveBody && !await inactiveB.evaluate((element) => element === document.activeElement), "Inactive retained B accepted browser focus or input");
+  await content.focus();
+  await page.keyboard.press(".");
+  const afterRetainedRepeat = await editorBody();
+  assert(afterRetainedRepeat !== afterRetainedAction, "A lost its non-insert repeat action across A to B to A");
+  await page.keyboard.press("u");
+  assert((await editorBody()) === afterRetainedAction, "A undo did not remain scoped to the retained A editor");
+  await page.keyboard.type("'a");
+  assert((await cursorLine())?.startsWith("iewport line 001"), "A mark did not survive A to B to A");
+  await page.keyboard.press("u");
+  assert((await editorBody()) === beforeRetainedAction, "A retained undo history did not restore its original body");
+  await page.keyboard.press("Shift+H");
+  await page.keyboard.press("Shift+L");
+  for (const key of ["Control+d", "Control+u", "Control+f", "Control+b"]) await page.keyboard.press(key);
+  for (const command of ["zz", "zt", "zb"]) await page.keyboard.type(command);
+  const postReactivationGeometry = await cursorViewportGeometry();
+  assert(postReactivationGeometry && postReactivationGeometry.cursorWidth > 0 && postReactivationGeometry.cursorHeight > 0 && postReactivationGeometry.scrollerWidth > 0 && postReactivationGeometry.scrollerHeight > 0, "Reactivated A viewport motions lost measured geometry");
   await page.setViewportSize({ width: 420, height: 720 });
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth), "Active editor overflows horizontally at 420px");
+  await scroller.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  await content.focus();
+  await scroller.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  let leftEditor = false;
+  for (let index = 0; index < 20 && !leftEditor; index += 1) {
+    await page.keyboard.press("Tab");
+    leftEditor = await page.evaluate(() => !document.activeElement?.closest(".cm-editor"));
+  }
+  assert(leftEditor, "Tab cannot leave CodeMirror for surrounding controls");
+  await main.evaluate((element) => { element.scrollTop = 0; });
+  await scroller.hover();
+  const outerBeforeWheel = await main.evaluate((element) => element.scrollTop);
+  await page.mouse.wheel(0, 800);
+  await page.waitForTimeout(50);
+  const outerAfterWheel = await main.evaluate((element) => element.scrollTop);
+  assert(outerAfterWheel > outerBeforeWheel, "Wheel scrolling did not chain to the outer page at the editor edge");
+  await main.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  assert(await page.getByRole("button", { name: /Agent work · 3/ }).isVisible(), "Active shelf is unreachable at 420px");
   const narrowStatus = await documentStatus.evaluate((element) => ({
     overflow: getComputedStyle(element).overflow,
     whiteSpace: getComputedStyle(element).whiteSpace,
@@ -329,18 +516,26 @@ try {
   assert(narrowFooterBox && narrowDocumentBox && Math.abs(narrowDocumentBox.x + narrowDocumentBox.width / 2 - (narrowFooterBox.x + narrowFooterBox.width / 2)) < 1, "Narrow document status lost full-window centering");
   assert(narrowStatus.overflow === "hidden" && narrowStatus.whiteSpace === "nowrap" && narrowStatus.textOverflow === "ellipsis" && narrowStatus.footerOverflow <= 0, "Narrow status does not truncate without overflowing");
   await page.setViewportSize({ width: 960, height: 720 });
+  await content.focus();
+  await page.keyboard.press("Escape");
   const startupCalls = await calls("get_or_create_daily");
   assert(startupCalls.length === 1 && startupCalls[0].args.day === "2026-08-03", "Startup did not request the canonical daily");
+  const documentCallsBeforeH = (await calls("get_document")).length;
   await page.keyboard.press("Shift+H");
-  assert((await page.getByRole("heading", { name: "Monday, August 3, 2026" }).count()) === 1, "Single-buffer H changed documents");
-  assert((await calls("get_document")).length === 0, "Single-buffer H attempted to open a document");
+  assert((await page.getByRole("heading", { name: "Monday, August 3, 2026" }).count()) === 1, "H changed documents");
+  assert((await calls("get_document")).length === documentCallsBeforeH, "H attempted to open a document");
+  await page.getByRole("button", { name: "Read" }).click();
+  await page.locator(".archive-reader").waitFor();
+  await page.getByRole("button", { name: "Edit" }).click();
+  await editor.waitFor();
 
   const cleanRemote = "shared line\nstable line";
   const cleanUpdateCount = (await calls("update_document_body")).length;
-  await page.evaluate((body) => {
+  const cleanRemoteRevision = await page.evaluate(() => window.__archiveSync.revision(1) + 1);
+  await page.evaluate(({ body, revision }) => {
     window.__archiveSync.setPresence(2, true);
-    window.__archiveSync.pushRemote(1, body, 2);
-  }, cleanRemote);
+    window.__archiveSync.pushRemote(1, body, revision);
+  }, { body: cleanRemote, revision: cleanRemoteRevision });
   await page.waitForFunction((body) => document.querySelector(".cm-content")?.innerText.replace(/\n$/, "") === body, cleanRemote, { timeout: 450 });
   assert((await editorBody()) === cleanRemote, "Clean remote source was not applied exactly");
   const cleanEditorState = await page.evaluate(() => {
@@ -363,7 +558,7 @@ try {
   const firstRemote = "REMOTE line\nstable line";
   await replaceAllInVim(firstLocal);
   const writesBeforeFirstConflict = (await calls("update_document_body")).length;
-  await page.evaluate((body) => window.__archiveSync.pushRemote(1, body, 3), firstRemote);
+  await page.evaluate(({ body, revision }) => window.__archiveSync.pushRemote(1, body, revision), { body: firstRemote, revision: cleanRemoteRevision + 1 });
   const conflictDialog = page.getByRole("alertdialog", { name: "Concurrent edits need your choice" });
   await conflictDialog.waitFor({ timeout: 850 });
   assert((await editorBody()) === firstLocal, "First conflict did not preserve the exact local source");
@@ -378,7 +573,7 @@ try {
   const secondRemote = "THEIRS line\nstable line";
   await replaceAllInVim(secondLocal);
   const writesBeforeSecondConflict = (await calls("update_document_body")).length;
-  await page.evaluate((body) => window.__archiveSync.pushRemote(1, body, 4), secondRemote);
+  await page.evaluate(({ body, revision }) => window.__archiveSync.pushRemote(1, body, revision), { body: secondRemote, revision: cleanRemoteRevision + 2 });
   await conflictDialog.waitFor({ timeout: 850 });
   assert((await editorBody()) === secondLocal, "Second conflict did not preserve the exact local source");
   assert((await calls("update_document_body")).length === writesBeforeSecondConflict, "Autosave wrote an unresolved second conflict");
@@ -386,14 +581,14 @@ try {
   await conflictDialog.waitFor({ state: "detached" });
   await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
   const keepMineWrites = await calls("update_document_body");
-  assert(keepMineWrites.some((call) => call.args.id === 1 && call.args.expectedRevision === 4 && call.args.body === secondLocal), "Keep mine did not write the exact local source against the remote revision");
+  assert(keepMineWrites.some((call) => call.args.id === 1 && call.args.expectedRevision === cleanRemoteRevision + 2 && call.args.body === secondLocal), "Keep mine did not write the exact local source against the remote revision");
   assert((await editorBody()) === secondLocal, "Keep mine changed the local source");
 
-  await page.evaluate(() => window.__archiveSync.pushRemote(1, "", 6));
+  await page.evaluate((revision) => window.__archiveSync.pushRemote(1, "", revision), cleanRemoteRevision + 4);
   await page.waitForFunction(() => document.querySelector(".cm-content")?.innerText.replace(/\n$/, "") === "", { timeout: 450 });
   assert((await page.locator(".editor-toolbar, .editor-topbar, .editor-split, .sidebar, [role=tablist], [data-mermaid-toolbar], [data-sync-toolbar], [data-sync-status]").count()) === 0, "Sync or presence added permanent application chrome");
 
-  await page.keyboard.press("Control+o");
+  await leader("c");
   const dailyDelete = page.locator('[data-slot="command-item"]', { hasText: "Daily documents cannot be deleted" });
   await dailyDelete.waitFor();
   assert((await dailyDelete.getAttribute("data-disabled")) === "true", "Daily delete action is enabled");
@@ -439,16 +634,17 @@ try {
   assert((await calls("resolve_references")).some((call) => call.args.ids.includes(999)), "Active references were not batch resolved");
   await page.getByRole("button", { name: "Read" }).click();
   await page.locator(".archive-reader").waitFor();
-  assert((await editor.count()) === 0, "Read mode left the user document editor mounted");
+  assert((await editor.count()) === 0 && (await retainedEditors.count()) === 2, "Read mode did not retain exactly the open user editors while hiding the active one");
   await page.getByRole("button", { name: "Edit" }).click();
   await editor.waitFor();
   assert((await page.locator(".archive-reader").count()) === 0, "Edit mode left the user document reader mounted");
 
   const createCountBefore = (await calls("create_note")).length;
-  await page.keyboard.press("Control+n");
+  await content.click();
+  await leader("n");
   await page.getByRole("heading", { name: "Untitled note" }).waitFor();
-  assert((await calls("create_note")).length === createCountBefore + 1, "Ctrl+N did not invoke create_note exactly once");
-  assert((await editor.count()) === 1, "Ctrl+N rendered more than one editor");
+  assert((await calls("create_note")).length === createCountBefore + 1, "Space n did not invoke create_note exactly once");
+  assert((await editor.count()) === 1, "Space n rendered more than one editor");
   await content.click();
   await page.keyboard.press("i");
   await mode("INSERT").waitFor();
@@ -479,12 +675,12 @@ try {
   assert(closeOrder[0] >= 0 && closeOrder[0] < closeOrder[1], "Window destroyed before pending body persisted");
   await page.keyboard.press("Escape");
 
-  await page.keyboard.press("Shift+H");
+  await page.keyboard.type("[b");
   await page.getByRole("heading", { name: "Project note" }).waitFor();
   await page.waitForFunction(() => document.querySelector("footer")?.textContent?.includes("2/3"));
   await page.waitForFunction(() => document.querySelector("footer")?.textContent?.includes("NORMAL"));
   await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
-  await page.keyboard.press("Shift+L");
+  await page.keyboard.type("]b");
   await page.getByRole("heading", { name: /Draft body/ }).waitFor();
   assert((await page.locator("footer").innerText()).includes("3/3 · Draft body"), "Status bar does not show buffer position and label");
   await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
@@ -498,20 +694,22 @@ try {
   await explorer.waitFor({ state: "detached" });
   await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
   const expectedSourceWithReference = "Draft body[[note:2|Project note]] ";
-  await page.waitForTimeout(650);
+  await page.waitForFunction((body) => window.__archiveCalls.some((call) =>
+    call.command === "update_document_body" && call.args.id === 5 && call.args.expectedRevision === 2 && call.args.body === body
+  ), expectedSourceWithReference, { timeout: 2_000 });
   updates = await calls("update_document_body");
-  assert(updates.some((call) => call.args.id === 5 && call.args.expectedRevision === 2 && call.args.body === expectedSourceWithReference), "Inserted raw reference did not reach autosave unchanged from revision 2");
+  assert(updates.some((call) => call.args.id === 5 && call.args.expectedRevision === 2 && call.args.body === expectedSourceWithReference), `Inserted raw reference did not reach autosave unchanged from revision 2: ${JSON.stringify(updates.filter((call) => call.args.id === 5))}`);
   await page.locator(".cm-reference-note", { hasText: "Project note" }).waitFor();
 
   await page.keyboard.press("0");
   for (let index = 0; index < 12; index += 1) await page.keyboard.press("l");
   await page.locator(".cm-reference-note").waitFor({ state: "detached" });
   assert((await editorBody()).includes("[[note:2|Project note]]"), "Cursor inside reference did not reveal raw source");
-  await page.keyboard.press("Enter");
+  await page.keyboard.type("gf");
   await page.getByRole("heading", { name: "Project note" }).waitFor();
   await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
   await page.keyboard.press("j");
-  await page.keyboard.press("Enter");
+  await page.keyboard.type("gf");
   await page.getByText("Could not open note: Document 999 does not exist").waitFor();
   assert((await editorBody()) === "# Project note\n[[note:999|Missing]]", "Missing reference navigation modified the project note");
   assert((await editor.count()) === 1, "Missing reference navigation replaced the editor");
@@ -533,7 +731,9 @@ try {
   await selectionRendering("linewise visual");
   await page.keyboard.press("Escape");
 
-  await page.keyboard.press("Control+o");
+  const survivorRoot = await page.locator('[data-document-id="5"] .cm-editor').elementHandle();
+  const editorsBeforeDeletion = await retainedEditors.count();
+  await leader("c");
   const noteDelete = page.locator('[data-slot="command-item"]', { hasText: "Delete note permanently…" });
   await noteDelete.waitFor();
   assert((await noteDelete.getAttribute("data-disabled")) !== "true", "Standalone delete action is disabled");
@@ -541,17 +741,21 @@ try {
   await page.getByRole("alertdialog", { name: "Permanently delete this note?" }).waitFor();
   await page.getByRole("button", { name: "Cancel" }).click();
   assert((await calls("delete_note")).length === 0, "Cancel deleted the note");
-  await page.keyboard.press("Control+o");
+  await content.click();
+  await leader("c");
   await noteDelete.click();
   await page.getByRole("button", { name: "Delete permanently" }).click();
   await page.getByRole("heading", { name: /Draft body/ }).waitFor();
   const deletes = await calls("delete_note");
   assert(deletes.length === 1 && deletes[0].args.id === 2, "Confirmation did not delete the active standalone note exactly once");
+  assert((await retainedEditors.count()) === editorsBeforeDeletion - 1, "Deletion did not remove exactly one editor");
+  assert(await survivorRoot.evaluate((root) => root === document.querySelector('[data-document-id="5"] .cm-editor')), "Deletion replaced a surviving editor DOM identity");
   await page.waitForFunction(() => document.querySelector("footer")?.textContent?.includes("2/2"));
   await page.waitForFunction(() => document.querySelector(".cm-editor")?.classList.contains("cm-focused"));
-  await page.keyboard.press("Shift+H");
+  await page.keyboard.type("[b");
   await page.getByRole("heading", { name: "Monday, August 3, 2026" }).waitFor();
-  await page.keyboard.press("Control+o");
+  await content.click();
+  await leader("c");
   await dailyDelete.waitFor();
   assert((await dailyDelete.getAttribute("data-disabled")) === "true", "Daily delete became available after deletion");
   await page.keyboard.press("Escape");
@@ -590,7 +794,7 @@ try {
   await page.keyboard.press("Enter");
   await page.getByRole("heading", { name: "Agent research artifact" }).waitFor();
   assert((await page.locator("footer").innerText()).includes("Artifact · Agent"), "Agent artifact status is not distinguished");
-  assert((await page.locator(".cm-editor").count()) === 0, "Agent artifact instantiated CodeMirror");
+  assert((await page.locator('[data-document-id="4"] .cm-editor').count()) === 0, "Agent artifact instantiated CodeMirror");
   const reader = page.locator(".archive-reader");
   await reader.locator("svg").waitFor();
   assert((await calls("render_mermaid")).length > 0, "Reader Mermaid source was not rendered");
@@ -625,7 +829,8 @@ try {
   assert((await privateResult.innerText()).toLowerCase().includes("private"), "Private explorer metadata is missing");
   await page.keyboard.press("Escape");
 
-  await page.keyboard.press("Control+o");
+  await content.click();
+  await leader("c");
   await page.locator('[data-slot="command-item"]', { hasText: "New project" }).click();
   await page.getByRole("heading", { name: "Untitled project" }).waitFor();
   await page.getByRole("heading", { name: "Project documents" }).waitFor();
