@@ -8,13 +8,15 @@ Generated on 2026-08-09. Execute in the order below unless dependencies say othe
 |------|-------|----------|--------|------------|--------|
 | 001 | Establish project-centered knowledge | P1 | L | — | DONE |
 | 002 | Add human journal, reading, and agent-review workflows | P1 | L | 001 | DONE |
+| 003 | Give Vim ownership of editing and buffer state | P1 | L | 002 | DONE |
 
 Status values: TODO | IN PROGRESS | DONE | BLOCKED | REJECTED
 
 ## Dependency notes
 
 - Plan 002 builds on project documents and the attachment contract established by plan 001.
-- Vim ownership and runner-wide Archive adoption remain later milestones after plan 002.
+- Plan 003 restores native Vim behavior and preserves editor-local state across Archive buffers.
+- Runner-wide Archive adoption remains the milestone after plan 003.
 
 ## Findings considered and rejected
 
