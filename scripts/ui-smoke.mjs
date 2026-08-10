@@ -84,7 +84,7 @@ try {
         day: "2026-08-03",
         created_at: timestamp,
         updated_at: timestamp,
-        body: "# Agent research artifact\nUseful findings\n```mermaid\ngraph TD\nA-->B\n```",
+        body: `# Agent research artifact\n${Array.from({ length: 140 }, (_, index) => `artifact line ${String(index + 1).padStart(3, "0")}`).join("\n")}\n\`\`\`mermaid\ngraph TD\nA-->B\n\`\`\``,
         revision: 1,
       },
       {
@@ -113,7 +113,7 @@ try {
     let nextId = 5;
     const projectDocuments = new Map();
     const attachments = [
-      { artifact_id: 4, title: "Agent research artifact", day: "2026-08-03", status: "blocked", created_at: timestamp, updated_at: timestamp, reviewed_at: timestamp },
+      { artifact_id: 4, title: "Agent research artifact", day: "2026-08-03", status: "blocked", created_at: timestamp, updated_at: timestamp, reviewed_at: null },
       { artifact_id: 50, title: "Failed agent run", day: "2026-08-03", status: "failed", created_at: timestamp, updated_at: timestamp, reviewed_at: timestamp },
       { artifact_id: 51, title: "Completed agent run", day: "2026-08-03", status: "completed", created_at: timestamp, updated_at: timestamp, reviewed_at: null },
     ];
@@ -775,7 +775,7 @@ try {
   const shelf = page.getByRole("button", { name: /Agent work · 3/ });
   await shelf.waitFor();
   const shelfSummary = await shelf.innerText();
-  assert(shelfSummary.includes("1 blocked") && shelfSummary.includes("1 failed") && shelfSummary.includes("1 New"), `Agent shelf summaries are not independent: ${shelfSummary}`);
+  assert(shelfSummary.includes("1 blocked") && shelfSummary.includes("1 failed") && shelfSummary.includes("2 New"), `Agent shelf summaries are not independent: ${shelfSummary}`);
   await shelf.click();
   const blockedShelfRow = await page.getByRole("button", { name: /Agent research artifact/ }).innerText();
   const failedShelfRow = await page.getByRole("button", { name: /Failed agent run/ }).innerText();
@@ -799,17 +799,112 @@ try {
   await reader.locator("svg").waitFor();
   assert((await calls("render_mermaid")).length > 0, "Reader Mermaid source was not rendered");
   assert((await page.locator(".editor-toolbar, .editor-topbar, .editor-split, [data-mermaid-toolbar]").count()) === 0, "Mermaid added application chrome");
-  assert((await page.getByText("· Reviewed").count()) === 1, "Attached artifact review provenance is missing");
+  assert((await page.getByText("· New").count()) === 1, "Unreviewed artifact provenance is missing");
+  const artifactMain = page.locator("main");
+  await artifactMain.evaluate((element) => { element.scrollTop = 0; });
+  const readScroll = async (key) => {
+    const before = await artifactMain.evaluate((element) => element.scrollTop);
+    await page.keyboard.press(key);
+    await page.waitForTimeout(20);
+    return { before, after: await artifactMain.evaluate((element) => element.scrollTop) };
+  };
+  const lineDown = await readScroll("j");
+  assert(lineDown.after > 0, "Read j did not scroll the outer canvas down");
+  assert((await readScroll("k")).after < lineDown.after, "Read k did not scroll the outer canvas up");
+  await page.keyboard.press("Shift+G");
+  const artifactBottom = await artifactMain.evaluate((element) => element.scrollTop);
+  assert(artifactBottom > 0, "Read G did not reach the outer document bottom");
+  await page.keyboard.press("g");
+  await page.evaluate(() => window.__archiveSync.setPresence(2, true));
+  await page.waitForTimeout(450);
+  await page.keyboard.press("g");
+  assert((await artifactMain.evaluate((element) => element.scrollTop)) === 0, "Read gg did not reach the outer document top");
+  for (const [down, up, name] of [["Control+d", "Control+u", "half-page"], ["Control+f", "Control+b", "full-page"]]) {
+    const movedDown = await readScroll(down);
+    assert(movedDown.after > movedDown.before, `Read ${name} down did not scroll the outer canvas`);
+    const movedUp = await readScroll(up);
+    assert(movedUp.after < movedUp.before, `Read ${name} up did not scroll the outer canvas`);
+  }
+  const artifactBufferStatus = await documentStatus.innerText();
+  await page.keyboard.press("Shift+H");
+  await page.waitForFunction((status) => document.querySelector('[data-status-region="document"]')?.textContent !== status, artifactBufferStatus);
+  assert((await page.getByRole("button", { name: "Edit" }).count()) === 1, "Read H did not preserve Read on a user buffer");
+  await page.keyboard.press("Shift+L");
+  await page.getByRole("heading", { name: "Agent research artifact" }).waitFor();
+  assert((await page.locator('[data-document-id="4"] .cm-editor').count()) === 0, "Read H/L instantiated artifact CodeMirror");
+  await page.keyboard.press("Shift+H");
+  const editButton = page.getByRole("button", { name: "Edit" });
+  await editButton.focus();
+  await page.keyboard.press("Space");
+  await page.getByRole("button", { name: "Read" }).waitFor();
+  await page.getByRole("button", { name: "Read" }).click();
+  await page.keyboard.press("Shift+L");
+  await page.getByRole("heading", { name: "Agent research artifact" }).waitFor();
+  await leader("Space");
+  await explorer.waitFor();
+  const dialogCreateBefore = (await calls("create_note")).length;
+  await search.press("Control+n");
+  await search.press("Control+o");
+  await explorer.press("Control+n");
+  await explorer.press("Control+o");
+  assert((await calls("create_note")).length === dialogCreateBefore && (await page.getByRole("dialog").count()) === 1, "Dialog input or surface leaked Ctrl-N/Ctrl-O to application shortcuts");
+  await page.keyboard.press("Escape");
+  await leader("c");
+  await page.getByRole("dialog", { name: "Command Palette" }).waitFor();
+  await page.keyboard.press("Escape");
+  const readCreateBefore = (await calls("create_note")).length;
+  await leader("n");
+  await page.getByRole("heading", { name: "Untitled note" }).waitFor();
+  assert((await calls("create_note")).length === readCreateBefore + 1 && (await calls("create_note")).at(-1).args.visibility === "shared", "Read Space n did not create a shared note");
+  await page.getByRole("button", { name: "Read" }).click();
+  await page.keyboard.press("Shift+H");
+  await page.getByRole("heading", { name: "Agent research artifact" }).waitFor();
+  await page.evaluate(() => document.activeElement instanceof HTMLElement && document.activeElement.blur());
+  await page.keyboard.press("Space");
+  await page.evaluate(() => document.body.dispatchEvent(new KeyboardEvent("keydown", { key: "N", shiftKey: true, bubbles: true, cancelable: true })));
+  await page.getByRole("heading", { name: "Untitled note" }).waitFor();
+  assert((await calls("create_note")).at(-1).args.visibility === "private", "Read Space N did not create a private note");
+  await page.getByRole("button", { name: "Read" }).click();
+  const privateReadStatus = await documentStatus.innerText();
+  await page.keyboard.press("Shift+H");
+  await page.waitForFunction((status) => document.querySelector('[data-status-region="document"]')?.textContent !== status, privateReadStatus);
+  for (let index = 0; index < 10 && (await page.getByRole("heading", { name: "Agent research artifact" }).count()) === 0; index += 1) {
+    const status = await documentStatus.innerText();
+    await page.keyboard.press("Shift+H");
+    await page.waitForFunction((previous) => document.querySelector('[data-status-region="document"]')?.textContent !== previous, status);
+  }
+  await page.getByRole("heading", { name: "Agent research artifact" }).waitFor();
+  const markArtifactReviewed = page.getByRole("button", { name: "Mark reviewed" });
+  await markArtifactReviewed.scrollIntoViewIfNeeded();
+  await page.keyboard.press("f");
+  assert((await page.locator("[data-read-hint]").count()) > 0, "Read f did not show hints for the artifact");
+  await artifactMain.evaluate((element) => { element.scrollTop -= 80; });
+  await page.locator("[data-read-hint]").first().waitFor({ state: "detached" });
+  await markArtifactReviewed.scrollIntoViewIfNeeded();
+  await page.keyboard.press("f");
+  const markHintKey = await page.locator("[data-read-hint]").evaluateAll((badges, button) => {
+    const target = button.getBoundingClientRect();
+    const badge = badges.find((candidate) => {
+      const rect = candidate.getBoundingClientRect();
+      return Math.abs(rect.top - (target.top + 2)) < 2 && Math.abs(rect.left - (target.left + 2)) < 2;
+    });
+    return badge?.getAttribute("data-read-hint") ?? null;
+  }, await markArtifactReviewed.elementHandle());
+  assert(markHintKey, "Could not identify the Mark reviewed hint by geometry");
+  await page.keyboard.type(markHintKey);
+  await page.getByText("· Reviewed").waitFor();
+  let reviewCalls = await calls("mark_attachment_reviewed");
+  assert(reviewCalls.length === 1 && reviewCalls[0].args.artifactId === 4, "Read f did not mark artifact 4 reviewed exactly once");
   await page.keyboard.press("Control+o");
   await page.locator('[data-slot="command-item"]', { hasText: "Review agent work" }).click();
   const reviewDialog = page.getByRole("dialog", { name: "Review agent work" });
   await reviewDialog.waitFor();
   await reviewDialog.locator('[data-slot="command-item"]', { hasText: "Completed agent run" }).click();
-  assert((await calls("mark_attachment_reviewed")).length === 0, "Opening agent work marked it reviewed");
+  assert((await calls("mark_attachment_reviewed")).length === 1, "Opening agent work marked it reviewed");
   await page.getByRole("button", { name: "Mark reviewed" }).click();
   await page.getByText("· Reviewed").waitFor();
-  const reviewCalls = await calls("mark_attachment_reviewed");
-  assert(reviewCalls.length === 1 && reviewCalls[0].args.artifactId === 51, "Mark reviewed did not mutate exactly one attachment");
+  reviewCalls = await calls("mark_attachment_reviewed");
+  assert(reviewCalls.length === 2 && reviewCalls[1].args.artifactId === 51, "Mark reviewed did not mutate attachment 51 exactly once");
   assert((await page.locator("section").innerText()).includes("Completed"), "Review changed execution status");
   assert((await page.getByText("· New").count()) === 0, "Reviewed attachment kept its New indicator");
 
@@ -824,7 +919,7 @@ try {
   await page.keyboard.type("  ");
   await explorer.waitFor();
   await search.fill("Untitled");
-  const privateResult = explorer.locator('[data-slot="command-item"]', { hasText: "Untitled note" }).filter({ hasText: "Private" });
+  const privateResult = explorer.locator('[data-slot="command-item"]', { hasText: "Untitled note" }).filter({ hasText: "Private" }).last();
   await privateResult.waitFor();
   assert((await privateResult.innerText()).toLowerCase().includes("private"), "Private explorer metadata is missing");
   await page.keyboard.press("Escape");
@@ -839,7 +934,7 @@ try {
   const addExplorer = page.getByRole("dialog", { name: "Add document to project" });
   await addExplorer.waitFor();
   await addExplorer.getByPlaceholder("Search documents…").fill("Untitled");
-  const addResult = addExplorer.locator('[data-slot="command-item"]', { hasText: "Untitled note" }).filter({ hasText: "Private" });
+  const addResult = addExplorer.locator('[data-slot="command-item"]', { hasText: "Untitled note" }).filter({ hasText: "Private" }).last();
   await addResult.waitFor();
   await addResult.click();
   await addExplorer.waitFor({ state: "detached" });

@@ -93,6 +93,23 @@ type Presence = {
   agentPresent: boolean;
 };
 
+type ReadHint = {
+  key: string;
+  top: number;
+  left: number;
+};
+
+function ownsGlobalKeyboard(event: KeyboardEvent, overlayOpen: boolean) {
+  if (overlayOpen || document.querySelector("[role='dialog'], [role='alertdialog']")) return false;
+  if (!(event.target instanceof Element)) return true;
+  return !event.target.closest(".cm-editor, input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='textbox'], [role='combobox'], [role='dialog'], [role='alertdialog']") &&
+    (!(event.target instanceof HTMLElement) || !event.target.isContentEditable);
+}
+
+function isInteractive(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest("button, a[href], input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='button'], [role='link']"));
+}
+
 export function App() {
   const [today, setToday] = useState(() => toLocalDay(new Date()));
   const [active, setActive] = useState<Document | null>(null);
@@ -124,6 +141,8 @@ export function App() {
   const [reviewQueue, setReviewQueue] = useState<DailyAttachment[]>([]);
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewing, setReviewing] = useState(false);
+  const [readHints, setReadHints] = useState<ReadHint[]>([]);
+  const [readHintInput, setReadHintInput] = useState("");
   const activeRef = useRef(active);
   const todayRef = useRef(today);
   const operation = useRef(true);
@@ -147,6 +166,13 @@ export function App() {
   const todayToken = useRef(0);
   const markReviewToken = useRef(0);
   const reviewPending = useRef(false);
+  const mainRef = useRef<HTMLElement>(null);
+  const readPrefix = useRef<"g" | "space" | null>(null);
+  const readPrefixTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const readHintsRef = useRef<ReadHint[]>([]);
+  const readHintInputRef = useRef("");
+  const readHintTargets = useRef(new Map<string, HTMLElement>());
+  const keyboardOwnership = useRef({ mode, activeId: active?.id, overlayOpen: false });
   const sessionId = useRef(
     `archive-gui-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random()}`}`,
   ).current;
@@ -155,6 +181,11 @@ export function App() {
   conflictRef.current = conflict;
   explorerOpenRef.current = explorerOpen;
   explorerPurposeRef.current = explorerPurpose;
+  keyboardOwnership.current = {
+    mode,
+    activeId: active?.id,
+    overlayOpen: commandsOpen || explorerOpen || reviewOpen || conflict !== null || deleteTargetId !== null,
+  };
 
   const autosaveRef = useRef<AutosaveController | null>(null);
   if (!autosaveRef.current) {
@@ -558,7 +589,7 @@ export function App() {
   useEffect(() => {
     const keydown = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
-      if (event.target instanceof Element && event.target.closest(".cm-editor")) return;
+      if (!ownsGlobalKeyboard(event, keyboardOwnership.current.overlayOpen)) return;
       const shortcut = appShortcut(event);
       if (shortcut === "new-note" && !operation.current) {
         event.preventDefault();
@@ -573,7 +604,195 @@ export function App() {
     };
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
-  });
+  }, []);
+
+  useEffect(() => {
+    const clearPrefix = () => {
+      readPrefix.current = null;
+      if (readPrefixTimer.current) clearTimeout(readPrefixTimer.current);
+      readPrefixTimer.current = null;
+    };
+    const setPrefix = (prefix: "g" | "space") => {
+      clearPrefix();
+      readPrefix.current = prefix;
+      readPrefixTimer.current = setTimeout(clearPrefix, 700);
+    };
+    const cancelHints = () => {
+      readHintsRef.current = [];
+      readHintInputRef.current = "";
+      readHintTargets.current.clear();
+      setReadHints([]);
+      setReadHintInput("");
+    };
+    const openReadExplorer = () => {
+      const current = activeRef.current;
+      if (!current || operation.current) return false;
+      setExplorerOrigin({ documentId: current.id, cursor: 0 });
+      setExplorerPurpose("open");
+      setExplorerQuery("");
+      setExplorerResults([]);
+      setExplorerSelectedId(null);
+      setExplorerOpen(true);
+      return true;
+    };
+    const startHints = () => {
+      const canvas = mainRef.current;
+      if (!canvas) return false;
+      const mainRect = canvas.getBoundingClientRect();
+      const alphabet = "asdfghjklqwertyuiopzxcvbnm";
+      const targets = [...canvas.querySelectorAll<HTMLElement>("button, a[href]")].filter((target) => {
+        const rect = target.getBoundingClientRect();
+        const style = getComputedStyle(target);
+        return !target.matches(":disabled, [aria-disabled='true']") &&
+          !target.closest("[hidden], [inert], [aria-hidden='true']") &&
+          style.display !== "none" && style.visibility !== "hidden" &&
+          rect.width > 0 && rect.height > 0 && rect.bottom > Math.max(0, mainRect.top) &&
+          rect.top < Math.min(window.innerHeight, mainRect.bottom) && rect.right > Math.max(0, mainRect.left) &&
+          rect.left < Math.min(window.innerWidth, mainRect.right);
+      });
+      const width = targets.length <= alphabet.length ? 1 : 2;
+      const hints = targets.map((target, index) => {
+        const rect = target.getBoundingClientRect();
+        let value = index;
+        let key = "";
+        for (let position = 0; position < width; position += 1) {
+          key = alphabet[value % alphabet.length] + key;
+          value = Math.floor(value / alphabet.length);
+        }
+        readHintTargets.current.set(key, target);
+        return { key, top: Math.max(2, rect.top + 2), left: Math.max(2, rect.left + 2) };
+      });
+      readHintsRef.current = hints;
+      readHintInputRef.current = "";
+      setReadHints(hints);
+      setReadHintInput("");
+      return targets.length > 0;
+    };
+    const keydown = (event: KeyboardEvent) => {
+      const ownership = keyboardOwnership.current;
+      if (event.defaultPrevented || ownership.mode !== "read" || !ownsGlobalKeyboard(event, ownership.overlayOpen)) {
+        clearPrefix();
+        if (ownership.overlayOpen) cancelHints();
+        return;
+      }
+      if (readHintsRef.current.length > 0) {
+        if ((event.key === " " || event.key === "Enter") && isInteractive(event.target)) {
+          cancelHints();
+          return;
+        }
+        if (event.key === "Escape") {
+          event.preventDefault();
+          cancelHints();
+          return;
+        }
+        if (event.repeat || event.key.length !== 1 || event.ctrlKey || event.metaKey || event.altKey) return;
+        const input = readHintInputRef.current + event.key.toLowerCase();
+        const matches = readHintsRef.current.filter((hint) => hint.key.startsWith(input));
+        event.preventDefault();
+        if (matches.length === 1 && matches[0].key === input) {
+          const target = readHintTargets.current.get(matches[0].key);
+          const canvas = mainRef.current;
+          cancelHints();
+          if (!target || !canvas || !target.isConnected || !canvas.contains(target) || target.matches(":disabled, [aria-disabled='true']") || target.closest("[hidden], [inert], [aria-hidden='true']")) return;
+          const rect = target.getBoundingClientRect();
+          const mainRect = canvas.getBoundingClientRect();
+          const style = getComputedStyle(target);
+          if (style.display === "none" || style.visibility === "hidden" || rect.width <= 0 || rect.height <= 0 ||
+            rect.bottom <= Math.max(0, mainRect.top) || rect.top >= Math.min(window.innerHeight, mainRect.bottom) ||
+            rect.right <= Math.max(0, mainRect.left) || rect.left >= Math.min(window.innerWidth, mainRect.right)) return;
+          target.click();
+        } else if (matches.length > 0) {
+          readHintInputRef.current = input;
+          setReadHintInput(input);
+        } else {
+          cancelHints();
+        }
+        return;
+      }
+      const main = mainRef.current;
+      if (!main) return;
+      const key = event.key;
+      const control = event.ctrlKey && !event.metaKey && !event.altKey;
+      const scroll = (top: number) => main.scrollBy({ top, behavior: "auto" });
+      let handled = true;
+      if (readPrefix.current === "g") {
+        clearPrefix();
+        if (!event.repeat && key === "g" && !event.ctrlKey && !event.metaKey && !event.altKey) main.scrollTo({ top: 0, behavior: "auto" });
+        else handled = false;
+      } else if (readPrefix.current === "space") {
+        clearPrefix();
+        if (event.repeat || event.ctrlKey || event.metaKey || event.altKey) handled = false;
+        else if (key === " " && !event.shiftKey) handled = openReadExplorer();
+        else if (key === "n" && !event.shiftKey) { void newStandaloneNote("shared"); }
+        else if (key === "N" && event.shiftKey) { void newStandaloneNote("private"); }
+        else if (key === "c" && !event.shiftKey) setCommandsOpen(true);
+        else handled = false;
+      } else if (!event.repeat && !control && !event.metaKey && !event.altKey && key === "g") {
+        setPrefix("g");
+      } else if (!event.repeat && !control && !event.metaKey && !event.altKey && key === " " && !isInteractive(event.target)) {
+        setPrefix("space");
+      } else if (!control && !event.metaKey && !event.altKey && key === "j") scroll(36);
+      else if (!control && !event.metaKey && !event.altKey && key === "k") scroll(-36);
+      else if (!control && !event.metaKey && !event.altKey && key === "G") main.scrollTo({ top: main.scrollHeight, behavior: "auto" });
+      else if (control && key.toLowerCase() === "d") scroll(main.clientHeight / 2);
+      else if (control && key.toLowerCase() === "u") scroll(-main.clientHeight / 2);
+      else if (control && key.toLowerCase() === "f") scroll(main.clientHeight);
+      else if (control && key.toLowerCase() === "b") scroll(-main.clientHeight);
+      else if (!control && !event.metaKey && !event.altKey && key === "H") handled = switchBuffer(-1, true);
+      else if (!control && !event.metaKey && !event.altKey && key === "L") handled = switchBuffer(1, true);
+      else if (!control && !event.metaKey && !event.altKey && key === "f") handled = startHints();
+      else handled = false;
+      if (handled) event.preventDefault();
+    };
+    window.addEventListener("keydown", keydown);
+    return () => {
+      window.removeEventListener("keydown", keydown);
+      clearPrefix();
+      cancelHints();
+    };
+  }, []);
+
+  useEffect(() => {
+    readPrefix.current = null;
+    if (readPrefixTimer.current) clearTimeout(readPrefixTimer.current);
+    readPrefixTimer.current = null;
+    readHintsRef.current = [];
+    readHintInputRef.current = "";
+    readHintTargets.current.clear();
+    setReadHints([]);
+    setReadHintInput("");
+  }, [active?.id, mode, commandsOpen, explorerOpen, reviewOpen, conflict, deleteTargetId]);
+
+  useEffect(() => {
+    const main = mainRef.current;
+    if (!main || readHints.length === 0) return;
+    const cancel = () => {
+      readHintsRef.current = [];
+      readHintInputRef.current = "";
+      readHintTargets.current.clear();
+      setReadHints([]);
+      setReadHintInput("");
+    };
+    const observer = new MutationObserver((records) => {
+      if (records.length > 0) cancel();
+    });
+    observer.observe(main, {
+      childList: true,
+      characterData: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "style", "disabled", "aria-disabled", "hidden", "inert", "aria-hidden", "href", "role", "tabindex"],
+    });
+    main.addEventListener("scroll", cancel);
+    window.addEventListener("resize", cancel);
+    window.addEventListener("pointerdown", cancel);
+    return () => {
+      observer.disconnect();
+      main.removeEventListener("scroll", cancel);
+      window.removeEventListener("resize", cancel);
+      window.removeEventListener("pointerdown", cancel);
+    };
+  }, [readHints.length]);
 
   useEffect(() => {
     if (!explorerOpen || !active) return;
@@ -614,7 +833,7 @@ export function App() {
     }
   }
 
-  async function openDocument(id: number) {
+  async function openDocument(id: number, preserveRead = false) {
     if (activeRef.current?.id === id || operation.current) return;
     operation.current = true;
     setBusy(true);
@@ -623,7 +842,13 @@ export function App() {
       try {
         const buffered = buffersRef.current.find((buffer) => buffer.document.id === id);
         const document = buffered?.document ?? await getDocument(id);
-        if (await flush()) showDocument(document);
+        if (await flush()) {
+          showDocument(document);
+          if (preserveRead && document.author === "user" && document.kind !== "artifact") {
+            setMode("read");
+            setVimMode("READ");
+          }
+        }
       } catch (error) {
         setNotice(`Could not open note: ${message(error)}`);
       }
@@ -800,12 +1025,12 @@ export function App() {
     return true;
   }
 
-  function switchBuffer(direction: -1 | 1) {
+  function switchBuffer(direction: -1 | 1, readNavigation = false) {
     const current = activeRef.current;
-    if (!current || operation.current || vimMode !== "NORMAL" || commandsOpen || explorerOpen || deleteTargetId !== null) return false;
+    if (!current || operation.current || (!readNavigation && mode === "edit" && vimMode !== "NORMAL") || keyboardOwnership.current.overlayOpen) return false;
     const id = adjacentBufferId(buffersRef.current, current.id, direction);
     if (id === null) return false;
-    void openDocument(id);
+    void openDocument(id, readNavigation);
     return true;
   }
 
@@ -971,7 +1196,7 @@ export function App() {
 
   return (
     <div className="grid h-screen grid-rows-[minmax(0,1fr)_28px] overflow-hidden bg-background text-foreground">
-      <main className="min-h-0 overflow-y-auto bg-[radial-gradient(circle_at_50%_-15%,#292d37_0,transparent_38%)]">
+      <main ref={mainRef} className="min-h-0 overflow-y-auto bg-[radial-gradient(circle_at_50%_-15%,#292d37_0,transparent_38%)]">
         <div className="mx-auto w-full max-w-[820px] px-6 pb-32 pt-12">
           <div className="flex flex-wrap items-center gap-2">
             <h1 className="min-w-0 flex-1 text-3xl font-semibold tracking-[-0.035em] text-[#f3efe7]">{title}</h1>
@@ -1103,6 +1328,18 @@ export function App() {
           )}
         </div>
       </main>
+
+      {readHints.map((hint) => (
+        <span
+          key={hint.key}
+          aria-hidden="true"
+          data-read-hint={hint.key}
+          className="pointer-events-none fixed z-[100] rounded-sm border border-amber-200 bg-[#17191f] px-1 py-0.5 font-mono text-[10px] font-bold leading-none text-amber-200 shadow-md"
+          style={{ top: hint.top, left: hint.left }}
+        >
+          <span className="text-amber-50">{readHintInput}</span>{hint.key.slice(readHintInput.length)}
+        </span>
+      ))}
 
       <footer
         className="grid grid-cols-[minmax(0,1fr)_minmax(0,auto)_minmax(0,1fr)] items-center border-t border-border/70 bg-[#17191f] px-3 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground select-none"

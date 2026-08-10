@@ -310,6 +310,117 @@ describe("Archive document canvas", () => {
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();
   });
 
+  it("owns Read-mode navigation, prefixes, buffers, and exact keyboard hints outside text entry and dialogs", async () => {
+    const row = { artifact_id: 8, title: "Agent output", day: daily.day, status: "completed" as const, created_at: daily.created_at, updated_at: daily.updated_at, reviewed_at: null };
+    vi.mocked(listUnreviewedAttachments).mockResolvedValue([row]);
+    vi.mocked(getAttachmentByArtifactId).mockResolvedValue(row);
+    vi.mocked(markAttachmentReviewed).mockResolvedValue({ ...row, reviewed_at: "2026-08-03T11:00:00.000Z" });
+    vi.mocked(getDocument).mockResolvedValue({ ...daily, id: 8, kind: "artifact", author: "agent", body: "# Agent output" });
+    const { container } = render(<App />);
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByRole("button", { name: "Read" }));
+    await act(async () => Promise.resolve());
+    const main = container.querySelector("main")!;
+    const scrollBy = vi.fn();
+    const scrollTo = vi.fn();
+    Object.defineProperties(main, {
+      clientHeight: { value: 600, configurable: true },
+      scrollHeight: { value: 2_000, configurable: true },
+      scrollBy: { value: scrollBy, configurable: true },
+      scrollTo: { value: scrollTo, configurable: true },
+    });
+    main.getBoundingClientRect = () => new DOMRect(0, 0, 800, 600);
+
+    fireEvent.keyDown(document.body, { key: "j" });
+    fireEvent.keyDown(document.body, { key: "k" });
+    fireEvent.keyDown(document.body, { key: "d", ctrlKey: true });
+    fireEvent.keyDown(document.body, { key: "u", ctrlKey: true });
+    fireEvent.keyDown(document.body, { key: "f", ctrlKey: true });
+    fireEvent.keyDown(document.body, { key: "b", ctrlKey: true });
+    expect(scrollBy.mock.calls.map(([options]) => options.top)).toEqual([36, -36, 300, -300, 600, -600]);
+    fireEvent.keyDown(document.body, { key: "G" });
+    fireEvent.keyDown(document.body, { key: "g" });
+    fireEvent.keyDown(document.body, { key: "g" });
+    expect(scrollTo.mock.calls.map(([options]) => options.top)).toEqual([2_000, 0]);
+    fireEvent.keyDown(document.body, { key: "g" });
+    await act(async () => vi.advanceTimersByTimeAsync(400));
+    fireEvent.keyDown(document.body, { key: "g" });
+    expect(scrollTo).toHaveBeenCalledTimes(3);
+    fireEvent.keyDown(document.body, { key: "g" });
+    await act(async () => vi.advanceTimersByTimeAsync(701));
+    fireEvent.keyDown(document.body, { key: "g" });
+    expect(scrollTo).toHaveBeenCalledTimes(3);
+    await act(async () => vi.advanceTimersByTimeAsync(701));
+
+    fireEvent.keyDown(document.body, { key: "g", repeat: true });
+    fireEvent.keyDown(document.body, { key: "g" });
+    fireEvent.keyDown(document.body, { key: "g", ctrlKey: true });
+    expect(scrollTo).toHaveBeenCalledTimes(3);
+
+    fireEvent.keyDown(document.body, { key: " " });
+    fireEvent.keyDown(document.body, { key: " " });
+    expect(screen.getByRole("dialog", { name: "Explore notes" })).toBeTruthy();
+    const input = screen.getByPlaceholderText("Search notes…");
+    fireEvent.keyDown(input, { key: "j" });
+    fireEvent.keyDown(input, { key: "n", ctrlKey: true });
+    fireEvent.keyDown(input, { key: "o", ctrlKey: true });
+    const dialog = screen.getByRole("dialog", { name: "Explore notes" });
+    fireEvent.keyDown(dialog, { key: "n", ctrlKey: true });
+    fireEvent.keyDown(dialog, { key: "o", ctrlKey: true });
+    expect(createNote).not.toHaveBeenCalled();
+    expect(scrollBy).toHaveBeenCalledTimes(6);
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    fireEvent.keyDown(document.body, { key: " " });
+    fireEvent.keyDown(document.body, { key: "c" });
+    expect(screen.getByRole("dialog", { name: "Command Palette" })).toBeTruthy();
+    fireEvent.keyDown(document, { key: "Escape" });
+    fireEvent.keyDown(document.body, { key: " " });
+    fireEvent.keyDown(document.body, { key: "N", shiftKey: true });
+    await act(async () => Promise.resolve());
+    expect(createNote).toHaveBeenCalledWith("2026-08-03", "private");
+
+    fireEvent.keyDown(document.body, { ctrlKey: true, key: "o" });
+    fireEvent.click(screen.getAllByText("Review agent work").at(-1)!);
+    await act(async () => Promise.resolve());
+    fireEvent.click(screen.getByText("Agent output"));
+    await act(async () => Promise.resolve());
+    const mark = screen.getByRole("button", { name: "Mark reviewed" });
+    mark.getBoundingClientRect = () => new DOMRect(100, 100, 120, 32);
+    fireEvent.keyDown(document.body, { key: "f" });
+    expect(container.querySelectorAll("[data-read-hint]").length).toBeGreaterThan(0);
+    let hint = [...container.querySelectorAll("[data-read-hint]")].find((candidate) => candidate.getBoundingClientRect().top >= 0)!;
+    fireEvent.scroll(main);
+    expect(container.querySelectorAll("[data-read-hint]")).toHaveLength(0);
+    fireEvent.keyDown(document.body, { key: "f" });
+    hint = container.querySelector("[data-read-hint]")!;
+    const inserted = document.createElement("div");
+    mark.parentElement!.insertBefore(inserted, mark);
+    await act(async () => Promise.resolve());
+    expect(container.querySelectorAll("[data-read-hint]")).toHaveLength(0);
+
+    fireEvent.keyDown(document.body, { key: "f" });
+    expect(container.querySelectorAll("[data-read-hint]").length).toBeGreaterThan(0);
+    mark.focus();
+    const nativeSpace = new KeyboardEvent("keydown", { key: " ", bubbles: true, cancelable: true });
+    act(() => mark.dispatchEvent(nativeSpace));
+    expect(nativeSpace.defaultPrevented).toBe(false);
+    expect(container.querySelectorAll("[data-read-hint]")).toHaveLength(0);
+    if (!nativeSpace.defaultPrevented && !vi.mocked(markAttachmentReviewed).mock.calls.length) fireEvent.click(mark);
+    await act(async () => Promise.resolve());
+    expect(markAttachmentReviewed).toHaveBeenCalledWith(8);
+    expect(markAttachmentReviewed).toHaveBeenCalledTimes(1);
+
+    fireEvent.keyDown(document.body, { key: "H" });
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("heading", { name: "Untitled note" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Edit" })).toBeTruthy();
+    fireEvent.keyDown(document.body, { key: "L" });
+    await act(async () => Promise.resolve());
+    expect(screen.getByRole("heading", { name: "Agent output" })).toBeTruthy();
+    expect(container.querySelector('[data-document-id="8"] .cm-editor')).toBeNull();
+  });
+
   it("keeps Edit when the Read flush fails", async () => {
     vi.mocked(updateDocument).mockRejectedValueOnce(new Error("disk full"));
     const { container } = render(<App />);
