@@ -1,6 +1,3 @@
-use merman::render::{
-    HeadlessRenderer, HostThemeOutput, HostThemeProfile, HostThemeRoles, HostThemeRootBackground,
-};
 use merman_analysis::{AnalysisOptions, Analyzer, DiagnosticSeverity};
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use rmcp::schemars;
@@ -23,57 +20,13 @@ pub struct MermaidResult {
     pub svg: Option<String>,
 }
 
-fn engine(diagram_id: Option<&str>) -> (Analyzer, HeadlessRenderer) {
-    let mut output = HostThemeOutput::resvg_safe_editor();
-    output.root_background = HostThemeRootBackground::Color("transparent".to_owned());
-    let profile = HostThemeProfile::builder()
-        .roles(HostThemeRoles {
-            canvas: Some("#1b1e24".into()),
-            surface: Some("#1b1e24".into()),
-            surface_alt: Some("#232831".into()),
-            surface_muted: Some("#232831".into()),
-            text: Some("#ece8df".into()),
-            subtle_text: Some("#b8b3aa".into()),
-            border: Some("#4a5260".into()),
-            line: Some("#8f98a7".into()),
-            edge_label_background: Some("#1b1e24".into()),
-            cluster_background: Some("#232831".into()),
-            cluster_border: Some("#4a5260".into()),
-            note_background: Some("#302a20".into()),
-            note_border: Some("#9d8555".into()),
-            note_text: Some("#ece8df".into()),
-            actor_background: Some("#232831".into()),
-            actor_border: Some("#4a5260".into()),
-            actor_text: Some("#ece8df".into()),
-            activation_background: Some("#232831".into()),
-            activation_border: Some("#8f98a7".into()),
-            ..HostThemeRoles::default()
-        })
-        .theme_variable("background", "transparent")
-        .output(output)
-        .build();
-    let mut renderer = HeadlessRenderer::new()
-        .with_strict_parsing()
-        .with_host_theme(&profile);
-    if let Some(diagram_id) = diagram_id {
-        renderer = renderer.with_diagram_id(diagram_id);
-    }
+fn analyzer() -> Analyzer {
     let options = AnalysisOptions::default().with_max_source_bytes(Some(MAX_MERMAID_SOURCE_BYTES));
-    let analyzer = Analyzer::with_engine_and_options(renderer.engine.clone(), options);
-    (analyzer, renderer)
+    Analyzer::with_options(options)
 }
 
 pub fn validate(source: &str) -> MermaidResult {
-    validate_with_svg(source, None)
-}
-
-pub fn render(source: &str, diagram_id: &str) -> MermaidResult {
-    validate_with_svg(source, Some(diagram_id))
-}
-
-fn validate_with_svg(source: &str, diagram_id: Option<&str>) -> MermaidResult {
-    let (analyzer, renderer) = engine(diagram_id);
-    let analysis = analyzer.analyze_result(source);
+    let analysis = analyzer().analyze_result(source);
     let diagram_type = analysis
         .diagrams()
         .first()
@@ -84,7 +37,7 @@ fn validate_with_svg(source: &str, diagram_id: Option<&str>) -> MermaidResult {
                 .iter()
                 .find_map(|diagnostic| diagnostic.diagram_type.clone())
         });
-    let mut diagnostics = analysis
+    let diagnostics = analysis
         .diagnostics()
         .iter()
         .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
@@ -94,37 +47,11 @@ fn validate_with_svg(source: &str, diagram_id: Option<&str>) -> MermaidResult {
             message: diagnostic.message.clone(),
         })
         .collect::<Vec<_>>();
-    let mut valid = analysis.payload().valid;
-    let svg = if valid && diagram_id.is_some() {
-        match renderer.render_svg_sync(source) {
-            Ok(Some(svg)) => Some(svg),
-            Ok(None) => {
-                valid = false;
-                diagnostics.push(MermaidDiagnostic {
-                    line: None,
-                    column: None,
-                    message: "source does not contain a Mermaid diagram".to_owned(),
-                });
-                None
-            }
-            Err(error) => {
-                valid = false;
-                diagnostics.push(MermaidDiagnostic {
-                    line: None,
-                    column: None,
-                    message: error.to_string(),
-                });
-                None
-            }
-        }
-    } else {
-        None
-    };
     MermaidResult {
-        valid,
+        valid: analysis.payload().valid,
         diagram_type,
         diagnostics,
-        svg,
+        svg: None,
     }
 }
 
@@ -202,37 +129,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn validates_and_renders_flowchart_and_sequence() {
+    fn validates_flowchart_and_sequence() {
         for (source, kind) in [
             ("flowchart TD\nA-->B", "flowchart-v2"),
             ("sequenceDiagram\nAlice->>Bob: Hi", "sequence"),
         ] {
-            let result = render(source, "archive-test");
+            let result = validate(source);
             assert!(result.valid, "{:?}", result.diagnostics);
             assert_eq!(result.diagram_type.as_deref(), Some(kind));
-            assert!(
-                result
-                    .svg
-                    .as_deref()
-                    .is_some_and(|svg| svg.contains("<svg"))
-            );
-            let svg = result.svg.unwrap().to_lowercase();
-            assert!(svg.contains("#1b1e24") || svg.contains("#232831"));
-            assert!(svg.contains("#ece8df"));
-            for opaque in [
-                "background-color:white",
-                "background-color:#fff",
-                "background-color:#ffffff",
-                "rgb(255",
-            ] {
-                assert!(!svg.contains(opaque), "{svg}");
-            }
+            assert!(result.svg.is_none());
         }
-        let first = render("flowchart TD\nA-->B", "archive-first").svg.unwrap();
-        let second = render("flowchart TD\nA-->B", "archive-second").svg.unwrap();
-        assert!(first.contains("archive-first"));
-        assert!(second.contains("archive-second"));
-        assert_ne!(first, second);
     }
 
     #[test]

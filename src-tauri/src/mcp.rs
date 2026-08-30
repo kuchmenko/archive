@@ -319,9 +319,29 @@ pub async fn run(database: Database) -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use rmcp::model::CallToolRequestParams;
+    use rusqlite::{Connection, params};
 
     fn server() -> ArchiveMcp {
         ArchiveMcp::new(Database::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap())
+    }
+
+    fn server_with_observer() -> (ArchiveMcp, Connection, tempfile::TempDir) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("archive.sqlite3");
+        let archive = ArchiveMcp::new(Database::open(&path).unwrap());
+        let observer = Connection::open(path).unwrap();
+        (archive, observer, directory)
+    }
+
+    fn insert_document(connection: &Connection, kind: &str, visibility: &str, body: &str) -> i64 {
+        connection
+            .execute(
+                "INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body)
+             VALUES(?1,?2,'user','2026-08-04','a','a',?3)",
+                params![kind, visibility, body],
+            )
+            .unwrap();
+        connection.last_insert_rowid()
     }
 
     #[test]
@@ -359,64 +379,60 @@ mod tests {
 
     #[test]
     fn project_context_enforces_privacy_limits_and_associations() {
-        let archive = server();
-        let project = archive
-            .database
-            .create_project("2026-08-04", "shared")
-            .unwrap();
-        let private = archive
-            .database
-            .create_note("2026-08-04", "private")
-            .unwrap();
-        archive
-            .database
-            .add_document_to_project(project.id, private.id, "user")
+        let (archive, observer, _directory) = server_with_observer();
+        let project_id = insert_document(&observer, "project", "shared", "# Project");
+        let private_id = insert_document(&observer, "note", "private", "# Private");
+        observer
+            .execute(
+                "INSERT INTO project_documents(project_document_id,document_id,added_by,created_at)
+             VALUES(?1,?2,'user','a')",
+                [project_id, private_id],
+            )
             .unwrap();
         let artifact = archive
             .create_artifact(Parameters(CreateArtifactArgs {
                 title: "Project artifact".into(),
                 body: "body".into(),
                 related_document_ids: None,
-                project_id: Some(project.id),
+                project_id: Some(project_id),
             }))
             .unwrap()
             .0;
         let context = archive
             .get_project_context(Parameters(ProjectContextArgs {
-                project_id: project.id,
+                project_id,
                 limit: Some(20),
             }))
             .unwrap()
             .0;
-        assert_eq!(context.project.id, project.id);
+        assert_eq!(context.project.id, project_id);
         assert_eq!(context.documents.len(), 1);
         assert_eq!(context.documents[0].id, artifact.id);
         assert_eq!(
-            archive
-                .database
-                .list_project_documents(project.id)
-                .unwrap()
-                .len(),
+            observer
+                .query_row(
+                    "SELECT count(*) FROM project_documents WHERE project_document_id=?1",
+                    [project_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
             2
         );
         assert_eq!(
             archive
                 .get_project_context(Parameters(ProjectContextArgs {
-                    project_id: project.id,
+                    project_id,
                     limit: Some(0)
                 }))
                 .err()
                 .unwrap(),
             "limit must be between 1 and 50"
         );
-        let private_project = archive
-            .database
-            .create_project("2026-08-04", "private")
-            .unwrap();
+        let private_project_id = insert_document(&observer, "project", "private", "");
         assert_eq!(
             archive
                 .get_project_context(Parameters(ProjectContextArgs {
-                    project_id: private_project.id,
+                    project_id: private_project_id,
                     limit: None
                 }))
                 .err()
@@ -437,18 +453,15 @@ mod tests {
 
     #[test]
     fn private_and_missing_errors_are_exactly_identical() {
-        let archive = server();
-        let private = archive
-            .database
-            .create_note("2026-08-04", "private")
-            .unwrap();
+        let (archive, observer, _directory) = server_with_observer();
+        let private_id = insert_document(&observer, "note", "private", "");
         let private_error = archive
-            .read_document(Parameters(ReadArgs { id: private.id }))
+            .read_document(Parameters(ReadArgs { id: private_id }))
             .err()
             .expect("private document must not be readable");
         let missing_error = archive
             .read_document(Parameters(ReadArgs {
-                id: private.id + 1000,
+                id: private_id + 1000,
             }))
             .err()
             .expect("missing document must not be readable");

@@ -32,51 +32,16 @@ pub struct Document {
     pub revision: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct SyncSnapshot {
-    pub document: Option<Document>,
-    pub user_count: usize,
-    pub agent_present: bool,
-}
-
-pub type DocumentSummary = Document;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ReferenceSummary {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReferenceSummary {
     pub id: i64,
-    pub kind: String,
-    pub day: String,
     pub label: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct AttachmentSummary {
-    pub artifact_id: i64,
-    pub title: String,
-    pub day: String,
-    pub status: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub reviewed_at: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DailyNeighbor {
-    pub id: i64,
-    pub day: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DailyNeighbors {
-    pub previous: Option<DailyNeighbor>,
-    pub next: Option<DailyNeighbor>,
 }
 
 #[derive(Debug)]
 pub enum Error {
     InvalidDay,
     InvalidId,
-    InvalidVisibility,
     InvalidTitle,
     InvalidStatus,
     BodyTooLarge,
@@ -86,9 +51,6 @@ pub enum Error {
     InvalidSessionId,
     InvalidMermaid(String),
     MissingDocument(i64),
-    CannotDeleteDaily,
-    WriteConflict,
-    ReadOnlyDocument,
     UnsupportedSchema(i64),
     Lock,
     Io(std::io::Error),
@@ -100,7 +62,6 @@ impl fmt::Display for Error {
         match self {
             Self::InvalidDay => write!(formatter, "day must be a valid YYYY-MM-DD local date"),
             Self::InvalidId => write!(formatter, "document id must be positive"),
-            Self::InvalidVisibility => write!(formatter, "visibility must be shared or private"),
             Self::InvalidTitle => write!(
                 formatter,
                 "title must be a non-empty single line of at most {MAX_TITLE_BYTES} bytes"
@@ -127,12 +88,6 @@ impl fmt::Display for Error {
             ),
             Self::InvalidMermaid(message) => message.fmt(formatter),
             Self::MissingDocument(id) => write!(formatter, "document {id} does not exist"),
-            Self::CannotDeleteDaily => write!(formatter, "daily documents cannot be deleted"),
-            Self::WriteConflict => write!(
-                formatter,
-                "document changed outside this editor; reload before saving"
-            ),
-            Self::ReadOnlyDocument => write!(formatter, "document is read-only"),
             Self::UnsupportedSchema(version) => write!(
                 formatter,
                 "database schema version {version} is not supported"
@@ -183,80 +138,6 @@ impl Database {
         self.connection.lock().map_err(|_| Error::Lock)
     }
 
-    pub fn get_or_create_daily(&self, day: &str) -> Result<Document, Error> {
-        validate_day(day)?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body)
-             VALUES ('daily', 'shared', 'user', ?1, ?2, ?2, '')
-             ON CONFLICT(day) WHERE kind = 'daily' DO NOTHING",
-            params![day, now()],
-        )?;
-        let document = get_daily(&transaction, day)?.ok_or(Error::MissingDocument(0))?;
-        transaction.commit()?;
-        Ok(document)
-    }
-
-    pub fn create_note(&self, day: &str, visibility: &str) -> Result<Document, Error> {
-        validate_day(day)?;
-        validate_visibility(visibility)?;
-        let connection = self.connection()?;
-        let timestamp = now();
-        connection.execute("INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body) VALUES ('note', ?1, 'user', ?2, ?3, ?3, '')", params![visibility, day, timestamp])?;
-        let id = connection.last_insert_rowid();
-        get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))
-    }
-
-    pub fn create_project(&self, day: &str, visibility: &str) -> Result<Document, Error> {
-        validate_day(day)?;
-        validate_visibility(visibility)?;
-        let connection = self.connection()?;
-        let timestamp = now();
-        connection.execute("INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body) VALUES ('project', ?1, 'user', ?2, ?3, ?3, '')", params![visibility, day, timestamp])?;
-        let id = connection.last_insert_rowid();
-        get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))
-    }
-
-    pub fn add_document_to_project(
-        &self,
-        project_id: i64,
-        document_id: i64,
-        added_by: &str,
-    ) -> Result<(), Error> {
-        validate_id(project_id)?;
-        validate_id(document_id)?;
-        if !matches!(added_by, "user" | "agent") {
-            return Err(Error::InvalidSessionId);
-        }
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let project = get_document_from(&transaction, project_id)?
-            .ok_or(Error::MissingDocument(project_id))?;
-        if project.kind != "project" {
-            return Err(Error::MissingDocument(project_id));
-        }
-        let document = get_document_from(&transaction, document_id)?
-            .ok_or(Error::MissingDocument(document_id))?;
-        if document.kind == "project" {
-            return Err(Error::MissingDocument(document_id));
-        }
-        transaction.execute("INSERT INTO project_documents(project_document_id, document_id, added_by, created_at) VALUES(?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING", params![project_id, document_id, added_by, now()])?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn list_project_documents(&self, project_id: i64) -> Result<Vec<Document>, Error> {
-        validate_id(project_id)?;
-        let connection = self.connection()?;
-        let project = get_document_from(&connection, project_id)?
-            .ok_or(Error::MissingDocument(project_id))?;
-        if project.kind != "project" {
-            return Err(Error::MissingDocument(project_id));
-        }
-        project_documents(&connection, project_id, false, 50)
-    }
-
     pub fn mcp_project_context(
         &self,
         project_id: i64,
@@ -273,102 +154,22 @@ impl Database {
             return Err(Error::MissingDocument(project_id));
         }
         let project = sanitize_mcp_document(&connection, project)?;
-        let documents = project_documents(&connection, project_id, true, limit)?;
+        let documents = project_documents(&connection, project_id, limit)?;
         Ok((project, sanitize_mcp_documents(&connection, documents)?))
     }
 
-    pub fn get_document(&self, id: i64) -> Result<Document, Error> {
-        validate_id(id)?;
-        let connection = self.connection()?;
-        get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))
-    }
-
-    #[cfg(test)]
-    fn update_document_body(&self, id: i64, body: &str) -> Result<Document, Error> {
-        validate_id(id)?;
-        let connection = self.connection()?;
-        if connection.execute(
-            "UPDATE documents SET body = ?1, updated_at = ?2, revision = revision + 1 WHERE id = ?3",
-            params![body, now(), id],
-        )? == 0
-        {
-            return Err(Error::MissingDocument(id));
-        }
-        get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))
-    }
-
-    pub fn replace_document_body(
-        &self,
-        id: i64,
-        expected_revision: i64,
-        body: &str,
-    ) -> Result<Document, Error> {
-        validate_id(id)?;
-        let connection = self.connection()?;
-        let stored = get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))?;
-        if stored.author != "user" || !matches!(stored.kind.as_str(), "daily" | "note" | "project")
-        {
-            return Err(Error::ReadOnlyDocument);
-        }
-        let updated = connection
-            .query_row(
-                "UPDATE documents SET body = ?1, updated_at = ?2, revision = revision + 1
-                 WHERE id = ?3 AND revision = ?4
-                 RETURNING id, kind, visibility, author, day, created_at, updated_at, body, revision",
-                params![body, now(), id, expected_revision],
-                document_from_row,
-            )
-            .optional()?;
-        if let Some(document) = updated {
-            return Ok(document);
-        }
-        if get_document_from(&connection, id)?.is_some() {
-            Err(Error::WriteConflict)
-        } else {
-            Err(Error::MissingDocument(id))
-        }
-    }
-
-    pub fn sync_document(&self, id: i64, known_revision: i64) -> Result<SyncSnapshot, Error> {
-        validate_id(id)?;
-        let connection = self.connection()?;
-        let document = get_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))?;
-        let (user_count, agent_present) = presence_snapshot(&connection, id)?;
-        let document = (document.revision > known_revision).then_some(document);
-        Ok(SyncSnapshot {
-            document,
-            user_count,
-            agent_present,
-        })
-    }
-
-    pub fn set_presence(
-        &self,
-        session_id: &str,
-        actor: &str,
-        document_id: i64,
-    ) -> Result<(), Error> {
+    pub fn set_agent_presence(&self, session_id: &str, document_id: i64) -> Result<(), Error> {
         validate_session_id(session_id)?;
         validate_id(document_id)?;
-        if !matches!(actor, "user" | "agent") {
-            return Err(Error::InvalidSessionId);
-        }
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if actor == "agent" && get_shared_document_from(&transaction, document_id)?.is_none() {
-            return Err(Error::MissingDocument(document_id));
-        }
-        if actor == "user" && get_document_from(&transaction, document_id)?.is_none() {
+        if get_shared_document_from(&transaction, document_id)?.is_none() {
             return Err(Error::MissingDocument(document_id));
         }
         delete_stale_presence(&transaction)?;
-        transaction.execute("INSERT INTO presence(session_id, actor, document_id, last_heartbeat) VALUES(?1, ?2, ?3, unixepoch()) ON CONFLICT(session_id) DO UPDATE SET actor=excluded.actor, document_id=excluded.document_id, last_heartbeat=excluded.last_heartbeat", params![session_id, actor, document_id])?;
+        transaction.execute("INSERT INTO presence(session_id, actor, document_id, last_heartbeat) VALUES(?1, 'agent', ?2, unixepoch()) ON CONFLICT(session_id) DO UPDATE SET actor=excluded.actor, document_id=excluded.document_id, last_heartbeat=excluded.last_heartbeat", params![session_id, document_id])?;
         transaction.commit()?;
         Ok(())
-    }
-
-    pub fn set_agent_presence(&self, session_id: &str, document_id: i64) -> Result<(), Error> {
-        self.set_presence(session_id, "agent", document_id)
     }
 
     pub fn remove_presence(&self, session_id: &str) -> Result<(), Error> {
@@ -376,71 +177,6 @@ impl Database {
         self.connection()?
             .execute("DELETE FROM presence WHERE session_id=?1", [session_id])?;
         Ok(())
-    }
-
-    pub fn delete_note(&self, id: i64) -> Result<(), Error> {
-        validate_id(id)?;
-        let connection = self.connection()?;
-        let kind: Option<String> = connection
-            .query_row("SELECT kind FROM documents WHERE id = ?1", [id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        match kind.as_deref() {
-            None => Err(Error::MissingDocument(id)),
-            Some("daily") => Err(Error::CannotDeleteDaily),
-            Some("note" | "artifact" | "project") => {
-                connection.execute("DELETE FROM documents WHERE id = ?1", [id])?;
-                Ok(())
-            }
-            Some(_) => Err(Error::MissingDocument(id)),
-        }
-    }
-
-    pub fn search_documents(
-        &self,
-        active_day: &str,
-        query: &str,
-    ) -> Result<Vec<DocumentSummary>, Error> {
-        validate_day(active_day)?;
-        validate_query(query)?;
-        let pattern = format!("%{}%", escape_like(query));
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents
-             WHERE body LIKE ?2 ESCAPE '\\' OR day LIKE ?2 ESCAPE '\\'
-             ORDER BY (day = ?1) DESC, abs(julianday(day) - julianday(?1)) ASC,
-                      CASE kind WHEN 'daily' THEN 0 ELSE 1 END ASC, day DESC, created_at DESC, id DESC LIMIT ?3")?;
-        Ok(statement
-            .query_map(
-                params![active_day, pattern, SEARCH_RESULT_LIMIT],
-                document_from_row,
-            )?
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn resolve_references(&self, ids: &[i64]) -> Result<Vec<ReferenceSummary>, Error> {
-        let distinct_ids = distinct_valid_ids(ids)?;
-        if distinct_ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders = std::iter::repeat_n("?", distinct_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!("SELECT id, kind, day, body FROM documents WHERE id IN ({placeholders})");
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(&sql)?;
-        let rows =
-            statement.query_map(params_from_iter(distinct_ids.iter()), reference_from_row)?;
-        let mut summaries = rows
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .map(|summary| (summary.id, summary))
-            .collect::<HashMap<_, _>>();
-        Ok(distinct_ids
-            .into_iter()
-            .filter_map(|id| summaries.remove(&id))
-            .collect())
     }
 
     pub fn mcp_read_document(&self, id: i64) -> Result<Document, Error> {
@@ -485,111 +221,6 @@ impl Database {
             }
         }
         Ok(matches)
-    }
-
-    pub fn list_daily_attachments(&self, day: &str) -> Result<Vec<AttachmentSummary>, Error> {
-        validate_day(day)?;
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT a.id, a.body, parent.day, da.status, a.created_at, a.updated_at, da.reviewed_at
-             FROM document_attachments da
-             JOIN documents parent ON parent.id = da.parent_document_id
-             JOIN documents a ON a.id = da.attached_document_id
-             WHERE parent.kind = 'daily' AND parent.day = ?1
-               AND a.kind = 'artifact' AND a.author = 'agent'
-             ORDER BY a.created_at DESC, a.id DESC",
-        )?;
-        let rows = statement.query_map([day], |row| {
-            let body: String = row.get(1)?;
-            Ok(AttachmentSummary {
-                artifact_id: row.get(0)?,
-                title: note_label(&body),
-                day: row.get(2)?,
-                status: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
-                reviewed_at: row.get(6)?,
-            })
-        })?;
-        Ok(rows.collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn list_unreviewed_attachments(&self) -> Result<Vec<AttachmentSummary>, Error> {
-        let connection = self.connection()?;
-        let mut statement = connection.prepare(
-            "SELECT a.id, a.body, parent.day, da.status, a.created_at, a.updated_at, da.reviewed_at
-             FROM document_attachments da
-             JOIN documents parent ON parent.id = da.parent_document_id
-             JOIN documents a ON a.id = da.attached_document_id
-             WHERE parent.kind = 'daily' AND a.kind = 'artifact' AND a.author = 'agent'
-               AND da.reviewed_at IS NULL
-             ORDER BY parent.day DESC, a.created_at DESC, a.id DESC LIMIT 50",
-        )?;
-        Ok(statement
-            .query_map([], attachment_summary_from_row)?
-            .collect::<Result<Vec<_>, _>>()?)
-    }
-
-    pub fn get_attachment_by_artifact_id(
-        &self,
-        artifact_id: i64,
-    ) -> Result<Option<AttachmentSummary>, Error> {
-        validate_id(artifact_id)?;
-        let connection = self.connection()?;
-        connection
-            .query_row(
-                "SELECT a.id, a.body, parent.day, da.status, a.created_at, a.updated_at, da.reviewed_at
-                 FROM document_attachments da
-                 JOIN documents parent ON parent.id = da.parent_document_id
-                 JOIN documents a ON a.id = da.attached_document_id
-                 WHERE parent.kind = 'daily' AND a.kind = 'artifact' AND a.author = 'agent'
-                   AND a.id = ?1",
-                [artifact_id],
-                attachment_summary_from_row,
-            )
-            .optional()
-            .map_err(Error::from)
-    }
-
-    pub fn mark_attachment_reviewed(&self, artifact_id: i64) -> Result<AttachmentSummary, Error> {
-        validate_id(artifact_id)?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = transaction.execute(
-            "UPDATE document_attachments SET reviewed_at = COALESCE(reviewed_at, ?1)
-             WHERE attached_document_id = ?2 AND EXISTS (
-               SELECT 1 FROM documents a, documents parent
-               WHERE a.id = attached_document_id AND parent.id = parent_document_id
-                 AND a.kind = 'artifact' AND a.author = 'agent' AND parent.kind = 'daily')",
-            params![now(), artifact_id],
-        )?;
-        if changed == 0 {
-            return Err(Error::MissingDocument(artifact_id));
-        }
-        let summary = transaction.query_row(
-            "SELECT a.id, a.body, parent.day, da.status, a.created_at, a.updated_at, da.reviewed_at
-             FROM document_attachments da
-             JOIN documents parent ON parent.id = da.parent_document_id
-             JOIN documents a ON a.id = da.attached_document_id
-             WHERE parent.kind = 'daily' AND a.kind = 'artifact' AND a.author = 'agent'
-               AND a.id = ?1",
-            [artifact_id],
-            attachment_summary_from_row,
-        )?;
-        transaction.commit()?;
-        Ok(summary)
-    }
-
-    pub fn daily_neighbors(&self, day: &str) -> Result<DailyNeighbors, Error> {
-        validate_day(day)?;
-        let connection = self.connection()?;
-        let previous = connection.query_row(
-            "SELECT id, day FROM documents WHERE kind='daily' AND day < ?1 ORDER BY day DESC, id DESC LIMIT 1",
-            [day], |row| Ok(DailyNeighbor { id: row.get(0)?, day: row.get(1)? })).optional()?;
-        let next = connection.query_row(
-            "SELECT id, day FROM documents WHERE kind='daily' AND day > ?1 ORDER BY day ASC, id ASC LIMIT 1",
-            [day], |row| Ok(DailyNeighbor { id: row.get(0)?, day: row.get(1)? })).optional()?;
-        Ok(DailyNeighbors { previous, next })
     }
 
     pub fn mcp_create_artifact(
@@ -886,13 +517,6 @@ fn validate_id(id: i64) -> Result<(), Error> {
         Ok(())
     }
 }
-fn validate_visibility(value: &str) -> Result<(), Error> {
-    if matches!(value, "shared" | "private") {
-        Ok(())
-    } else {
-        Err(Error::InvalidVisibility)
-    }
-}
 fn validate_session_id(value: &str) -> Result<(), Error> {
     if value.is_empty() || value.len() > MAX_SESSION_ID_BYTES {
         Err(Error::InvalidSessionId)
@@ -941,12 +565,6 @@ fn distinct_valid_ids(ids: &[i64]) -> Result<Vec<i64>, Error> {
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
-fn escape_like(query: &str) -> String {
-    query
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
 fn escape_reference_label(label: &str) -> String {
     label
         .replace('\\', "\\\\")
@@ -976,18 +594,6 @@ fn note_label(body: &str) -> String {
         label.to_owned()
     }
 }
-fn attachment_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentSummary> {
-    let body: String = row.get(1)?;
-    Ok(AttachmentSummary {
-        artifact_id: row.get(0)?,
-        title: note_label(&body),
-        day: row.get(2)?,
-        status: row.get(3)?,
-        created_at: row.get(4)?,
-        updated_at: row.get(5)?,
-        reviewed_at: row.get(6)?,
-    })
-}
 fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
     Ok(Document {
         id: row.get(0)?,
@@ -1008,14 +614,6 @@ fn delete_stale_presence(connection: &Connection) -> Result<(), Error> {
     )?;
     Ok(())
 }
-fn presence_snapshot(connection: &Connection, id: i64) -> Result<(usize, bool), Error> {
-    let (users, agents): (i64, i64) = connection.query_row(
-        "SELECT count(*) FILTER (WHERE actor='user'), count(*) FILTER (WHERE actor='agent') FROM presence WHERE document_id=?1 AND last_heartbeat >= unixepoch() - ?2",
-        params![id, PRESENCE_TTL_SECONDS],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    )?;
-    Ok((users as usize, agents > 0))
-}
 fn reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceSummary> {
     let id = row.get(0)?;
     let kind: String = row.get(1)?;
@@ -1026,12 +624,7 @@ fn reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceSumm
     } else {
         note_label(&body)
     };
-    Ok(ReferenceSummary {
-        id,
-        kind,
-        day,
-        label,
-    })
+    Ok(ReferenceSummary { id, label })
 }
 fn get_document_from(connection: &Connection, id: i64) -> Result<Option<Document>, Error> {
     Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents WHERE id = ?1", [id], document_from_row).optional()?)
@@ -1045,16 +638,14 @@ fn get_daily(connection: &Connection, day: &str) -> Result<Option<Document>, Err
 fn project_documents(
     connection: &Connection,
     project_id: i64,
-    shared_only: bool,
     limit: usize,
 ) -> Result<Vec<Document>, Error> {
-    let sql = format!(
+    let mut statement = connection.prepare(
         "SELECT d.id, d.kind, d.visibility, d.author, d.day, d.created_at, d.updated_at, d.body, d.revision
          FROM project_documents pd JOIN documents d ON d.id = pd.document_id
-         WHERE pd.project_document_id = ?1 {} ORDER BY d.updated_at DESC, d.id DESC LIMIT ?2",
-        if shared_only { "AND d.visibility = 'shared'" } else { "" }
-    );
-    let mut statement = connection.prepare(&sql)?;
+         WHERE pd.project_document_id = ?1 AND d.visibility = 'shared'
+         ORDER BY d.updated_at DESC, d.id DESC LIMIT ?2",
+    )?;
     Ok(statement
         .query_map(params![project_id, limit], document_from_row)?
         .collect::<Result<Vec<_>, _>>()?)
@@ -1236,8 +827,48 @@ fn sanitize_document_with_ids(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     fn database() -> Database {
         Database::from_connection(Connection::open_in_memory().unwrap()).unwrap()
+    }
+
+    fn insert_document(
+        database: &Database,
+        kind: &str,
+        visibility: &str,
+        author: &str,
+        day: &str,
+        body: &str,
+    ) -> Document {
+        let connection = database.connection.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body)
+             VALUES(?1,?2,?3,?4,'a','a',?5)",
+                params![kind, visibility, author, day, body],
+            )
+            .unwrap();
+        let id = connection.last_insert_rowid();
+        get_document_from(&connection, id).unwrap().unwrap()
+    }
+
+    fn document(database: &Database, id: i64) -> Document {
+        get_document_from(&database.connection.lock().unwrap(), id)
+            .unwrap()
+            .unwrap()
+    }
+
+    fn add_to_project(database: &Database, project_id: i64, document_id: i64) {
+        database
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO project_documents(project_document_id,document_id,added_by,created_at)
+             VALUES(?1,?2,'user','a')",
+                [project_id, document_id],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1302,12 +933,18 @@ mod tests {
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, 7);
-        assert_eq!(database.get_document(1).unwrap().body, "user body");
-        assert!(
+        assert_eq!(document(&database, 1).body, "user body");
+        assert_eq!(
             database
-                .list_daily_attachments("2026-08-04")
+                .connection
+                .lock()
                 .unwrap()
-                .is_empty()
+                .query_row("SELECT count(*) FROM document_attachments", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
         );
     }
 
@@ -1337,9 +974,9 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&path).unwrap();
-        assert_eq!(database.get_document(3).unwrap().body, "daily");
-        assert_eq!(database.get_document(7).unwrap().revision, 2);
-        assert_eq!(database.get_document(11).unwrap().author, "agent");
+        assert_eq!(document(&database, 3).body, "daily");
+        assert_eq!(document(&database, 7).revision, 2);
+        assert_eq!(document(&database, 11).author, "agent");
         let connection = database.connection.lock().unwrap();
         assert_eq!(
             connection
@@ -1371,13 +1008,17 @@ mod tests {
             0
         );
         drop(connection);
-        let project = database.create_project("2026-08-04", "shared").unwrap();
+        let project = insert_document(&database, "project", "shared", "user", "2026-08-04", "");
         assert!(project.id > 50);
         drop(database);
         let reopened = Database::open(&path).unwrap();
-        assert_eq!(reopened.get_document(project.id).unwrap(), project);
+        assert_eq!(document(&reopened, project.id), project);
         assert_eq!(
-            reopened.list_daily_attachments("2026-08-04").unwrap()[0].artifact_id,
+            reopened.connection.lock().unwrap().query_row(
+                "SELECT attached_document_id FROM document_attachments WHERE parent_document_id=3",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).unwrap(),
             11
         );
     }
@@ -1393,7 +1034,7 @@ mod tests {
         connection.execute("INSERT INTO entries VALUES(21,'2026-08-04','2026-08-04T09:00:00Z','2026-08-04T09:00:00Z',?1)",[&large]).unwrap();
         drop(connection);
         let database = Database::open(&path).unwrap();
-        let first = database.get_document(3).unwrap();
+        let first = document(&database, 3);
         assert_eq!(first.body, "first\n\n\nsecond");
         assert_eq!(first.created_at, "2026-08-02T08:00:00Z");
         assert_eq!(first.updated_at, "2026-08-06T00:00:00Z");
@@ -1401,12 +1042,9 @@ mod tests {
             (&first.visibility, &first.author),
             (&"shared".to_owned(), &"user".to_owned())
         );
-        assert_eq!(database.get_document(20).unwrap().body.len(), 1_200_002);
+        assert_eq!(document(&database, 20).body.len(), 1_200_002);
         drop(database);
-        assert_eq!(
-            Database::open(&path).unwrap().get_document(3).unwrap(),
-            first
-        );
+        assert_eq!(document(&Database::open(&path).unwrap(), 3), first);
     }
 
     #[test]
@@ -1423,7 +1061,7 @@ mod tests {
             tx.commit().unwrap();
         }
         let database = Database::from_connection(connection).unwrap();
-        let row = database.get_document(7).unwrap();
+        let row = document(&database, 7);
         assert_eq!(
             (&row.visibility, &row.author),
             (&"shared".to_owned(), &"user".to_owned())
@@ -1440,100 +1078,38 @@ mod tests {
             tx.commit().unwrap();
         }
         let database = Database::from_connection(connection).unwrap();
-        assert_eq!(database.get_document(1).unwrap().revision, 1);
-    }
-
-    #[test]
-    fn daily_is_unique_and_notes_are_standalone() {
-        let d = database();
-        let daily = d.get_or_create_daily("2024-02-29").unwrap();
-        assert_eq!(d.get_or_create_daily("2024-02-29").unwrap(), daily);
-        let note = d.create_note("2024-02-29", "shared").unwrap();
-        assert_ne!(daily.id, note.id);
-    }
-
-    #[test]
-    fn projects_have_concrete_many_to_many_membership_and_reject_nesting() {
-        let d = database();
-        let first = d.create_project("2026-08-04", "shared").unwrap();
-        let second = d.create_project("2026-08-04", "shared").unwrap();
-        let note = d.create_note("2026-08-04", "shared").unwrap();
-        d.add_document_to_project(first.id, note.id, "user")
-            .unwrap();
-        d.add_document_to_project(first.id, note.id, "user")
-            .unwrap();
-        d.add_document_to_project(second.id, note.id, "agent")
-            .unwrap();
-        assert_eq!(
-            d.list_project_documents(first.id).unwrap(),
-            vec![note.clone()]
-        );
-        assert_eq!(d.list_project_documents(second.id).unwrap(), vec![note]);
-        assert!(matches!(
-            d.add_document_to_project(first.id, second.id, "user"),
-            Err(Error::MissingDocument(_))
-        ));
-        assert!(
-            d.add_document_to_project(first.id, first.id, "user")
-                .is_err()
-        );
-        assert!(d.add_document_to_project(first.id, 9999, "user").is_err());
-        assert!(d.add_document_to_project(first.id, 1, "other").is_err());
-    }
-
-    #[test]
-    fn project_members_are_ordered_bounded_and_survive_project_deletion() {
-        let d = database();
-        let project = d.create_project("2026-08-04", "shared").unwrap();
-        let mut ids = Vec::new();
-        for index in 0..55 {
-            let note = d.create_note("2026-08-04", "shared").unwrap();
-            d.update_document_body(note.id, &format!("note {index}"))
-                .unwrap();
-            d.add_document_to_project(project.id, note.id, "user")
-                .unwrap();
-            ids.push(note.id);
-        }
-        let rows = d.list_project_documents(project.id).unwrap();
-        assert_eq!(rows.len(), 50);
-        assert_eq!(rows[0].id, *ids.last().unwrap());
-        assert_eq!(rows[49].id, ids[5]);
-        let retained = ids[10];
-        d.delete_note(project.id).unwrap();
-        assert_eq!(d.get_document(retained).unwrap().id, retained);
-        let memberships: i64 = d
-            .connection
-            .lock()
-            .unwrap()
-            .query_row("SELECT count(*) FROM project_documents", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(memberships, 0);
+        assert_eq!(document(&database, 1).revision, 1);
     }
 
     #[test]
     fn mcp_project_context_is_private_safe_sanitized_and_bounded() {
         let d = database();
-        let project = d.create_project("2026-08-04", "shared").unwrap();
-        let shared = d.create_note("2026-08-04", "shared").unwrap();
-        let private = d.create_note("2026-08-04", "private").unwrap();
-        d.update_document_body(private.id, "# Secret member")
-            .unwrap();
-        d.update_document_body(
-            shared.id,
+        let private = insert_document(
+            &d,
+            "note",
+            "private",
+            "user",
+            "2026-08-04",
+            "# Secret member",
+        );
+        let shared = insert_document(
+            &d,
+            "note",
+            "shared",
+            "user",
+            "2026-08-04",
             &format!("# Shared\n[[note:{}|Secret label]]", private.id),
-        )
-        .unwrap();
-        d.update_document_body(
-            project.id,
+        );
+        let project = insert_document(
+            &d,
+            "project",
+            "shared",
+            "user",
+            "2026-08-04",
             &format!("# Project\n[[note:{}|Private project label]]", private.id),
-        )
-        .unwrap();
-        d.add_document_to_project(project.id, shared.id, "user")
-            .unwrap();
-        d.add_document_to_project(project.id, private.id, "user")
-            .unwrap();
+        );
+        add_to_project(&d, project.id, shared.id);
+        add_to_project(&d, project.id, private.id);
         let (visible_project, members) = d.mcp_project_context(project.id, 1).unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].id, shared.id);
@@ -1553,7 +1129,7 @@ mod tests {
             d.mcp_project_context(project.id, 51),
             Err(Error::InvalidLimit)
         ));
-        let private_project = d.create_project("2026-08-04", "private").unwrap();
+        let private_project = insert_document(&d, "project", "private", "user", "2026-08-04", "");
         assert!(matches!(
             d.mcp_project_context(private_project.id, 20),
             Err(Error::MissingDocument(_))
@@ -1567,8 +1143,8 @@ mod tests {
     #[test]
     fn invalid_mcp_project_associations_roll_back_every_related_row() {
         let d = database();
-        let private = d.create_project("2026-08-04", "private").unwrap();
-        let note = d.create_note("2026-08-04", "shared").unwrap();
+        let private = insert_document(&d, "project", "private", "user", "2026-08-04", "");
+        let note = insert_document(&d, "note", "shared", "user", "2026-08-04", "");
         for project_id in [Some(private.id), Some(note.id), Some(9999)] {
             assert!(matches!(
                 d.mcp_create_artifact("Rejected", "body", &[], project_id),
@@ -1609,95 +1185,16 @@ mod tests {
     }
 
     #[test]
-    fn crud_validation_and_autoincrement() {
-        let d = database();
-        assert!(matches!(
-            d.create_note("2024-02-30", "shared"),
-            Err(Error::InvalidDay)
-        ));
-        assert!(matches!(
-            d.create_note("2024-02-29", "no"),
-            Err(Error::InvalidVisibility)
-        ));
-        assert!(matches!(d.get_document(0), Err(Error::InvalidId)));
-        let daily = d.get_or_create_daily("2026-08-03").unwrap();
-        let note = d.create_note("2026-08-03", "shared").unwrap();
-        let updated = d.update_document_body(note.id, "body").unwrap();
-        assert_eq!(d.get_document(note.id).unwrap(), updated);
-        assert!(matches!(
-            d.delete_note(daily.id),
-            Err(Error::CannotDeleteDaily)
-        ));
-        d.delete_note(note.id).unwrap();
-        assert!(d.create_note("2026-08-03", "shared").unwrap().id > note.id);
-    }
-
-    #[test]
-    fn gui_search_is_literal_bounded_and_ordered_by_proximity() {
-        let d = database();
-        let mut active = 0;
-        for day in ["2026-08-01", "2026-08-03", "2026-08-02", "2026-08-05"] {
-            let x = d.get_or_create_daily(day).unwrap();
-            if day == "2026-08-03" {
-                active = x.id;
-            }
-            d.update_document_body(x.id, "needle").unwrap();
-        }
-        let note = d.create_note("2026-08-03", "private").unwrap();
-        d.update_document_body(note.id, "needle 100%_literal")
-            .unwrap();
-        assert_eq!(d.search_documents("2026-08-03", "%_").unwrap().len(), 1);
-        let rows = d.search_documents("2026-08-03", "needle").unwrap();
-        assert_eq!((rows[0].id, rows[1].id), (active, note.id));
-        assert_eq!(
-            rows.into_iter().map(|x| x.day).collect::<Vec<_>>(),
-            [
-                "2026-08-03",
-                "2026-08-03",
-                "2026-08-02",
-                "2026-08-05",
-                "2026-08-01"
-            ]
-        );
-        assert!(matches!(
-            d.search_documents("2026-08-03", &"x".repeat(257)),
-            Err(Error::SearchQueryTooLarge)
-        ));
-        for _ in 0..60 {
-            d.create_note("2026-08-03", "shared").unwrap();
-        }
-        assert_eq!(d.search_documents("2026-08-03", "").unwrap().len(), 50);
-    }
-
-    #[test]
-    fn resolves_distinct_references_in_input_order() {
-        let d = database();
-        let daily = d.get_or_create_daily("2026-08-03").unwrap();
-        let note = d.create_note("2026-08-02", "private").unwrap();
-        d.update_document_body(note.id, "\n ## Current title \nbody")
-            .unwrap();
-        let rows = d
-            .resolve_references(&[note.id, i64::MAX, daily.id, note.id])
-            .unwrap();
-        assert_eq!(
-            rows.iter().map(|r| r.id).collect::<Vec<_>>(),
-            [note.id, daily.id]
-        );
-        assert_eq!(rows[0].label, "Current title");
-        assert!(d.resolve_references(&[]).unwrap().is_empty());
-        assert!(matches!(d.resolve_references(&[0]), Err(Error::InvalidId)));
-        assert!(matches!(
-            d.resolve_references(&vec![1; 201]),
-            Err(Error::TooManyReferenceIds)
-        ));
-    }
-
-    #[test]
     fn mcp_private_and_missing_are_indistinguishable() {
         let d = database();
-        let private = d.create_note("2026-08-04", "private").unwrap();
-        d.update_document_body(private.id, "SECRET TITLE body [[note:998|meta]]")
-            .unwrap();
+        let private = insert_document(
+            &d,
+            "note",
+            "private",
+            "user",
+            "2026-08-04",
+            "SECRET TITLE body [[note:998|meta]]",
+        );
         let missing = private.id + 1000;
         assert_eq!(
             d.mcp_read_document(private.id).unwrap_err().to_string(),
@@ -1717,22 +1214,34 @@ mod tests {
     #[test]
     fn mcp_sanitizes_private_and_missing_references_before_read_and_search() {
         let d = database();
-        let shared_target = d.create_note("2026-08-04", "shared").unwrap();
-        d.update_document_body(shared_target.id, "# Visible target")
-            .unwrap();
-        let private_target = d.create_note("2026-08-04", "private").unwrap();
-        d.update_document_body(private_target.id, "# Authoritative private title")
-            .unwrap();
-        let source = d.create_note("2026-08-04", "shared").unwrap();
+        let shared_target = insert_document(
+            &d,
+            "note",
+            "shared",
+            "user",
+            "2026-08-04",
+            "# Visible target",
+        );
+        let private_target = insert_document(
+            &d,
+            "note",
+            "private",
+            "user",
+            "2026-08-04",
+            "# Authoritative private title",
+        );
         let missing_id = private_target.id + 10_000;
         let shared_reference = format!("[[note:{}|Visible \\| label]]", shared_target.id);
         let private_reference = format!("[[note:{}|Private stored label]]", private_target.id);
         let missing_reference = format!("[[note:{missing_id}|Missing stored label]]");
-        d.update_document_body(
-            source.id,
+        let source = insert_document(
+            &d,
+            "note",
+            "shared",
+            "user",
+            "2026-08-04",
             &format!("# Source\n{shared_reference}\n{private_reference}\n{missing_reference}"),
-        )
-        .unwrap();
+        );
 
         let visible = d.mcp_read_document(source.id).unwrap().body;
         assert!(visible.contains(&shared_reference));
@@ -1767,8 +1276,7 @@ mod tests {
     #[test]
     fn artifact_dedupes_and_escapes_references_atomically() {
         let d = database();
-        let note = d.create_note("2026-08-04", "shared").unwrap();
-        d.update_document_body(note.id, "# a|b]\\c").unwrap();
+        let note = insert_document(&d, "note", "shared", "user", "2026-08-04", "# a|b]\\c");
         let artifact = d
             .mcp_create_artifact("Title", "Body", &[note.id, note.id], None)
             .unwrap();
@@ -1783,11 +1291,8 @@ mod tests {
     }
 
     #[test]
-    fn mcp_body_limits_do_not_change_gui() {
+    fn mcp_body_limits_are_enforced() {
         let d = database();
-        let note = d.create_note("2026-08-04", "shared").unwrap();
-        d.update_document_body(note.id, &"x".repeat(MAX_BODY_BYTES + 1))
-            .unwrap();
         assert!(matches!(
             d.mcp_create_daily_attachment(
                 "2026-08-04",
@@ -1807,8 +1312,7 @@ mod tests {
     #[test]
     fn daily_attachment_leaves_daily_body_untouched() {
         let d = database();
-        let daily = d.get_or_create_daily("2026-08-04").unwrap();
-        d.update_document_body(daily.id, "user thoughts").unwrap();
+        let daily = insert_document(&d, "daily", "shared", "user", "2026-08-04", "user thoughts");
         let first = d
             .mcp_create_daily_attachment("2026-08-04", "Run A", "details a", Some("blocked"), None)
             .unwrap();
@@ -1819,15 +1323,28 @@ mod tests {
         assert_eq!(first.kind, "artifact");
         assert_eq!(first.author, "agent");
         assert_eq!(first.body, "# Run A\n\ndetails a");
-        assert_eq!(d.get_document(daily.id).unwrap().body, "user thoughts");
-        assert_eq!(d.get_document(daily.id).unwrap().revision, 2);
-        let attachments = d.list_daily_attachments("2026-08-04").unwrap();
-        assert_eq!(attachments.len(), 2);
-        assert_eq!(attachments[0].artifact_id, second.id);
-        assert_eq!(attachments[0].title, "Run B");
-        assert_eq!(attachments[0].status, "failed");
-        assert_eq!(attachments[1].artifact_id, first.id);
-        assert_eq!(attachments[1].status, "blocked");
+        assert_eq!(document(&d, daily.id).body, "user thoughts");
+        assert_eq!(document(&d, daily.id).revision, 1);
+        let connection = d.connection.lock().unwrap();
+        let mut statement = connection
+            .prepare(
+                "SELECT attached_document_id,status FROM document_attachments
+             WHERE parent_document_id=?1 ORDER BY attached_document_id",
+            )
+            .unwrap();
+        let attachments = statement
+            .query_map([daily.id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            attachments,
+            vec![(first.id, "blocked".into()), (second.id, "failed".into())]
+        );
+        drop(statement);
+        drop(connection);
         assert!(matches!(
             d.mcp_create_daily_attachment("2026-08-04", "Bad", "x", Some("running"), None),
             Err(Error::InvalidStatus)
@@ -1856,165 +1373,69 @@ mod tests {
         ).unwrap();
         drop(connection);
         let database = Database::open(&path).unwrap();
-        let row = database
-            .list_daily_attachments("2026-08-01")
-            .unwrap()
-            .remove(0);
         assert_eq!(
-            (row.artifact_id, row.status, row.reviewed_at),
+            database
+                .connection
+                .lock()
+                .unwrap()
+                .query_row(
+                    "SELECT attached_document_id,status,reviewed_at FROM document_attachments",
+                    [],
+                    |row| Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?
+                    )),
+                )
+                .unwrap(),
             (8, "blocked".to_owned(), None)
         );
         drop(database);
         let reopened = Database::open(&path).unwrap();
         assert_eq!(
-            reopened.list_unreviewed_attachments().unwrap()[0].artifact_id,
+            reopened.connection.lock().unwrap().query_row(
+                "SELECT attached_document_id FROM document_attachments WHERE reviewed_at IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            ).unwrap(),
             8
         );
     }
 
     #[test]
-    fn review_queue_is_cross_day_bounded_and_review_is_exact() {
-        let d = database();
-        let mut newest = 0;
-        for index in 0..55 {
-            let day = format!("2026-07-{:02}", index % 28 + 1);
-            newest = d
-                .mcp_create_daily_attachment(
-                    &day,
-                    &format!("Work {index}"),
-                    "body",
-                    Some("failed"),
-                    None,
-                )
-                .unwrap()
-                .id;
-        }
-        let standalone = d
-            .mcp_create_artifact("Standalone", "body", &[], None)
-            .unwrap();
-        assert!(
-            d.get_attachment_by_artifact_id(standalone.id)
-                .unwrap()
-                .is_none()
-        );
-        let queue = d.list_unreviewed_attachments().unwrap();
-        assert_eq!(queue.len(), 50);
-        assert!(queue.windows(2).all(|pair| pair[0].day >= pair[1].day));
-        let before = d.get_document(newest).unwrap();
-        let first = d.mark_attachment_reviewed(newest).unwrap();
-        let second = d.mark_attachment_reviewed(newest).unwrap();
-        assert_eq!(first.reviewed_at, second.reviewed_at);
-        assert_eq!(first.status, "failed");
-        assert_eq!(d.get_document(newest).unwrap(), before);
-        assert!(matches!(
-            d.mark_attachment_reviewed(0),
-            Err(Error::InvalidId)
-        ));
-        assert!(d.mark_attachment_reviewed(standalone.id).is_err());
-    }
-
-    #[test]
-    fn gui_writes_allow_user_documents_and_preserve_agent_artifacts() {
-        let d = database();
-        let daily = d.get_or_create_daily("2026-08-01").unwrap();
-        let note = d.create_note("2026-08-01", "shared").unwrap();
-        let project = d.create_project("2026-08-01", "shared").unwrap();
-        for document in [daily, note, project] {
-            assert_eq!(
-                d.replace_document_body(document.id, 1, "changed")
-                    .unwrap()
-                    .body,
-                "changed"
-            );
-        }
-        let artifact = d
-            .mcp_create_artifact("Immutable", "body", &[], None)
-            .unwrap();
-        let before = artifact.clone();
-        assert!(matches!(
-            d.replace_document_body(artifact.id, artifact.revision, "changed"),
-            Err(Error::ReadOnlyDocument)
-        ));
-        assert_eq!(d.get_document(artifact.id).unwrap(), before);
-    }
-
-    #[test]
-    fn daily_neighbors_cross_gaps_without_creating_rows() {
-        let d = database();
-        let first = d.get_or_create_daily("2026-08-01").unwrap();
-        let last = d.get_or_create_daily("2026-08-09").unwrap();
-        let count = || {
-            d.connection
-                .lock()
-                .unwrap()
-                .query_row("SELECT count(*) FROM documents", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap()
-        };
-        let before = count();
-        let middle = d.daily_neighbors("2026-08-05").unwrap();
-        assert_eq!(middle.previous.unwrap().id, first.id);
-        assert_eq!(middle.next.unwrap().id, last.id);
-        assert!(d.daily_neighbors("2026-08-01").unwrap().previous.is_none());
-        assert!(d.daily_neighbors("2026-08-09").unwrap().next.is_none());
-        assert!(matches!(
-            d.daily_neighbors("2026-02-30"),
-            Err(Error::InvalidDay)
-        ));
-        assert_eq!(count(), before);
-    }
-
-    #[test]
-    fn revisions_poll_cross_connections_and_presence_are_exact() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("archive.sqlite3");
-        let gui = Database::open(&path).unwrap();
-        let other = Database::open(&path).unwrap();
-        let initial = gui.get_or_create_daily("2026-08-04").unwrap();
-        assert_eq!(initial.revision, 1);
-        assert!(gui.sync_document(initial.id, 1).unwrap().document.is_none());
-        let changed = other
-            .replace_document_body(initial.id, 1, "changed")
-            .unwrap();
-        assert_eq!(changed.revision, 2);
-        assert_eq!(
-            gui.sync_document(initial.id, 1)
-                .unwrap()
-                .document
-                .unwrap()
-                .body,
-            "changed"
-        );
-        assert!(matches!(
-            gui.replace_document_body(initial.id, 1, "stale"),
-            Err(Error::WriteConflict)
-        ));
-
-        gui.set_presence("user-one", "user", initial.id).unwrap();
-        gui.set_agent_presence("agent-one", initial.id).unwrap();
-        let snapshot = gui.sync_document(initial.id, 2).unwrap();
-        assert_eq!((snapshot.user_count, snapshot.agent_present), (1, true));
-        assert_eq!(gui.get_document(initial.id).unwrap().revision, 2);
-        let note = gui.create_note("2026-08-04", "shared").unwrap();
-        gui.set_presence("user-one", "user", note.id).unwrap();
-        assert_eq!(gui.sync_document(initial.id, 2).unwrap().user_count, 0);
-        gui.remove_presence("agent-one").unwrap();
-        assert!(!gui.sync_document(initial.id, 2).unwrap().agent_present);
-    }
-
-    #[test]
     fn stale_presence_expires_and_agents_cannot_claim_private_documents() {
         let d = database();
-        let shared = d.create_note("2026-08-04", "shared").unwrap();
-        let private = d.create_note("2026-08-04", "private").unwrap();
-        d.set_presence("stale", "user", shared.id).unwrap();
+        let shared = insert_document(&d, "note", "shared", "user", "2026-08-04", "");
+        let private = insert_document(&d, "note", "private", "user", "2026-08-04", "");
+        d.set_agent_presence("stale", shared.id).unwrap();
         d.connection
             .lock()
             .unwrap()
             .execute("UPDATE presence SET last_heartbeat=unixepoch()-11", [])
             .unwrap();
-        assert_eq!(d.sync_document(shared.id, 1).unwrap().user_count, 0);
+        d.set_agent_presence("current", shared.id).unwrap();
+        let connection = d.connection.lock().unwrap();
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM presence WHERE session_id='stale'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT document_id FROM presence WHERE session_id='current'",
+                    [],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            shared.id
+        );
+        drop(connection);
         assert!(matches!(
             d.set_agent_presence("agent", private.id),
             Err(Error::MissingDocument(_))
@@ -2023,8 +1444,16 @@ mod tests {
             d.set_agent_presence("agent", private.id + 1000),
             Err(Error::MissingDocument(_))
         ));
-        d.set_presence("private-user", "user", private.id).unwrap();
-        assert_eq!(d.sync_document(private.id, 1).unwrap().user_count, 1);
+        d.remove_presence("current").unwrap();
+        assert_eq!(
+            d.connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM presence", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2037,14 +1466,23 @@ mod tests {
         assert!(create_error.to_string().contains("Mermaid block 1"));
         assert!(d.mcp_search_documents("Rejected", 50).unwrap().is_empty());
 
-        let daily = d.get_or_create_daily("2026-08-04").unwrap();
-        d.update_document_body(daily.id, "before").unwrap();
+        let daily = insert_document(&d, "daily", "shared", "user", "2026-08-04", "before");
         let attach_error = d
             .mcp_create_daily_attachment("2026-08-04", "Rejected", invalid, None, None)
             .unwrap_err();
         assert!(attach_error.to_string().contains("Mermaid block 1"));
-        assert_eq!(d.get_document(daily.id).unwrap().body, "before");
-        assert!(d.list_daily_attachments("2026-08-04").unwrap().is_empty());
+        assert_eq!(document(&d, daily.id).body, "before");
+        assert_eq!(
+            d.connection
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM document_attachments", [], |row| row
+                    .get::<_, i64>(
+                    0
+                ))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -2057,33 +1495,18 @@ mod tests {
             artifact.body
         );
 
-        let daily = d.get_or_create_daily("2026-08-04").unwrap();
-        d.update_document_body(daily.id, "```mermaid\ninvalid")
-            .unwrap();
+        let daily = insert_document(
+            &d,
+            "daily",
+            "shared",
+            "user",
+            "2026-08-04",
+            "```mermaid\ninvalid",
+        );
         assert!(
             d.mcp_create_daily_attachment("2026-08-04", "Plain", "plain addition", None, None)
                 .is_ok()
         );
-        assert_eq!(
-            d.get_document(daily.id).unwrap().body,
-            "```mermaid\ninvalid"
-        );
-    }
-
-    #[test]
-    fn gui_replace_is_unaffected_by_mcp_daily_attachment() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("archive.sqlite3");
-        let gui = Database::open(&path).unwrap();
-        let mcp = Database::open(&path).unwrap();
-        let daily = gui.get_or_create_daily("2026-08-04").unwrap();
-        gui.update_document_body(daily.id, "user text").unwrap();
-        mcp.mcp_create_daily_attachment("2026-08-04", "Agent run", "agent append", None, None)
-            .unwrap();
-
-        let updated = gui.replace_document_body(daily.id, 2, "user edit").unwrap();
-        assert_eq!(updated.body, "user edit");
-        assert_eq!(gui.get_document(daily.id).unwrap().body, "user edit");
-        assert_eq!(gui.list_daily_attachments("2026-08-04").unwrap().len(), 1);
+        assert_eq!(document(&d, daily.id).body, "```mermaid\ninvalid");
     }
 }

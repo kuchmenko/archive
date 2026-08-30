@@ -1,28 +1,18 @@
 [package]
 name = "archive"
 version = "0.1.0"
-description = "A focused daily notes editor"
+description = "A local knowledge archive with an MCP stdio server"
 edition = "2024"
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
-merman = { version = "=0.8.0-alpha.3", features = ["render"] }
 merman-analysis = "=0.8.0-alpha.3"
-pulldown-cmark = { version = "=0.13.4", default-features = false, features = ["html"] }
+pulldown-cmark = { version = "=0.13.4", default-features = false }
 rmcp = { version = "3.1.0", features = ["transport-io"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
-tauri = { version = "2", features = [] }
-tauri-plugin-clipboard-manager = "2.3.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-
-[features]
-default = ["custom-protocol"]
-custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
 rmcp = { version = "3.1.0", features = ["client", "transport-io"] }
