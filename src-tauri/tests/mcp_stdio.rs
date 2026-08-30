@@ -21,8 +21,36 @@ fn response(reader: &mut impl BufRead, id: i64) -> Value {
     }
 }
 
+fn context(key: &str) -> Value {
+    json!({
+        "idempotency_key": key,
+        "actor": "stdio-agent",
+        "thread": "stdio-thread",
+        "client": "archive-integration"
+    })
+}
+
+fn call(
+    stdin: &mut impl Write,
+    reader: &mut impl BufRead,
+    id: i64,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    send(
+        stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments}
+        }),
+    );
+    response(reader, id)
+}
+
 #[test]
-fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
+fn mcp_stdio_built_binary_runs_representative_record_flow_with_clean_framing() {
     let state = tempfile::tempdir().unwrap();
     let database_path = state
         .path()
@@ -62,166 +90,235 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
     );
     let tools = response(&mut stdout, 2);
-    assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 6);
+    let tools = tools["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 17);
+    assert!(tools.iter().all(|tool| {
+        tool.get("inputSchema").is_some() && tool["outputSchema"]["type"] == "object"
+    }));
+    assert!(!tools.iter().any(|tool| tool["name"] == "search_documents"));
+
+    let work = call(
+        &mut stdin,
+        &mut stdout,
+        3,
+        "create_scope",
+        json!({"name": "work", "context": context("stdio-scope")}),
+    );
+    let work_id = work["result"]["structuredContent"]["id"].as_i64().unwrap();
+    let label = call(
+        &mut stdin,
+        &mut stdout,
+        4,
+        "create_label",
+        json!({
+            "facet": "topic",
+            "key": "rust",
+            "display_name": "Rust",
+            "aliases": ["rust-lang"],
+            "context": context("stdio-label")
+        }),
+    );
+    let label_id = label["result"]["structuredContent"]["id"].as_i64().unwrap();
+    let created = call(
+        &mut stdin,
+        &mut stdout,
+        5,
+        "create_record",
+        json!({
+            "record": {
+                "scope_id": work_id,
+                "title": "Stdio record",
+                "payload": {"kind": "note", "body": "initial local knowledge"},
+                "sources": [],
+                "label_ids": [1]
+            },
+            "context": context("stdio-create")
+        }),
+    );
+    let record_id = created["result"]["structuredContent"]["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        created["result"]["structuredContent"]["current"]["payload"]["kind"],
+        "note"
+    );
+    let duplicate = call(
+        &mut stdin,
+        &mut stdout,
+        6,
+        "create_record",
+        json!({
+            "record": {
+                "scope_id": work_id,
+                "title": "Stdio record",
+                "payload": {"kind": "note", "body": "initial local knowledge"},
+                "sources": [],
+                "label_ids": [1]
+            },
+            "context": context("stdio-create")
+        }),
+    );
+    assert_eq!(duplicate["result"]["structuredContent"]["id"], record_id);
+    let revised = call(
+        &mut stdin,
+        &mut stdout,
+        7,
+        "revise_record",
+        json!({
+            "record_id": record_id,
+            "expected_revision": 1,
+            "title": "Stdio record corrected",
+            "payload": {"kind": "note", "body": "corrected local knowledge"},
+            "sources": [],
+            "reason": "correct wording",
+            "context": context("stdio-revise")
+        }),
+    );
+    assert_eq!(
+        revised["result"]["structuredContent"]["current_revision"],
+        2
+    );
+    let labeled = call(
+        &mut stdin,
+        &mut stdout,
+        8,
+        "add_label",
+        json!({
+            "record_id": record_id,
+            "label_id": label_id,
+            "reason": "organized by topic",
+            "context": context("stdio-add-label")
+        }),
+    );
+    assert_eq!(
+        labeled["result"]["structuredContent"]["labels"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let organized = call(
+        &mut stdin,
+        &mut stdout,
+        9,
+        "retract_label",
+        json!({
+            "record_id": record_id,
+            "label_id": 1,
+            "reason": "left inbox",
+            "context": context("stdio-retract-label")
+        }),
+    );
+    assert_eq!(
+        organized["result"]["structuredContent"]["labels"][0]["canonical"],
+        "topic:rust"
+    );
+    let global = call(
+        &mut stdin,
+        &mut stdout,
+        10,
+        "create_record",
+        json!({
+            "record": {
+                "scope_id": 1,
+                "title": "Global reference",
+                "payload": {"kind": "idea", "proposal": "reuse locally"},
+                "sources": [],
+                "label_ids": [1]
+            },
+            "context": context("stdio-global")
+        }),
+    );
+    let global_id = global["result"]["structuredContent"]["id"]
+        .as_i64()
+        .unwrap();
+    let relation = call(
+        &mut stdin,
+        &mut stdout,
+        11,
+        "add_relation",
+        json!({
+            "source_record_id": record_id,
+            "target_record_id": global_id,
+            "kind": "references",
+            "reason": "explicit cross-scope reference",
+            "context": context("stdio-relation")
+        }),
+    );
+    assert_eq!(
+        relation["result"]["structuredContent"]["kind"],
+        "references"
+    );
+    let searched = call(
+        &mut stdin,
+        &mut stdout,
+        12,
+        "search_records",
+        json!({
+            "scope_id": work_id,
+            "query": "corrected knowledge",
+            "label_ids": [label_id],
+            "include_history": true
+        }),
+    );
+    let hit = &searched["result"]["structuredContent"]["records"][0];
+    assert_eq!(hit["record"]["id"], record_id);
+    assert_eq!(hit["record"]["history"].as_array().unwrap().len(), 2);
     assert!(
-        tools["result"]["tools"]
+        hit["match_explanation"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|tool| {
-                tool.get("inputSchema").is_some() && tool["outputSchema"]["type"] == "object"
-            })
+            .any(|value| value == "fts:title_or_payload")
     );
+    let read = call(
+        &mut stdin,
+        &mut stdout,
+        13,
+        "read_record",
+        json!({"record_id": record_id, "include_history": true}),
+    );
+    assert_eq!(
+        read["result"]["structuredContent"]["relations"][0]["target_record_id"],
+        global_id
+    );
+    let mermaid = call(
+        &mut stdin,
+        &mut stdout,
+        14,
+        "validate_mermaid",
+        json!({"source": "flowchart TD\nA-->B"}),
+    );
+    assert_eq!(mermaid["result"]["structuredContent"]["valid"], true);
 
     let observer = Connection::open(&database_path).unwrap();
     observer.busy_timeout(Duration::from_secs(5)).unwrap();
-    observer.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('project','shared','user','2026-08-04','a','a','# Stdio project')", []).unwrap();
-    let project_id = observer.last_insert_rowid();
-    observer.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('note','private','user','2026-08-04','a','a','# Private member')", []).unwrap();
-    let private_id = observer.last_insert_rowid();
-    observer
-        .execute(
-            "INSERT INTO project_documents VALUES(?1,?2,'user','a')",
-            [project_id, private_id],
-        )
-        .unwrap();
-
-    for (id, source, valid) in [
-        (3, "flowchart TD\nA-->", false),
-        (4, "sequenceDiagram\nAlice->>Bob: Hi", true),
-    ] {
-        send(
-            &mut stdin,
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "tools/call",
-                "params": {"name": "validate_mermaid", "arguments": {"source": source}}
-            }),
-        );
-        let result = response(&mut stdout, id);
-        assert_eq!(result["result"]["structuredContent"]["valid"], valid);
-        assert!(result.get("error").is_none());
-    }
-
-    send(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
-            "params": {
-                "name": "create_artifact",
-                "arguments": {
-                    "title": "Validated diagram",
-                    "body": "```mermaid\nflowchart TD\nA-->B\n```",
-                    "project_id": project_id
-                }
-            }
-        }),
-    );
-    let artifact = response(&mut stdout, 5);
-    let document = &artifact["result"]["structuredContent"];
-    assert!(document["body"].as_str().unwrap().contains("```mermaid"));
-    let id = document["id"].as_i64().unwrap();
-    send(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 6,
-            "method": "tools/call",
-            "params": {"name": "read_document", "arguments": {"id": id}}
-        }),
+    assert_eq!(
+        observer
+            .query_row(
+                "SELECT current_revision FROM records WHERE id=?1",
+                [record_id],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        2
     );
     assert_eq!(
-        response(&mut stdout, 6)["result"]["structuredContent"]["body"],
-        document["body"]
+        observer
+            .query_row("SELECT count(*) FROM label_retractions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
     );
-
-    send(
-        &mut stdin,
-        json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"get_project_context","arguments":{"project_id":project_id}}}),
-    );
-    let context = response(&mut stdout, 10);
     assert_eq!(
-        context["result"]["structuredContent"]["project"]["id"],
-        project_id
+        observer
+            .query_row("SELECT count(*) FROM record_relations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        1
     );
-    let members = context["result"]["structuredContent"]["documents"]
-        .as_array()
-        .unwrap();
-    assert_eq!(members.len(), 1);
-    assert_eq!(members[0]["id"], id);
-    let persisted: i64 = observer.query_row("SELECT count(*) FROM project_documents WHERE project_document_id=?1 AND document_id=?2 AND added_by='agent'", [project_id, id], |row| row.get(0)).unwrap();
-    assert_eq!(persisted, 1);
-
-    for (request_id, title, body, status) in [
-        (7, "First run", "first attachment", "blocked"),
-        (8, "Second run", "second attachment", "failed"),
-    ] {
-        send(
-            &mut stdin,
-            json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "method": "tools/call",
-                "params": {
-                    "name": "create_daily_attachment",
-                    "arguments": {
-                        "day": "2026-08-04",
-                        "title": title,
-                        "body": body,
-                        "status": status
-                    }
-                }
-            }),
-        );
-        let attached = response(&mut stdout, request_id);
-        let content = &attached["result"]["structuredContent"];
-        assert_eq!(content["kind"], "artifact");
-        assert_eq!(content["author"], "agent");
-        assert_eq!(
-            content["body"].as_str().unwrap(),
-            format!("# {title}\n\n{body}")
-        );
-    }
-    let (daily_revision, daily_body): (i64, String) = observer
-        .query_row(
-            "SELECT revision, body FROM documents WHERE kind='daily' AND day='2026-08-04'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    assert_eq!((daily_revision, daily_body.as_str()), (1, ""));
-    let attachment_count: i64 = observer
-        .query_row(
-            "SELECT count(*) FROM document_attachments da
-             JOIN documents parent ON parent.id = da.parent_document_id
-             WHERE parent.kind='daily' AND parent.day='2026-08-04'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(attachment_count, 2);
-
-    send(
-        &mut stdin,
-        json!({
-            "jsonrpc": "2.0",
-            "id": 9,
-            "method": "tools/call",
-            "params": {
-                "name": "search_documents",
-                "arguments": {"query": "Validated diagram", "limit": 1}
-            }
-        }),
-    );
-    let search = response(&mut stdout, 9);
-    assert_eq!(
-        search["result"]["structuredContent"]["documents"][0]["id"],
-        id
-    );
-    assert!(search.get("error").is_none());
 
     drop(stdin);
     let mut remaining_stdout = String::new();

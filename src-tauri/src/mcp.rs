@@ -8,8 +8,12 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::database::{Database, Document, Error};
+use crate::database::{Database, Error};
 use crate::merman::{self, MermaidResult};
+use crate::model::{
+    DirectRelationKind, Label, Lifecycle, LifecycleTarget, Record, RecordInput, RecordKind,
+    RecordPayload, Relation, Scope, SearchPage, SourceInput, WriteContext,
+};
 
 #[derive(Clone)]
 pub struct ArchiveMcp {
@@ -17,118 +21,157 @@ pub struct ArchiveMcp {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SearchArgs {
+#[serde(deny_unknown_fields)]
+struct CreateScopeArgs {
+    name: String,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CreateLabelArgs {
+    facet: String,
+    key: String,
+    display_name: String,
+    aliases: Vec<String>,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SearchLabelsArgs {
     query: String,
+    facet: Option<String>,
     limit: Option<usize>,
 }
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ReadArgs {
-    id: i64,
+#[serde(deny_unknown_fields)]
+struct CreateRecordArgs {
+    record: RecordInput,
+    context: WriteContext,
 }
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct CreateArtifactArgs {
-    title: String,
-    body: String,
-    related_document_ids: Option<Vec<i64>>,
-    project_id: Option<i64>,
-}
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct CreateDailyAttachmentArgs {
-    day: String,
-    title: String,
-    body: String,
-    /// One of: completed, blocked, failed. Defaults to completed.
-    status: Option<String>,
-    project_id: Option<i64>,
-}
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ProjectContextArgs {
-    project_id: i64,
+#[serde(deny_unknown_fields)]
+struct SearchRecordsArgs {
+    query: Option<String>,
+    scope_id: i64,
+    include_global: Option<bool>,
+    kinds: Option<Vec<RecordKind>>,
+    lifecycles: Option<Vec<Lifecycle>>,
+    label_ids: Option<Vec<i64>>,
+    include_history: Option<bool>,
+    before_id: Option<i64>,
     limit: Option<usize>,
 }
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReadRecordArgs {
+    record_id: i64,
+    include_history: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReviseRecordArgs {
+    record_id: i64,
+    expected_revision: i64,
+    title: String,
+    payload: RecordPayload,
+    sources: Vec<SourceInput>,
+    reason: String,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct LabelMutationArgs {
+    record_id: i64,
+    label_id: i64,
+    reason: String,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddRelationArgs {
+    source_record_id: i64,
+    target_record_id: i64,
+    kind: DirectRelationKind,
+    reason: String,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RetractRelationArgs {
+    relation_id: i64,
+    reason: String,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ListRelationsArgs {
+    record_id: i64,
+    include_retracted: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TransitionRecordArgs {
+    record_id: i64,
+    to: LifecycleTarget,
+    reason: String,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SupersedeRecordArgs {
+    record_id: i64,
+    replacement: RecordInput,
+    reason: String,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MergeRecordsArgs {
+    record_ids: Vec<i64>,
+    aggregate: RecordInput,
+    reason: String,
+    context: WriteContext,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct ValidateMermaidArgs {
     source: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-struct DocumentSummary {
-    id: i64,
-    kind: String,
-    author: String,
-    day: String,
-    label: String,
-    updated_at: String,
+struct ScopesResult {
+    scopes: Vec<Scope>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-struct SearchDocumentsResult {
-    documents: Vec<DocumentSummary>,
-}
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-struct ProjectContextResult {
-    project: SharedDocument,
-    documents: Vec<DocumentSummary>,
+struct LabelsResult {
+    labels: Vec<Label>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
-struct SharedDocument {
-    id: i64,
-    kind: String,
-    author: String,
-    day: String,
-    created_at: String,
-    updated_at: String,
-    body: String,
+struct RelationsResult {
+    relations: Vec<Relation>,
 }
 
 fn tool_error(error: Error) -> String {
-    if matches!(error, Error::MissingDocument(_)) {
-        "document not found".to_owned()
-    } else {
-        error.to_string()
-    }
-}
-
-fn label(document: &Document) -> String {
-    if document.kind == "daily" {
-        return document.day.clone();
-    }
-    let line = document
-        .body
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or("")
-        .trim();
-    let hashes = line.bytes().take_while(|byte| *byte == b'#').count();
-    let value = if (1..=6).contains(&hashes)
-        && line[hashes..]
-            .chars()
-            .next()
-            .is_none_or(char::is_whitespace)
-    {
-        line[hashes..].trim()
-    } else {
-        line
-    };
-    if value.is_empty() {
-        "Untitled note".to_owned()
-    } else {
-        value.to_owned()
-    }
-}
-
-impl From<Document> for SharedDocument {
-    fn from(document: Document) -> Self {
-        Self {
-            id: document.id,
-            kind: document.kind,
-            author: document.author,
-            day: document.day,
-            created_at: document.created_at,
-            updated_at: document.updated_at,
-            body: document.body,
-        }
+    match error {
+        Error::MissingRecord(_) => "record not found".to_owned(),
+        Error::MissingRelation(_) => "relation not found".to_owned(),
+        error => error.to_string(),
     }
 }
 
@@ -140,103 +183,224 @@ impl ArchiveMcp {
         }
     }
 
-    #[tool(description = "Search shared Archive documents and return deterministic summaries")]
-    fn search_documents(
+    #[tool(description = "Create or return one named Archive scope")]
+    fn create_scope(
         &self,
-        Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<Json<SearchDocumentsResult>, String> {
+        Parameters(args): Parameters<CreateScopeArgs>,
+    ) -> Result<Json<Scope>, String> {
         self.database
-            .mcp_search_documents(&args.query, args.limit.unwrap_or(20))
-            .map(|documents| {
-                Json(SearchDocumentsResult {
-                    documents: documents
-                        .into_iter()
-                        .map(|document| DocumentSummary {
-                            label: label(&document),
-                            id: document.id,
-                            kind: document.kind.clone(),
-                            author: document.author,
-                            day: document.day,
-                            updated_at: document.updated_at,
-                        })
-                        .collect(),
-                })
-            })
+            .create_scope(&args.name, &args.context)
+            .map(Json)
             .map_err(tool_error)
     }
 
-    #[tool(description = "Read one shared Archive document by its positive ID")]
-    fn read_document(
-        &self,
-        Parameters(args): Parameters<ReadArgs>,
-    ) -> Result<Json<SharedDocument>, String> {
+    #[tool(description = "List Archive scopes in deterministic name order")]
+    fn list_scopes(&self) -> Result<Json<ScopesResult>, String> {
         self.database
-            .mcp_read_document(args.id)
+            .list_scopes()
+            .map(|scopes| Json(ScopesResult { scopes }))
             .map_err(tool_error)
-            .map(|document| Json(document.into()))
+    }
+
+    #[tool(description = "Explicitly create or return a controlled faceted label")]
+    fn create_label(
+        &self,
+        Parameters(args): Parameters<CreateLabelArgs>,
+    ) -> Result<Json<Label>, String> {
+        self.database
+            .create_label(
+                &args.facet,
+                &args.key,
+                &args.display_name,
+                &args.aliases,
+                &args.context,
+            )
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Search active labels by canonical key, display name, or alias")]
+    fn search_labels(
+        &self,
+        Parameters(args): Parameters<SearchLabelsArgs>,
+    ) -> Result<Json<LabelsResult>, String> {
+        self.database
+            .search_labels(&args.query, args.facet.as_deref(), args.limit.unwrap_or(20))
+            .map(|labels| Json(LabelsResult { labels }))
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Create one validated typed Archive record transactionally")]
+    fn create_record(
+        &self,
+        Parameters(args): Parameters<CreateRecordArgs>,
+    ) -> Result<Json<Record>, String> {
+        self.database
+            .create_record(&args.record, &args.context)
+            .map(Json)
+            .map_err(tool_error)
     }
 
     #[tool(
-        description = "Create a shared agent-authored artifact with optional links to shared documents"
+        description = "Search current readable record revisions with deterministic filters and pagination"
     )]
-    fn create_artifact(
+    fn search_records(
         &self,
-        Parameters(args): Parameters<CreateArtifactArgs>,
-    ) -> Result<Json<SharedDocument>, String> {
+        Parameters(args): Parameters<SearchRecordsArgs>,
+    ) -> Result<Json<SearchPage>, String> {
         self.database
-            .mcp_create_artifact(
-                &args.title,
-                &args.body,
-                args.related_document_ids.as_deref().unwrap_or(&[]),
-                args.project_id,
+            .search_records(
+                args.query.as_deref(),
+                args.scope_id,
+                args.include_global.unwrap_or(false),
+                args.kinds.as_deref().unwrap_or(&[]),
+                args.lifecycles.as_deref().unwrap_or(&[]),
+                args.label_ids.as_deref().unwrap_or(&[]),
+                args.include_history.unwrap_or(false),
+                args.before_id,
+                args.limit.unwrap_or(20),
             )
+            .map(Json)
             .map_err(tool_error)
-            .map(|document| Json(document.into()))
     }
 
     #[tool(
-        description = "Create an agent-authored artifact attached to the daily note for an explicit YYYY-MM-DD day without mutating the daily body"
+        description = "Read one record by exact ID, optionally including immutable revision history"
     )]
-    fn create_daily_attachment(
+    fn read_record(
         &self,
-        Parameters(args): Parameters<CreateDailyAttachmentArgs>,
-    ) -> Result<Json<SharedDocument>, String> {
+        Parameters(args): Parameters<ReadRecordArgs>,
+    ) -> Result<Json<Record>, String> {
         self.database
-            .mcp_create_daily_attachment(
-                &args.day,
-                &args.title,
-                &args.body,
-                args.status.as_deref(),
-                args.project_id,
-            )
+            .read_record(args.record_id, args.include_history.unwrap_or(false))
+            .map(Json)
             .map_err(tool_error)
-            .map(|document| Json(document.into()))
     }
 
-    #[tool(description = "Read bounded shared context for one shared Archive project")]
-    fn get_project_context(
+    #[tool(description = "Create an immutable correction revision with optimistic concurrency")]
+    fn revise_record(
         &self,
-        Parameters(args): Parameters<ProjectContextArgs>,
-    ) -> Result<Json<ProjectContextResult>, String> {
+        Parameters(args): Parameters<ReviseRecordArgs>,
+    ) -> Result<Json<Record>, String> {
         self.database
-            .mcp_project_context(args.project_id, args.limit.unwrap_or(20))
+            .revise_record(
+                args.record_id,
+                args.expected_revision,
+                &args.title,
+                &args.payload,
+                &args.sources,
+                &args.reason,
+                &args.context,
+            )
+            .map(Json)
             .map_err(tool_error)
-            .map(|(project, documents)| {
-                Json(ProjectContextResult {
-                    project: project.into(),
-                    documents: documents
-                        .into_iter()
-                        .map(|document| DocumentSummary {
-                            label: label(&document),
-                            id: document.id,
-                            kind: document.kind,
-                            author: document.author,
-                            day: document.day,
-                            updated_at: document.updated_at,
-                        })
-                        .collect(),
-                })
-            })
+    }
+
+    #[tool(description = "Append an active label assertion to a record")]
+    fn add_label(
+        &self,
+        Parameters(args): Parameters<LabelMutationArgs>,
+    ) -> Result<Json<Record>, String> {
+        self.database
+            .add_label(args.record_id, args.label_id, &args.reason, &args.context)
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Append a label retraction while retaining at least one active label")]
+    fn retract_label(
+        &self,
+        Parameters(args): Parameters<LabelMutationArgs>,
+    ) -> Result<Json<Record>, String> {
+        self.database
+            .retract_label(args.record_id, args.label_id, &args.reason, &args.context)
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Append one controlled cross-scope record relation")]
+    fn add_relation(
+        &self,
+        Parameters(args): Parameters<AddRelationArgs>,
+    ) -> Result<Json<Relation>, String> {
+        self.database
+            .add_relation(
+                args.source_record_id,
+                args.target_record_id,
+                &args.kind,
+                &args.reason,
+                &args.context,
+            )
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Append a retraction for one relation assertion")]
+    fn retract_relation(
+        &self,
+        Parameters(args): Parameters<RetractRelationArgs>,
+    ) -> Result<Json<Relation>, String> {
+        self.database
+            .retract_relation(args.relation_id, &args.reason, &args.context)
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "List deterministic incoming and outgoing relations for one exact record")]
+    fn list_relations(
+        &self,
+        Parameters(args): Parameters<ListRelationsArgs>,
+    ) -> Result<Json<RelationsResult>, String> {
+        self.database
+            .list_relations(args.record_id, args.include_retracted.unwrap_or(false))
+            .map(|relations| Json(RelationsResult { relations }))
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Retract an active record with lifecycle history")]
+    fn transition_record(
+        &self,
+        Parameters(args): Parameters<TransitionRecordArgs>,
+    ) -> Result<Json<Record>, String> {
+        let to = match args.to {
+            LifecycleTarget::Retracted => Lifecycle::Retracted,
+        };
+        self.database
+            .transition_record(args.record_id, &to, &args.reason, &args.context)
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Create a semantic replacement and atomically supersede the old record")]
+    fn supersede_record(
+        &self,
+        Parameters(args): Parameters<SupersedeRecordArgs>,
+    ) -> Result<Json<Record>, String> {
+        self.database
+            .supersede_record(
+                args.record_id,
+                &args.replacement,
+                &args.reason,
+                &args.context,
+            )
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Create an aggregate and atomically mark all input records merged")]
+    fn merge_records(
+        &self,
+        Parameters(args): Parameters<MergeRecordsArgs>,
+    ) -> Result<Json<Record>, String> {
+        self.database
+            .merge_records(
+                &args.record_ids,
+                &args.aggregate,
+                &args.reason,
+                &args.context,
+            )
+            .map(Json)
+            .map_err(tool_error)
     }
 
     #[tool(description = "Validate Mermaid source and return its type and structured diagnostics")]
@@ -258,229 +422,4 @@ pub async fn run(database: Database) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use rmcp::model::CallToolRequestParams;
-    use rusqlite::{Connection, params};
-
-    fn server() -> ArchiveMcp {
-        ArchiveMcp::new(Database::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap())
-    }
-
-    fn server_with_observer() -> (ArchiveMcp, Connection, tempfile::TempDir) {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("archive.sqlite3");
-        let archive = ArchiveMcp::new(Database::open(&path).unwrap());
-        let observer = Connection::open(path).unwrap();
-        (archive, observer, directory)
-    }
-
-    fn insert_document(connection: &Connection, kind: &str, visibility: &str, body: &str) -> i64 {
-        connection
-            .execute(
-                "INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body)
-             VALUES(?1,?2,'user','2026-08-04','a','a',?3)",
-                params![kind, visibility, body],
-            )
-            .unwrap();
-        connection.last_insert_rowid()
-    }
-
-    #[test]
-    fn generated_router_has_exactly_six_structured_tools() {
-        let tools = ArchiveMcp::tool_router().list_all();
-        assert_eq!(tools.len(), 6);
-        assert_eq!(
-            tools
-                .iter()
-                .map(|tool| tool.name.as_ref())
-                .collect::<std::collections::BTreeSet<_>>(),
-            [
-                "create_artifact",
-                "create_daily_attachment",
-                "get_project_context",
-                "read_document",
-                "search_documents",
-                "validate_mermaid"
-            ]
-            .into_iter()
-            .collect()
-        );
-        assert!(tools.iter().all(|tool| tool.output_schema.is_some()));
-        for name in ["create_artifact", "create_daily_attachment"] {
-            let tool = tools.iter().find(|tool| tool.name == name).unwrap();
-            assert!(tool.input_schema["properties"]["project_id"].is_object());
-        }
-        let context = tools
-            .iter()
-            .find(|tool| tool.name == "get_project_context")
-            .unwrap();
-        assert!(context.input_schema["properties"]["project_id"].is_object());
-        assert!(context.input_schema["properties"]["limit"].is_object());
-    }
-
-    #[test]
-    fn project_context_enforces_privacy_limits_and_associations() {
-        let (archive, observer, _directory) = server_with_observer();
-        let project_id = insert_document(&observer, "project", "shared", "# Project");
-        let private_id = insert_document(&observer, "note", "private", "# Private");
-        observer
-            .execute(
-                "INSERT INTO project_documents(project_document_id,document_id,added_by,created_at)
-             VALUES(?1,?2,'user','a')",
-                [project_id, private_id],
-            )
-            .unwrap();
-        let artifact = archive
-            .create_artifact(Parameters(CreateArtifactArgs {
-                title: "Project artifact".into(),
-                body: "body".into(),
-                related_document_ids: None,
-                project_id: Some(project_id),
-            }))
-            .unwrap()
-            .0;
-        let context = archive
-            .get_project_context(Parameters(ProjectContextArgs {
-                project_id,
-                limit: Some(20),
-            }))
-            .unwrap()
-            .0;
-        assert_eq!(context.project.id, project_id);
-        assert_eq!(context.documents.len(), 1);
-        assert_eq!(context.documents[0].id, artifact.id);
-        assert_eq!(
-            observer
-                .query_row(
-                    "SELECT count(*) FROM project_documents WHERE project_document_id=?1",
-                    [project_id],
-                    |row| row.get::<_, i64>(0),
-                )
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            archive
-                .get_project_context(Parameters(ProjectContextArgs {
-                    project_id,
-                    limit: Some(0)
-                }))
-                .err()
-                .unwrap(),
-            "limit must be between 1 and 50"
-        );
-        let private_project_id = insert_document(&observer, "project", "private", "");
-        assert_eq!(
-            archive
-                .get_project_context(Parameters(ProjectContextArgs {
-                    project_id: private_project_id,
-                    limit: None
-                }))
-                .err()
-                .unwrap(),
-            "document not found"
-        );
-        assert_eq!(
-            archive
-                .get_project_context(Parameters(ProjectContextArgs {
-                    project_id: 9999,
-                    limit: None
-                }))
-                .err()
-                .unwrap(),
-            "document not found"
-        );
-    }
-
-    #[test]
-    fn private_and_missing_errors_are_exactly_identical() {
-        let (archive, observer, _directory) = server_with_observer();
-        let private_id = insert_document(&observer, "note", "private", "");
-        let private_error = archive
-            .read_document(Parameters(ReadArgs { id: private_id }))
-            .err()
-            .expect("private document must not be readable");
-        let missing_error = archive
-            .read_document(Parameters(ReadArgs {
-                id: private_id + 1000,
-            }))
-            .err()
-            .expect("missing document must not be readable");
-        assert_eq!(private_error, missing_error);
-        assert_eq!(private_error, "document not found");
-    }
-
-    #[tokio::test]
-    async fn duplex_initialization_framing_dispatch_and_malformed_arguments() {
-        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
-        let task = tokio::spawn(async move {
-            server()
-                .serve(server_transport)
-                .await
-                .unwrap()
-                .waiting()
-                .await
-                .unwrap()
-        });
-        let client = ().serve(client_transport).await.unwrap();
-        let invalid = client
-            .call_tool(
-                CallToolRequestParams::new("validate_mermaid").with_arguments(
-                    serde_json::json!({"source":"flowchart TD\nA-->"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(invalid.structured_content.unwrap()["valid"], false);
-        let valid = client
-            .call_tool(
-                CallToolRequestParams::new("validate_mermaid").with_arguments(
-                    serde_json::json!({"source":"flowchart TD\nA-->B"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(valid.structured_content.unwrap()["valid"], true);
-        let result = client
-            .call_tool(
-                CallToolRequestParams::new("create_daily_attachment").with_arguments(
-                    serde_json::json!({
-                        "day":"2026-08-04",
-                        "title":"Run",
-                        "body":"hello",
-                        "status":"blocked"
-                    })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        let content = result.structured_content.unwrap();
-        assert_eq!(content["kind"], "artifact");
-        assert_eq!(content["author"], "agent");
-        assert_eq!(content["body"], "# Run\n\nhello");
-        let malformed = client
-            .call_tool(
-                CallToolRequestParams::new("read_document").with_arguments(
-                    serde_json::json!({"id":"wrong"})
-                        .as_object()
-                        .unwrap()
-                        .clone(),
-                ),
-            )
-            .await
-            .unwrap();
-        assert_eq!(malformed.is_error, Some(true));
-        client.cancel().await.unwrap();
-        task.await.unwrap();
-    }
-}
+mod tests;

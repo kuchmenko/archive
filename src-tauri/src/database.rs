@@ -1,103 +1,82 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashSet},
     fmt, fs,
     path::Path,
     sync::{Mutex, MutexGuard},
     time::Duration,
 };
 
-use chrono::{Local, NaiveDate, SecondsFormat, Utc};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
-use serde::Serialize;
+use chrono::{DateTime, SecondsFormat, Utc};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde_json::{Value, json};
 
-const SCHEMA_VERSION: i64 = 7;
+use crate::model::{
+    DirectRelationKind, Label, Lifecycle, LifecycleTransition, Provenance, Record, RecordInput,
+    RecordKind, RecordPayload, Relation, RelationKind, Retraction, Revision, Scope, SearchHit,
+    SearchPage, SnippetOrigin, SourceInput, SourceReference, WriteContext,
+};
+
+const SCHEMA_VERSION: i64 = 8;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const SEARCH_RESULT_LIMIT: usize = 50;
-const MAX_REFERENCE_IDS: usize = 200;
 pub const MAX_BODY_BYTES: usize = 1_000_000;
 pub const MAX_TITLE_BYTES: usize = 200;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct Document {
-    pub id: i64,
-    pub kind: String,
-    pub visibility: String,
-    pub author: String,
-    pub day: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub body: String,
-    pub revision: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReferenceSummary {
-    pub id: i64,
-    pub label: String,
-}
+const MAX_NAME_BYTES: usize = 200;
+const MAX_PROVENANCE_BYTES: usize = 500;
+const MAX_LABEL_IDS: usize = 100;
+const MAX_SOURCES: usize = 100;
 
 #[derive(Debug)]
 pub enum Error {
-    InvalidDay,
-    InvalidId,
-    InvalidTitle,
-    InvalidStatus,
-    BodyTooLarge,
-    TooManyReferenceIds,
-    SearchQueryTooLarge,
-    InvalidLimit,
-    InvalidMermaid(String),
-    MissingDocument(i64),
+    Invalid(String),
+    MissingRecord(i64),
+    MissingScope(i64),
+    MissingLabel(i64),
+    MissingRelation(i64),
+    Conflict(String),
     UnsupportedSchema(i64),
     Lock,
     Io(std::io::Error),
+    Json(serde_json::Error),
     Sqlite(rusqlite::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidDay => write!(formatter, "day must be a valid YYYY-MM-DD local date"),
-            Self::InvalidId => write!(formatter, "document id must be positive"),
-            Self::InvalidTitle => write!(
-                formatter,
-                "title must be a non-empty single line of at most {MAX_TITLE_BYTES} bytes"
-            ),
-            Self::InvalidStatus => {
-                write!(formatter, "status must be completed, blocked, or failed")
+            Self::Invalid(message) | Self::Conflict(message) => message.fmt(formatter),
+            Self::MissingRecord(id) => write!(formatter, "record {id} does not exist"),
+            Self::MissingScope(id) => write!(formatter, "scope {id} does not exist"),
+            Self::MissingLabel(id) => write!(formatter, "label {id} does not exist"),
+            Self::MissingRelation(id) => write!(formatter, "relation {id} does not exist"),
+            Self::UnsupportedSchema(version) => {
+                write!(
+                    formatter,
+                    "database schema version {version} is not supported"
+                )
             }
-            Self::BodyTooLarge => write!(formatter, "body exceeds {MAX_BODY_BYTES} bytes"),
-            Self::TooManyReferenceIds => write!(
-                formatter,
-                "cannot resolve more than {MAX_REFERENCE_IDS} reference IDs"
-            ),
-            Self::SearchQueryTooLarge => write!(
-                formatter,
-                "search query exceeds {MAX_SEARCH_QUERY_BYTES} bytes"
-            ),
-            Self::InvalidLimit => write!(
-                formatter,
-                "limit must be between 1 and {SEARCH_RESULT_LIMIT}"
-            ),
-            Self::InvalidMermaid(message) => message.fmt(formatter),
-            Self::MissingDocument(id) => write!(formatter, "document {id} does not exist"),
-            Self::UnsupportedSchema(version) => write!(
-                formatter,
-                "database schema version {version} is not supported"
-            ),
             Self::Lock => write!(formatter, "database lock is unavailable"),
             Self::Io(error) => error.fmt(formatter),
+            Self::Json(error) => error.fmt(formatter),
             Self::Sqlite(error) => error.fmt(formatter),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
 impl From<std::io::Error> for Error {
     fn from(error: std::io::Error) -> Self {
         Self::Io(error)
     }
 }
+
+impl From<serde_json::Error> for Error {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Json(error)
+    }
+}
+
 impl From<rusqlite::Error> for Error {
     fn from(error: rusqlite::Error) -> Self {
         Self::Sqlite(error)
@@ -131,176 +110,1771 @@ impl Database {
         self.connection.lock().map_err(|_| Error::Lock)
     }
 
-    pub fn mcp_project_context(
-        &self,
-        project_id: i64,
-        limit: usize,
-    ) -> Result<(Document, Vec<Document>), Error> {
-        validate_id(project_id)?;
-        if !(1..=50).contains(&limit) {
-            return Err(Error::InvalidLimit);
+    pub fn create_scope(&self, name: &str, context: &WriteContext) -> Result<Scope, Error> {
+        validate_context(context)?;
+        let name = validate_scope_name(name)?;
+        let request = json!({"name": name, "context": context});
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "create_scope", &request)? {
+            return scope_from(&transaction, id)?.ok_or(Error::MissingScope(id));
         }
-        let connection = self.connection()?;
-        let project = get_shared_document_from(&connection, project_id)?
-            .ok_or(Error::MissingDocument(project_id))?;
-        if project.kind != "project" {
-            return Err(Error::MissingDocument(project_id));
-        }
-        let project = sanitize_mcp_document(&connection, project)?;
-        let documents = project_documents(&connection, project_id, limit)?;
-        Ok((project, sanitize_mcp_documents(&connection, documents)?))
+        let timestamp = now();
+        transaction.execute(
+            "INSERT INTO scopes(name,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(name) DO NOTHING",
+            params![
+                name,
+                timestamp,
+                context.actor,
+                context.thread,
+                context.client,
+                context.idempotency_key
+            ],
+        )?;
+        let id: i64 = transaction.query_row(
+            "SELECT id FROM scopes WHERE name=?1 COLLATE NOCASE",
+            [name],
+            |row| row.get(0),
+        )?;
+        store_write(
+            &transaction,
+            context,
+            "create_scope",
+            &request,
+            id,
+            &timestamp,
+        )?;
+        let scope = scope_from(&transaction, id)?.ok_or(Error::MissingScope(id))?;
+        transaction.commit()?;
+        Ok(scope)
     }
 
-    pub fn mcp_read_document(&self, id: i64) -> Result<Document, Error> {
-        validate_id(id)?;
-        let connection = self.connection()?;
-        let document =
-            get_shared_document_from(&connection, id)?.ok_or(Error::MissingDocument(id))?;
-        sanitize_mcp_document(&connection, document)
-    }
-
-    pub fn mcp_search_documents(&self, query: &str, limit: usize) -> Result<Vec<Document>, Error> {
-        validate_query(query)?;
-        if !(1..=SEARCH_RESULT_LIMIT).contains(&limit) {
-            return Err(Error::InvalidLimit);
-        }
+    pub fn list_scopes(&self) -> Result<Vec<Scope>, Error> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents
-             WHERE visibility = 'shared' ORDER BY updated_at DESC, id DESC",
+            "SELECT id,name,created_at,actor,thread,client FROM scopes ORDER BY name COLLATE NOCASE,id",
         )?;
-        let documents = statement
-            .query_map([], document_from_row)?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(statement);
-        let documents = sanitize_mcp_documents(&connection, documents)?;
-        let query = query.to_lowercase();
-        let mut matches = Vec::new();
-        for document in documents {
-            let visible_label = if document.kind == "daily" {
-                document.day.clone()
-            } else {
-                note_label(&document.body)
-            };
-            if document.body.to_lowercase().contains(&query)
-                || document.day.to_lowercase().contains(&query)
-                || visible_label.to_lowercase().contains(&query)
-            {
-                matches.push(document);
-                if matches.len() == limit {
-                    break;
-                }
+        Ok(statement
+            .query_map([], scope_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn create_label(
+        &self,
+        facet: &str,
+        key: &str,
+        display_name: &str,
+        aliases: &[String],
+        context: &WriteContext,
+    ) -> Result<Label, Error> {
+        validate_context(context)?;
+        let facet = validate_label_part("facet", facet)?;
+        let key = validate_label_part("key", key)?;
+        let display_name = validate_single_line("display_name", display_name, MAX_NAME_BYTES)?;
+        let aliases = validate_aliases(aliases)?;
+        let request = json!({"facet": facet, "key": key, "display_name": display_name, "aliases": aliases, "context": context});
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "create_label", &request)? {
+            return label_from(&transaction, id)?.ok_or(Error::MissingLabel(id));
+        }
+        let timestamp = now();
+        transaction.execute(
+            "INSERT INTO labels(facet,key,display_name,active,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,?2,?3,1,?4,?5,?6,?7,?8)
+             ON CONFLICT(facet,key) DO NOTHING",
+            params![
+                facet,
+                key,
+                display_name,
+                timestamp,
+                context.actor,
+                context.thread,
+                context.client,
+                context.idempotency_key
+            ],
+        )?;
+        let id: i64 = transaction.query_row(
+            "SELECT id FROM labels WHERE facet=?1 AND key=?2",
+            params![facet, key],
+            |row| row.get(0),
+        )?;
+        for alias in aliases {
+            transaction.execute(
+                "INSERT INTO label_aliases(label_id,alias) VALUES(?1,?2)
+                 ON CONFLICT(alias) DO NOTHING",
+                params![id, alias],
+            )?;
+            let owner: i64 = transaction.query_row(
+                "SELECT label_id FROM label_aliases WHERE alias=?1 COLLATE NOCASE",
+                [&alias],
+                |row| row.get(0),
+            )?;
+            if owner != id {
+                return Err(Error::Conflict(format!(
+                    "label alias {alias} belongs to another label"
+                )));
             }
         }
-        Ok(matches)
+        store_write(
+            &transaction,
+            context,
+            "create_label",
+            &request,
+            id,
+            &timestamp,
+        )?;
+        let label = label_from(&transaction, id)?.ok_or(Error::MissingLabel(id))?;
+        transaction.commit()?;
+        Ok(label)
     }
 
-    pub fn mcp_create_artifact(
+    pub fn search_labels(
         &self,
-        title: &str,
-        body: &str,
-        related_ids: &[i64],
-        project_id: Option<i64>,
-    ) -> Result<Document, Error> {
-        validate_title(title)?;
-        validate_body_size(body)?;
-        crate::merman::validate_markdown_fences(body).map_err(Error::InvalidMermaid)?;
-        let distinct_ids = distinct_valid_ids(related_ids)?;
+        query: &str,
+        facet: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<Label>, Error> {
+        validate_query(query)?;
+        validate_limit(limit)?;
+        let facet = facet
+            .map(|value| validate_label_part("facet", value))
+            .transpose()?;
+        let pattern = format!("%{}%", query.trim().to_lowercase());
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT l.id FROM labels l
+             LEFT JOIN label_aliases a ON a.label_id=l.id
+             WHERE l.active=1 AND (?1 IS NULL OR l.facet=?1)
+             AND (?2='%%' OR lower(l.facet||':'||l.key) LIKE ?2 OR lower(l.display_name) LIKE ?2 OR lower(a.alias) LIKE ?2)
+             ORDER BY l.facet,l.key,l.id LIMIT ?3",
+        )?;
+        let ids = statement
+            .query_map(params![facet, pattern, limit], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| label_from(&connection, id)?.ok_or(Error::MissingLabel(id)))
+            .collect()
+    }
+
+    pub fn create_record(
+        &self,
+        input: &RecordInput,
+        context: &WriteContext,
+    ) -> Result<Record, Error> {
+        validate_context(context)?;
+        validate_record_input(input)?;
+        let request = json!({"record": input, "context": context});
         let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_mcp_project(&transaction, project_id)?;
-        let references = resolve_shared_references(&transaction, &distinct_ids)?;
-        if references.len() != distinct_ids.len() {
-            let found = references.iter().map(|r| r.id).collect::<HashSet<_>>();
-            let missing = distinct_ids
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "create_record", &request)? {
+            return record_from(&transaction, id, false)?.ok_or(Error::MissingRecord(id));
+        }
+        let timestamp = now();
+        let id = insert_record(&transaction, input, context, "record created", &timestamp)?;
+        store_write(
+            &transaction,
+            context,
+            "create_record",
+            &request,
+            id,
+            &timestamp,
+        )?;
+        let record = record_from(&transaction, id, false)?.ok_or(Error::MissingRecord(id))?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn read_record(&self, id: i64, include_history: bool) -> Result<Record, Error> {
+        validate_id("record_id", id)?;
+        let connection = self.connection()?;
+        record_from(&connection, id, include_history)?.ok_or(Error::MissingRecord(id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_records(
+        &self,
+        query: Option<&str>,
+        scope_id: i64,
+        include_global: bool,
+        kinds: &[RecordKind],
+        lifecycles: &[Lifecycle],
+        label_ids: &[i64],
+        include_history: bool,
+        before_id: Option<i64>,
+        limit: usize,
+    ) -> Result<SearchPage, Error> {
+        validate_id("scope_id", scope_id)?;
+        validate_limit(limit)?;
+        if let Some(query) = query {
+            validate_query(query)?;
+        }
+        let label_ids = distinct_ids("label_ids", label_ids, MAX_LABEL_IDS)?;
+        if let Some(before_id) = before_id {
+            validate_id("before_id", before_id)?;
+        }
+        let connection = self.connection()?;
+        if scope_from(&connection, scope_id)?.is_none() {
+            return Err(Error::MissingScope(scope_id));
+        }
+        for id in &label_ids {
+            if label_from(&connection, *id)?.is_none() {
+                return Err(Error::MissingLabel(*id));
+            }
+        }
+        let fts = query.and_then(fts_query);
+        let lifecycle_values = if lifecycles.is_empty() {
+            vec![Lifecycle::Active]
+        } else {
+            lifecycles.to_vec()
+        };
+        let mut sql = String::from("SELECT r.id FROM records r JOIN scopes s ON s.id=r.scope_id ");
+        if fts.is_some() {
+            sql.push_str("JOIN record_fts ON record_fts.record_id=r.id ");
+        }
+        sql.push_str("WHERE r.readable=1 AND (r.scope_id=?1 OR (?2=1 AND s.name='global')) ");
+        if fts.is_some() {
+            sql.push_str("AND record_fts MATCH ?3 ");
+        }
+        let first_dynamic = if fts.is_some() { 4 } else { 3 };
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            scope_id.into(),
+            if include_global { 1_i64 } else { 0_i64 }.into(),
+        ];
+        if let Some(fts) = &fts {
+            values.push(fts.clone().into());
+        }
+        let mut next = first_dynamic;
+        sql.push_str("AND r.lifecycle IN (");
+        push_placeholders(&mut sql, lifecycle_values.len(), &mut next);
+        sql.push_str(") ");
+        values.extend(
+            lifecycle_values
                 .iter()
-                .find(|id| !found.contains(id))
-                .copied()
-                .unwrap_or(0);
-            return Err(Error::MissingDocument(missing));
+                .map(|value| value.as_str().to_owned().into()),
+        );
+        if !kinds.is_empty() {
+            sql.push_str("AND r.kind IN (");
+            push_placeholders(&mut sql, kinds.len(), &mut next);
+            sql.push_str(") ");
+            values.extend(kinds.iter().map(|value| value.as_str().to_owned().into()));
         }
-        let by_id = references
+        for label_id in &label_ids {
+            sql.push_str(&format!(
+                "AND EXISTS(SELECT 1 FROM label_assertions la WHERE la.record_id=r.id AND la.label_id=?{next} AND NOT EXISTS(SELECT 1 FROM label_retractions lr WHERE lr.assertion_id=la.id)) "
+            ));
+            values.push((*label_id).into());
+            next += 1;
+        }
+        if let Some(before_id) = before_id {
+            sql.push_str(&format!("AND r.id<?{next} "));
+            values.push(before_id.into());
+            next += 1;
+        }
+        sql.push_str(&format!("ORDER BY r.id DESC LIMIT ?{next}"));
+        values.push(((limit + 1) as i64).into());
+        let mut statement = connection.prepare(&sql)?;
+        let mut ids = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                row.get::<_, i64>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_before_id = if ids.len() > limit {
+            ids.pop();
+            ids.last().copied()
+        } else {
+            None
+        };
+        let mut explanation = Vec::new();
+        if fts.is_some() {
+            explanation.push("fts:title_or_payload".to_owned());
+        }
+        explanation.push(if include_global {
+            "scope:exact_or_global".to_owned()
+        } else {
+            "scope:exact".to_owned()
+        });
+        if !kinds.is_empty() {
+            explanation.push("kind".to_owned());
+        }
+        explanation.push("lifecycle".to_owned());
+        if !label_ids.is_empty() {
+            explanation.push("labels:all".to_owned());
+        }
+        let records = ids
             .into_iter()
-            .map(|reference| (reference.id, reference))
-            .collect::<HashMap<_, _>>();
-        let mut markdown = format!("# {}", title.trim());
-        if !body.is_empty() {
-            markdown.push_str("\n\n");
-            markdown.push_str(body);
+            .map(|id| {
+                Ok(SearchHit {
+                    record: record_from(&connection, id, include_history)?
+                        .ok_or(Error::MissingRecord(id))?,
+                    match_explanation: explanation.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(SearchPage {
+            records,
+            next_before_id,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn revise_record(
+        &self,
+        record_id: i64,
+        expected_revision: i64,
+        title: &str,
+        payload: &RecordPayload,
+        sources: &[SourceInput],
+        reason: &str,
+        context: &WriteContext,
+    ) -> Result<Record, Error> {
+        validate_context(context)?;
+        validate_id("record_id", record_id)?;
+        validate_id("expected_revision", expected_revision)?;
+        validate_title(title)?;
+        validate_reason(reason)?;
+        validate_payload(payload, sources)?;
+        let request = json!({"record_id": record_id, "expected_revision": expected_revision, "title": title, "payload": payload, "sources": sources, "reason": reason, "context": context});
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "revise_record", &request)? {
+            return record_from(&transaction, id, false)?.ok_or(Error::MissingRecord(id));
         }
-        for id in distinct_ids {
-            let reference = by_id.get(&id).ok_or(Error::MissingDocument(id))?;
-            markdown.push_str("\n\n");
-            markdown.push_str(&format!(
-                "[[note:{}|{}]]",
-                id,
-                escape_reference_label(&reference.label)
+        let (kind, current_revision) = readable_record_state(&transaction, record_id)?;
+        if current_revision != expected_revision {
+            return Err(Error::Conflict(format!(
+                "revision conflict: expected {expected_revision}, current {current_revision}"
+            )));
+        }
+        if kind != payload.kind() {
+            return Err(Error::Invalid(
+                "record kind cannot change during revision".to_owned(),
             ));
         }
-        validate_body_size(&markdown)?;
         let timestamp = now();
-        let day = Local::now().date_naive().format("%Y-%m-%d").to_string();
-        transaction.execute("INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body) VALUES ('artifact', 'shared', 'agent', ?1, ?2, ?2, ?3)", params![day, timestamp, markdown])?;
-        let id = transaction.last_insert_rowid();
-        associate_mcp_project(&transaction, project_id, id)?;
-        let document = get_document_from(&transaction, id)?.ok_or(Error::MissingDocument(id))?;
-        let document = sanitize_mcp_document(&transaction, document)?;
+        let revision = current_revision + 1;
+        let payload_json = serde_json::to_string(payload)?;
+        transaction.execute(
+            "INSERT INTO record_revisions(record_id,revision,title,payload_json,reason,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            params![record_id,revision,title.trim(),payload_json,reason.trim(),timestamp,context.actor,context.thread,context.client,context.idempotency_key],
+        )?;
+        insert_sources(&transaction, record_id, revision, sources)?;
+        transaction.execute(
+            "UPDATE records SET title=?1,current_revision=?2,updated_at=?3 WHERE id=?4",
+            params![title.trim(), revision, timestamp, record_id],
+        )?;
+        update_fts(&transaction, record_id, title.trim(), &payload_json)?;
+        store_write(
+            &transaction,
+            context,
+            "revise_record",
+            &request,
+            record_id,
+            &timestamp,
+        )?;
+        let record =
+            record_from(&transaction, record_id, false)?.ok_or(Error::MissingRecord(record_id))?;
         transaction.commit()?;
-        Ok(document)
+        Ok(record)
     }
 
-    pub fn mcp_create_daily_attachment(
+    pub fn add_label(
         &self,
-        day: &str,
-        title: &str,
-        body: &str,
-        status: Option<&str>,
-        project_id: Option<i64>,
-    ) -> Result<Document, Error> {
-        validate_day(day)?;
-        validate_title(title)?;
-        validate_body_size(body)?;
-        let status = status.unwrap_or("completed");
-        validate_status(status)?;
-        crate::merman::validate_markdown_fences(body).map_err(Error::InvalidMermaid)?;
-        let mut markdown = format!("# {}", title.trim());
-        if !body.is_empty() {
-            markdown.push_str("\n\n");
-            markdown.push_str(body);
-        }
-        validate_body_size(&markdown)?;
+        record_id: i64,
+        label_id: i64,
+        reason: &str,
+        context: &WriteContext,
+    ) -> Result<Record, Error> {
+        validate_context(context)?;
+        validate_id("record_id", record_id)?;
+        validate_id("label_id", label_id)?;
+        validate_reason(reason)?;
+        let request = json!({"record_id": record_id, "label_id": label_id, "reason": reason, "context": context});
         let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        validate_mcp_project(&transaction, project_id)?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "add_label", &request)? {
+            return record_from(&transaction, id, false)?.ok_or(Error::MissingRecord(id));
+        }
+        readable_record_state(&transaction, record_id)?;
+        ensure_active_label(&transaction, label_id)?;
+        let active: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM label_assertions la WHERE la.record_id=?1 AND la.label_id=?2
+             AND NOT EXISTS(SELECT 1 FROM label_retractions lr WHERE lr.assertion_id=la.id))",
+            params![record_id, label_id],
+            |row| row.get(0),
+        )?;
+        if active {
+            return Err(Error::Conflict(
+                "label is already active on record".to_owned(),
+            ));
+        }
         let timestamp = now();
         transaction.execute(
-            "INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body)
-             VALUES ('daily', 'shared', 'user', ?1, ?2, ?2, '')
-             ON CONFLICT(day) WHERE kind = 'daily' DO NOTHING",
-            params![day, timestamp],
+            "INSERT INTO label_assertions(record_id,label_id,reason,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+            params![record_id,label_id,reason.trim(),timestamp,context.actor,context.thread,context.client,context.idempotency_key],
         )?;
-        let daily = get_daily(&transaction, day)?.ok_or(Error::MissingDocument(0))?;
-        transaction.execute(
-            "INSERT INTO documents (kind, visibility, author, day, created_at, updated_at, body)
-             VALUES ('artifact', 'shared', 'agent', ?1, ?2, ?2, ?3)",
-            params![day, timestamp, markdown],
+        store_write(
+            &transaction,
+            context,
+            "add_label",
+            &request,
+            record_id,
+            &timestamp,
         )?;
-        let artifact_id = transaction.last_insert_rowid();
-        associate_mcp_project(&transaction, project_id, artifact_id)?;
-        transaction.execute(
-            "INSERT INTO document_attachments (parent_document_id, attached_document_id, status)
-             VALUES (?1, ?2, ?3)",
-            params![daily.id, artifact_id, status],
-        )?;
-        let document = get_document_from(&transaction, artifact_id)?
-            .ok_or(Error::MissingDocument(artifact_id))?;
-        let document = sanitize_mcp_document(&transaction, document)?;
+        let record =
+            record_from(&transaction, record_id, false)?.ok_or(Error::MissingRecord(record_id))?;
         transaction.commit()?;
-        Ok(document)
+        Ok(record)
+    }
+
+    pub fn retract_label(
+        &self,
+        record_id: i64,
+        label_id: i64,
+        reason: &str,
+        context: &WriteContext,
+    ) -> Result<Record, Error> {
+        validate_context(context)?;
+        validate_id("record_id", record_id)?;
+        validate_id("label_id", label_id)?;
+        validate_reason(reason)?;
+        let request = json!({"record_id": record_id, "label_id": label_id, "reason": reason, "context": context});
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "retract_label", &request)? {
+            return record_from(&transaction, id, false)?.ok_or(Error::MissingRecord(id));
+        }
+        readable_record_state(&transaction, record_id)?;
+        let assertion_id: i64 = transaction
+            .query_row(
+                "SELECT la.id FROM label_assertions la WHERE la.record_id=?1 AND la.label_id=?2
+                 AND NOT EXISTS(SELECT 1 FROM label_retractions lr WHERE lr.assertion_id=la.id)
+                 ORDER BY la.id DESC LIMIT 1",
+                params![record_id, label_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| Error::Conflict("label is not active on record".to_owned()))?;
+        let count: i64 = transaction.query_row(
+            "SELECT count(*) FROM label_assertions la WHERE la.record_id=?1
+             AND NOT EXISTS(SELECT 1 FROM label_retractions lr WHERE lr.assertion_id=la.id)",
+            [record_id],
+            |row| row.get(0),
+        )?;
+        if count <= 1 {
+            return Err(Error::Conflict(
+                "a record must retain at least one active label".to_owned(),
+            ));
+        }
+        let timestamp = now();
+        transaction.execute(
+            "INSERT INTO label_retractions(assertion_id,reason,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![assertion_id,reason.trim(),timestamp,context.actor,context.thread,context.client,context.idempotency_key],
+        )?;
+        store_write(
+            &transaction,
+            context,
+            "retract_label",
+            &request,
+            record_id,
+            &timestamp,
+        )?;
+        let record =
+            record_from(&transaction, record_id, false)?.ok_or(Error::MissingRecord(record_id))?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn add_relation(
+        &self,
+        source_record_id: i64,
+        target_record_id: i64,
+        kind: &DirectRelationKind,
+        reason: &str,
+        context: &WriteContext,
+    ) -> Result<Relation, Error> {
+        validate_context(context)?;
+        validate_id("source_record_id", source_record_id)?;
+        validate_id("target_record_id", target_record_id)?;
+        if source_record_id == target_record_id {
+            return Err(Error::Invalid(
+                "a relation cannot target its source".to_owned(),
+            ));
+        }
+        validate_reason(reason)?;
+        let request = json!({"source_record_id": source_record_id, "target_record_id": target_record_id, "kind": kind, "reason": reason, "context": context});
+        let kind = kind.relation_kind();
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "add_relation", &request)? {
+            return relation_from(&transaction, id, true)?.ok_or(Error::MissingRelation(id));
+        }
+        readable_record_state(&transaction, source_record_id)?;
+        readable_record_state(&transaction, target_record_id)?;
+        ensure_relation_absent(&transaction, source_record_id, target_record_id, &kind)?;
+        let timestamp = now();
+        let id = insert_relation(
+            &transaction,
+            source_record_id,
+            target_record_id,
+            &kind,
+            reason,
+            context,
+            &timestamp,
+        )?;
+        store_write(
+            &transaction,
+            context,
+            "add_relation",
+            &request,
+            id,
+            &timestamp,
+        )?;
+        let relation = relation_from(&transaction, id, true)?.ok_or(Error::MissingRelation(id))?;
+        transaction.commit()?;
+        Ok(relation)
+    }
+
+    pub fn retract_relation(
+        &self,
+        relation_id: i64,
+        reason: &str,
+        context: &WriteContext,
+    ) -> Result<Relation, Error> {
+        validate_context(context)?;
+        validate_id("relation_id", relation_id)?;
+        validate_reason(reason)?;
+        let request = json!({"relation_id": relation_id, "reason": reason, "context": context});
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "retract_relation", &request)? {
+            return relation_from(&transaction, id, true)?.ok_or(Error::MissingRelation(id));
+        }
+        let relation = relation_from(&transaction, relation_id, true)?
+            .ok_or(Error::MissingRelation(relation_id))?;
+        readable_record_state(&transaction, relation.source_record_id)?;
+        readable_record_state(&transaction, relation.target_record_id)?;
+        if relation.retracted.is_some() {
+            return Err(Error::Conflict("relation is already retracted".to_owned()));
+        }
+        let timestamp = now();
+        transaction.execute(
+            "INSERT INTO relation_retractions(relation_id,reason,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![relation_id,reason.trim(),timestamp,context.actor,context.thread,context.client,context.idempotency_key],
+        )?;
+        store_write(
+            &transaction,
+            context,
+            "retract_relation",
+            &request,
+            relation_id,
+            &timestamp,
+        )?;
+        let relation = relation_from(&transaction, relation_id, true)?
+            .ok_or(Error::MissingRelation(relation_id))?;
+        transaction.commit()?;
+        Ok(relation)
+    }
+
+    pub fn list_relations(
+        &self,
+        record_id: i64,
+        include_retracted: bool,
+    ) -> Result<Vec<Relation>, Error> {
+        validate_id("record_id", record_id)?;
+        let connection = self.connection()?;
+        readable_record_state(&connection, record_id)?;
+        relations_for(&connection, record_id, include_retracted)
+    }
+
+    pub fn transition_record(
+        &self,
+        record_id: i64,
+        to: &Lifecycle,
+        reason: &str,
+        context: &WriteContext,
+    ) -> Result<Record, Error> {
+        validate_context(context)?;
+        validate_id("record_id", record_id)?;
+        validate_reason(reason)?;
+        if *to != Lifecycle::Retracted {
+            return Err(Error::Invalid(
+                "use supersede_record or merge_records for that lifecycle".to_owned(),
+            ));
+        }
+        let request =
+            json!({"record_id": record_id, "to": to, "reason": reason, "context": context});
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "transition_record", &request)? {
+            return record_from(&transaction, id, false)?.ok_or(Error::MissingRecord(id));
+        }
+        let timestamp = now();
+        transition(&transaction, record_id, to, reason, context, &timestamp)?;
+        store_write(
+            &transaction,
+            context,
+            "transition_record",
+            &request,
+            record_id,
+            &timestamp,
+        )?;
+        let record =
+            record_from(&transaction, record_id, false)?.ok_or(Error::MissingRecord(record_id))?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn supersede_record(
+        &self,
+        record_id: i64,
+        replacement: &RecordInput,
+        reason: &str,
+        context: &WriteContext,
+    ) -> Result<Record, Error> {
+        validate_context(context)?;
+        validate_id("record_id", record_id)?;
+        validate_record_input(replacement)?;
+        validate_reason(reason)?;
+        let request = json!({"record_id": record_id, "replacement": replacement, "reason": reason, "context": context});
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "supersede_record", &request)? {
+            return record_from(&transaction, id, false)?.ok_or(Error::MissingRecord(id));
+        }
+        let (lifecycle, _) = readable_record_lifecycle(&transaction, record_id)?;
+        if lifecycle != Lifecycle::Active {
+            return Err(Error::Conflict(
+                "only an active record can be superseded".to_owned(),
+            ));
+        }
+        let timestamp = now();
+        let replacement_id = insert_record(&transaction, replacement, context, reason, &timestamp)?;
+        insert_relation(
+            &transaction,
+            replacement_id,
+            record_id,
+            &RelationKind::Supersedes,
+            reason,
+            context,
+            &timestamp,
+        )?;
+        transition(
+            &transaction,
+            record_id,
+            &Lifecycle::Superseded,
+            reason,
+            context,
+            &timestamp,
+        )?;
+        store_write(
+            &transaction,
+            context,
+            "supersede_record",
+            &request,
+            replacement_id,
+            &timestamp,
+        )?;
+        let record = record_from(&transaction, replacement_id, false)?
+            .ok_or(Error::MissingRecord(replacement_id))?;
+        transaction.commit()?;
+        Ok(record)
+    }
+
+    pub fn merge_records(
+        &self,
+        record_ids: &[i64],
+        aggregate: &RecordInput,
+        reason: &str,
+        context: &WriteContext,
+    ) -> Result<Record, Error> {
+        validate_context(context)?;
+        let record_ids = distinct_ids("record_ids", record_ids, MAX_LABEL_IDS)?;
+        if record_ids.len() < 2 {
+            return Err(Error::Invalid(
+                "merge requires at least two records".to_owned(),
+            ));
+        }
+        validate_record_input(aggregate)?;
+        validate_reason(reason)?;
+        let request = json!({"record_ids": record_ids, "aggregate": aggregate, "reason": reason, "context": context});
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        if let Some(id) = previous_result(&transaction, context, "merge_records", &request)? {
+            return record_from(&transaction, id, false)?.ok_or(Error::MissingRecord(id));
+        }
+        for id in &record_ids {
+            let (lifecycle, _) = readable_record_lifecycle(&transaction, *id)?;
+            if lifecycle != Lifecycle::Active {
+                return Err(Error::Conflict(
+                    "only active records can be merged".to_owned(),
+                ));
+            }
+        }
+        let timestamp = now();
+        let aggregate_id = insert_record(&transaction, aggregate, context, reason, &timestamp)?;
+        if record_ids.contains(&aggregate_id) {
+            return Err(Error::Invalid("aggregate must be a new record".to_owned()));
+        }
+        for id in record_ids {
+            insert_relation(
+                &transaction,
+                id,
+                aggregate_id,
+                &RelationKind::MergedInto,
+                reason,
+                context,
+                &timestamp,
+            )?;
+            transition(
+                &transaction,
+                id,
+                &Lifecycle::Merged,
+                reason,
+                context,
+                &timestamp,
+            )?;
+        }
+        store_write(
+            &transaction,
+            context,
+            "merge_records",
+            &request,
+            aggregate_id,
+            &timestamp,
+        )?;
+        let record = record_from(&transaction, aggregate_id, false)?
+            .ok_or(Error::MissingRecord(aggregate_id))?;
+        transaction.commit()?;
+        Ok(record)
     }
 }
 
-fn create_v3_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+fn immediate(connection: &mut Connection) -> Result<Transaction<'_>, Error> {
+    Ok(connection.transaction_with_behavior(TransactionBehavior::Immediate)?)
+}
+
+fn insert_record(
+    transaction: &Transaction<'_>,
+    input: &RecordInput,
+    context: &WriteContext,
+    reason: &str,
+    timestamp: &str,
+) -> Result<i64, Error> {
+    if scope_from(transaction, input.scope_id)?.is_none() {
+        return Err(Error::MissingScope(input.scope_id));
+    }
+    let label_ids = distinct_ids("label_ids", &input.label_ids, MAX_LABEL_IDS)?;
+    if label_ids.is_empty() {
+        return Err(Error::Invalid(
+            "record requires at least one active label".to_owned(),
+        ));
+    }
+    for id in &label_ids {
+        ensure_active_label(transaction, *id)?;
+    }
+    let kind = input.payload.kind();
+    let payload_json = serde_json::to_string(&input.payload)?;
+    transaction.execute(
+        "INSERT INTO records(scope_id,kind,title,lifecycle,current_revision,readable,created_at,updated_at,actor,thread,client,idempotency_key,import_metadata)
+         VALUES(?1,?2,?3,'active',1,1,?4,?4,?5,?6,?7,?8,NULL)",
+        params![input.scope_id,kind.as_str(),input.title.trim(),timestamp,context.actor,context.thread,context.client,context.idempotency_key],
+    )?;
+    let id = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO record_revisions(record_id,revision,title,payload_json,reason,created_at,actor,thread,client,idempotency_key)
+         VALUES(?1,1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![id,input.title.trim(),payload_json,reason.trim(),timestamp,context.actor,context.thread,context.client,context.idempotency_key],
+    )?;
+    insert_sources(transaction, id, 1, &input.sources)?;
+    for label_id in label_ids {
+        transaction.execute(
+            "INSERT INTO label_assertions(record_id,label_id,reason,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,?2,'record created',?3,?4,?5,?6,?7)",
+            params![id,label_id,timestamp,context.actor,context.thread,context.client,format!("{}:label:{label_id}",context.idempotency_key)],
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO lifecycle_transitions(record_id,from_state,to_state,reason,created_at,actor,thread,client,idempotency_key)
+         VALUES(?1,NULL,'active','record created',?2,?3,?4,?5,?6)",
+        params![id,timestamp,context.actor,context.thread,context.client,format!("{}:lifecycle",context.idempotency_key)],
+    )?;
+    update_fts(transaction, id, input.title.trim(), &payload_json)?;
+    Ok(id)
+}
+
+fn insert_sources(
+    transaction: &Transaction<'_>,
+    record_id: i64,
+    revision: i64,
+    sources: &[SourceInput],
+) -> Result<(), Error> {
+    for (position, source) in sources.iter().enumerate() {
+        transaction.execute(
+            "INSERT INTO source_references(record_id,revision,position,identity,locator,version,content_hash,anchor,quote)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![record_id,revision,position as i64,source.identity.trim(),trim_option(&source.locator),trim_option(&source.version),trim_option(&source.content_hash),trim_option(&source.anchor),source.quote],
+        )?;
+    }
+    Ok(())
+}
+
+fn transition(
+    transaction: &Transaction<'_>,
+    record_id: i64,
+    to: &Lifecycle,
+    reason: &str,
+    context: &WriteContext,
+    timestamp: &str,
+) -> Result<(), Error> {
+    let (from, _) = readable_record_lifecycle(transaction, record_id)?;
+    if from != Lifecycle::Active {
+        return Err(Error::Conflict(
+            "only an active record can transition".to_owned(),
+        ));
+    }
+    transaction.execute(
+        "UPDATE records SET lifecycle=?1,updated_at=?2 WHERE id=?3",
+        params![to.as_str(), timestamp, record_id],
+    )?;
+    transaction.execute(
+        "INSERT INTO lifecycle_transitions(record_id,from_state,to_state,reason,created_at,actor,thread,client,idempotency_key)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![record_id,from.as_str(),to.as_str(),reason.trim(),timestamp,context.actor,context.thread,context.client,format!("{}:lifecycle:{record_id}",context.idempotency_key)],
+    )?;
+    Ok(())
+}
+
+fn insert_relation(
+    transaction: &Transaction<'_>,
+    source_record_id: i64,
+    target_record_id: i64,
+    kind: &RelationKind,
+    reason: &str,
+    context: &WriteContext,
+    timestamp: &str,
+) -> Result<i64, Error> {
+    ensure_relation_absent(transaction, source_record_id, target_record_id, kind)?;
+    transaction.execute(
+        "INSERT INTO record_relations(source_record_id,target_record_id,kind,reason,created_at,actor,thread,client,idempotency_key)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+        params![source_record_id,target_record_id,kind.as_str(),reason.trim(),timestamp,context.actor,context.thread,context.client,format!("{}:relation:{source_record_id}:{target_record_id}:{}",context.idempotency_key,kind.as_str())],
+    )?;
+    Ok(transaction.last_insert_rowid())
+}
+
+fn ensure_relation_absent(
+    connection: &Connection,
+    source_record_id: i64,
+    target_record_id: i64,
+    kind: &RelationKind,
+) -> Result<(), Error> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM record_relations rr
+         WHERE rr.source_record_id=?1 AND rr.target_record_id=?2 AND rr.kind=?3
+         AND NOT EXISTS(SELECT 1 FROM relation_retractions rt WHERE rt.relation_id=rr.id))",
+        params![source_record_id, target_record_id, kind.as_str()],
+        |row| row.get(0),
+    )?;
+    if exists {
+        Err(Error::Conflict("relation is already active".to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+fn previous_result(
+    connection: &Connection,
+    context: &WriteContext,
+    operation: &str,
+    request: &Value,
+) -> Result<Option<i64>, Error> {
+    let stored: Option<(String, String, i64)> = connection
+        .query_row(
+            "SELECT operation,request_json,result_id FROM write_keys WHERE key=?1",
+            [&context.idempotency_key],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((stored_operation, stored_request, result_id)) = stored else {
+        return Ok(None);
+    };
+    let request_json = serde_json::to_string(request)?;
+    if stored_operation == operation && stored_request == request_json {
+        Ok(Some(result_id))
+    } else {
+        Err(Error::Conflict(
+            "idempotency key was already used for a different write".to_owned(),
+        ))
+    }
+}
+
+fn store_write(
+    connection: &Connection,
+    context: &WriteContext,
+    operation: &str,
+    request: &Value,
+    result_id: i64,
+    timestamp: &str,
+) -> Result<(), Error> {
+    connection.execute(
+        "INSERT INTO write_keys(key,operation,request_json,result_id,created_at,actor,thread,client)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![context.idempotency_key,operation,serde_json::to_string(request)?,result_id,timestamp,context.actor,context.thread,context.client],
+    )?;
+    Ok(())
+}
+
+fn update_fts(
+    connection: &Connection,
+    record_id: i64,
+    title: &str,
+    payload_json: &str,
+) -> Result<(), Error> {
+    let imported: bool = connection.query_row(
+        "SELECT import_metadata IS NOT NULL FROM records WHERE id=?1",
+        [record_id],
+        |row| row.get(0),
+    )?;
+    let payload_json = if imported {
+        let mut payload: RecordPayload = serde_json::from_str(payload_json)?;
+        sanitize_imported_payload(connection, &mut payload)?;
+        serde_json::to_string(&payload)?
+    } else {
+        payload_json.to_owned()
+    };
+    connection.execute("DELETE FROM record_fts WHERE record_id=?1", [record_id])?;
+    connection.execute(
+        "INSERT INTO record_fts(record_id,title,payload) VALUES(?1,?2,?3)",
+        params![record_id, title, payload_json],
+    )?;
+    Ok(())
+}
+
+fn rebuild_fts(connection: &Connection) -> Result<(), Error> {
+    let rows = {
+        let mut statement = connection.prepare(
+            "SELECT r.id,r.title,rr.payload_json,r.import_metadata IS NOT NULL
+             FROM records r JOIN record_revisions rr
+             ON rr.record_id=r.id AND rr.revision=r.current_revision
+             WHERE r.readable=1 ORDER BY r.id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+    connection.execute("DELETE FROM record_fts", [])?;
+    for (id, title, payload_json, imported) in rows {
+        let payload_json = if imported {
+            let mut payload: RecordPayload = serde_json::from_str(&payload_json)?;
+            sanitize_imported_payload(connection, &mut payload)?;
+            serde_json::to_string(&payload)?
+        } else {
+            payload_json
+        };
+        connection.execute(
+            "INSERT INTO record_fts(record_id,title,payload) VALUES(?1,?2,?3)",
+            params![id, title, payload_json],
+        )?;
+    }
+    Ok(())
+}
+
+fn scope_from(connection: &Connection, id: i64) -> Result<Option<Scope>, Error> {
+    Ok(connection
+        .query_row(
+            "SELECT id,name,created_at,actor,thread,client FROM scopes WHERE id=?1",
+            [id],
+            scope_from_row,
+        )
+        .optional()?)
+}
+
+fn scope_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Scope> {
+    Ok(Scope {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created: Provenance {
+            server_time: row.get(2)?,
+            actor: row.get(3)?,
+            thread: row.get(4)?,
+            client: row.get(5)?,
+        },
+    })
+}
+
+fn label_from(connection: &Connection, id: i64) -> Result<Option<Label>, Error> {
+    let base: Option<(i64, String, String, String, bool, Provenance)> = connection
+        .query_row(
+            "SELECT id,facet,key,display_name,active,created_at,actor,thread,client FROM labels WHERE id=?1",
+            [id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    Provenance {
+                        server_time: row.get(5)?,
+                        actor: row.get(6)?,
+                        thread: row.get(7)?,
+                        client: row.get(8)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    let Some((id, facet, key, display_name, active, created)) = base else {
+        return Ok(None);
+    };
+    let mut statement =
+        connection.prepare("SELECT alias FROM label_aliases WHERE label_id=?1 ORDER BY alias")?;
+    let aliases = statement
+        .query_map([id], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Label {
+        id,
+        canonical: format!("{facet}:{key}"),
+        facet,
+        key,
+        display_name,
+        aliases,
+        active,
+        created,
+    }))
+}
+
+#[allow(clippy::type_complexity)]
+fn record_from(
+    connection: &Connection,
+    id: i64,
+    include_history: bool,
+) -> Result<Option<Record>, Error> {
+    let base: Option<(
+        i64,
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        Provenance,
+        String,
+        Option<String>,
+    )> = connection
+        .query_row(
+            "SELECT id,scope_id,kind,title,lifecycle,current_revision,created_at,actor,thread,client,updated_at,import_metadata
+             FROM records WHERE id=?1 AND readable=1",
+            [id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    Provenance {
+                        server_time: row.get(6)?,
+                        actor: row.get(7)?,
+                        thread: row.get(8)?,
+                        client: row.get(9)?,
+                    },
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        scope_id,
+        kind,
+        title,
+        lifecycle,
+        current_revision,
+        created,
+        updated_at,
+        import_json,
+    )) = base
+    else {
+        return Ok(None);
+    };
+    let imported = import_json.is_some();
+    let current = revision_from(connection, id, current_revision, imported)?
+        .ok_or(Error::MissingRecord(id))?;
+    let history = if include_history {
+        let mut statement = connection.prepare(
+            "SELECT revision FROM record_revisions WHERE record_id=?1 ORDER BY revision",
+        )?;
+        let revisions = statement
+            .query_map([id], |row| row.get::<_, i64>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        revisions
+            .into_iter()
+            .map(|revision| {
+                revision_from(connection, id, revision, imported)?.ok_or(Error::MissingRecord(id))
+            })
+            .collect::<Result<Vec<_>, Error>>()?
+    } else {
+        Vec::new()
+    };
+    let scope = scope_from(connection, scope_id)?.ok_or(Error::MissingScope(scope_id))?;
+    let kind = RecordKind::parse(&kind)
+        .ok_or_else(|| Error::Invalid("stored record kind is invalid".to_owned()))?;
+    let lifecycle = Lifecycle::parse(&lifecycle)
+        .ok_or_else(|| Error::Invalid("stored lifecycle is invalid".to_owned()))?;
+    Ok(Some(Record {
+        id,
+        scope,
+        kind,
+        title,
+        lifecycle,
+        current_revision,
+        created,
+        updated_at,
+        current,
+        history,
+        labels: labels_for_record(connection, id)?,
+        relations: relations_for(connection, id, false)?,
+        lifecycle_history: lifecycle_for_record(connection, id)?,
+        import_metadata: import_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?,
+    }))
+}
+
+fn revision_from(
+    connection: &Connection,
+    record_id: i64,
+    revision: i64,
+    sanitize_import: bool,
+) -> Result<Option<Revision>, Error> {
+    let row: Option<(String, String, String, Provenance)> = connection
+        .query_row(
+            "SELECT title,payload_json,reason,created_at,actor,thread,client FROM record_revisions
+             WHERE record_id=?1 AND revision=?2",
+            params![record_id, revision],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    Provenance {
+                        server_time: row.get(3)?,
+                        actor: row.get(4)?,
+                        thread: row.get(5)?,
+                        client: row.get(6)?,
+                    },
+                ))
+            },
+        )
+        .optional()?;
+    let Some((title, payload_json, reason, provenance)) = row else {
+        return Ok(None);
+    };
+    let mut payload: RecordPayload = serde_json::from_str(&payload_json)?;
+    if sanitize_import {
+        sanitize_imported_payload(connection, &mut payload)?;
+    }
+    let mut statement = connection.prepare(
+        "SELECT id,identity,locator,version,content_hash,anchor,quote FROM source_references
+         WHERE record_id=?1 AND revision=?2 ORDER BY position,id",
+    )?;
+    let sources = statement
+        .query_map(params![record_id, revision], |row| {
+            Ok(SourceReference {
+                id: row.get(0)?,
+                identity: row.get(1)?,
+                locator: row.get(2)?,
+                version: row.get(3)?,
+                content_hash: row.get(4)?,
+                anchor: row.get(5)?,
+                quote: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Some(Revision {
+        revision,
+        title,
+        payload,
+        reason,
+        provenance,
+        sources,
+    }))
+}
+
+fn labels_for_record(connection: &Connection, record_id: i64) -> Result<Vec<Label>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT la.label_id FROM label_assertions la JOIN labels l ON l.id=la.label_id
+         WHERE la.record_id=?1 AND l.active=1
+         AND NOT EXISTS(SELECT 1 FROM label_retractions lr WHERE lr.assertion_id=la.id)
+         ORDER BY l.facet,l.key,l.id",
+    )?;
+    let ids = statement
+        .query_map([record_id], |row| row.get::<_, i64>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.into_iter()
+        .map(|id| label_from(connection, id)?.ok_or(Error::MissingLabel(id)))
+        .collect()
+}
+
+fn lifecycle_for_record(
+    connection: &Connection,
+    record_id: i64,
+) -> Result<Vec<LifecycleTransition>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT id,from_state,to_state,reason,created_at,actor,thread,client
+         FROM lifecycle_transitions WHERE record_id=?1 ORDER BY id",
+    )?;
+    statement
+        .query_map([record_id], |row| {
+            let from: Option<String> = row.get(1)?;
+            let to: String = row.get(2)?;
+            Ok((
+                row.get::<_, i64>(0)?,
+                from,
+                to,
+                row.get::<_, String>(3)?,
+                Provenance {
+                    server_time: row.get(4)?,
+                    actor: row.get(5)?,
+                    thread: row.get(6)?,
+                    client: row.get(7)?,
+                },
+            ))
+        })?
+        .map(|row| {
+            let (id, from, to, reason, provenance) = row?;
+            let from = match from {
+                Some(value) => Some(
+                    Lifecycle::parse(&value)
+                        .ok_or_else(|| Error::Invalid("stored lifecycle is invalid".to_owned()))?,
+                ),
+                None => None,
+            };
+            Ok(LifecycleTransition {
+                id,
+                from,
+                to: Lifecycle::parse(&to)
+                    .ok_or_else(|| Error::Invalid("stored lifecycle is invalid".to_owned()))?,
+                reason,
+                provenance,
+            })
+        })
+        .collect::<Result<Vec<_>, Error>>()
+}
+
+fn relations_for(
+    connection: &Connection,
+    record_id: i64,
+    include_retracted: bool,
+) -> Result<Vec<Relation>, Error> {
+    let mut statement = connection.prepare(
+        "SELECT rr.id FROM record_relations rr
+         JOIN records source ON source.id=rr.source_record_id AND source.readable=1
+         JOIN records target ON target.id=rr.target_record_id AND target.readable=1
+         WHERE (rr.source_record_id=?1 OR rr.target_record_id=?1)
+         AND (?2=1 OR NOT EXISTS(SELECT 1 FROM relation_retractions rt WHERE rt.relation_id=rr.id))
+         ORDER BY rr.id",
+    )?;
+    let ids = statement
+        .query_map(params![record_id, include_retracted], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    ids.into_iter()
+        .map(|id| {
+            relation_from(connection, id, include_retracted)?.ok_or(Error::MissingRelation(id))
+        })
+        .collect()
+}
+
+#[allow(clippy::type_complexity)]
+fn relation_from(
+    connection: &Connection,
+    id: i64,
+    include_retracted: bool,
+) -> Result<Option<Relation>, Error> {
+    let row: Option<(
+        i64,
+        i64,
+        String,
+        String,
+        Provenance,
+        Option<(String, Provenance)>,
+    )> = connection
+        .query_row(
+            "SELECT rr.source_record_id,rr.target_record_id,rr.kind,rr.reason,
+                    rr.created_at,rr.actor,rr.thread,rr.client,
+                    rt.reason,rt.created_at,rt.actor,rt.thread,rt.client
+             FROM record_relations rr
+             JOIN records source ON source.id=rr.source_record_id AND source.readable=1
+             JOIN records target ON target.id=rr.target_record_id AND target.readable=1
+             LEFT JOIN relation_retractions rt ON rt.relation_id=rr.id
+             WHERE rr.id=?1",
+            [id],
+            |row| {
+                let retraction_reason: Option<String> = row.get(8)?;
+                let retracted = retraction_reason
+                    .map(|reason| {
+                        Ok::<_, rusqlite::Error>((
+                            reason,
+                            Provenance {
+                                server_time: row.get(9)?,
+                                actor: row.get(10)?,
+                                thread: row.get(11)?,
+                                client: row.get(12)?,
+                            },
+                        ))
+                    })
+                    .transpose()?;
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    Provenance {
+                        server_time: row.get(4)?,
+                        actor: row.get(5)?,
+                        thread: row.get(6)?,
+                        client: row.get(7)?,
+                    },
+                    retracted,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((source_record_id, target_record_id, kind, reason, asserted, retracted)) = row else {
+        return Ok(None);
+    };
+    if retracted.is_some() && !include_retracted {
+        return Ok(None);
+    }
+    Ok(Some(Relation {
+        id,
+        source_record_id,
+        target_record_id,
+        kind: RelationKind::parse(&kind)
+            .ok_or_else(|| Error::Invalid("stored relation kind is invalid".to_owned()))?,
+        reason,
+        asserted,
+        retracted: retracted.map(|(reason, provenance)| Retraction { reason, provenance }),
+    }))
+}
+
+fn readable_record_state(
+    connection: &Connection,
+    record_id: i64,
+) -> Result<(RecordKind, i64), Error> {
+    let row: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT kind,current_revision FROM records WHERE id=?1 AND readable=1",
+            [record_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (kind, revision) = row.ok_or(Error::MissingRecord(record_id))?;
+    Ok((
+        RecordKind::parse(&kind)
+            .ok_or_else(|| Error::Invalid("stored record kind is invalid".to_owned()))?,
+        revision,
+    ))
+}
+
+fn readable_record_lifecycle(
+    connection: &Connection,
+    record_id: i64,
+) -> Result<(Lifecycle, i64), Error> {
+    let row: Option<(String, i64)> = connection
+        .query_row(
+            "SELECT lifecycle,current_revision FROM records WHERE id=?1 AND readable=1",
+            [record_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (lifecycle, revision) = row.ok_or(Error::MissingRecord(record_id))?;
+    Ok((
+        Lifecycle::parse(&lifecycle)
+            .ok_or_else(|| Error::Invalid("stored lifecycle is invalid".to_owned()))?,
+        revision,
+    ))
+}
+
+fn ensure_active_label(connection: &Connection, label_id: i64) -> Result<(), Error> {
+    let active: Option<bool> = connection
+        .query_row("SELECT active FROM labels WHERE id=?1", [label_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    match active {
+        Some(true) => Ok(()),
+        _ => Err(Error::MissingLabel(label_id)),
+    }
+}
+
+fn validate_record_input(input: &RecordInput) -> Result<(), Error> {
+    validate_id("scope_id", input.scope_id)?;
+    validate_title(&input.title)?;
+    if input.label_ids.is_empty() {
+        return Err(Error::Invalid(
+            "record requires at least one active label".to_owned(),
+        ));
+    }
+    distinct_ids("label_ids", &input.label_ids, MAX_LABEL_IDS)?;
+    validate_payload(&input.payload, &input.sources)
+}
+
+fn validate_payload(payload: &RecordPayload, sources: &[SourceInput]) -> Result<(), Error> {
+    if sources.len() > MAX_SOURCES {
+        return Err(Error::Invalid(format!(
+            "sources cannot contain more than {MAX_SOURCES} items"
+        )));
+    }
+    for source in sources {
+        validate_source(source)?;
+    }
+    match payload {
+        RecordPayload::Note { body } => validate_text("body", body, true, true)?,
+        RecordPayload::Observation {
+            statement,
+            observed_at,
+        } => {
+            validate_text("statement", statement, true, true)?;
+            validate_timestamp_option("observed_at", observed_at)?;
+            require_sources("observation", sources)?;
+        }
+        RecordPayload::Decision {
+            choice,
+            question,
+            rationale,
+            decided_at,
+        } => {
+            validate_text("choice", choice, true, true)?;
+            validate_optional_text("question", question, true)?;
+            validate_optional_text("rationale", rationale, true)?;
+            validate_timestamp_option("decided_at", decided_at)?;
+        }
+        RecordPayload::Idea { proposal } => validate_text("proposal", proposal, true, true)?,
+        RecordPayload::Snippet {
+            language,
+            code,
+            origin,
+            runtime,
+            dependencies,
+        } => {
+            validate_single_line("language", language, MAX_NAME_BYTES)?;
+            validate_text("code", code, true, false)?;
+            if let Some(runtime) = runtime {
+                validate_single_line("runtime", runtime, MAX_NAME_BYTES)?;
+            }
+            if let Some(dependencies) = dependencies {
+                if dependencies.len() > 100 {
+                    return Err(Error::Invalid(
+                        "dependencies cannot contain more than 100 items".to_owned(),
+                    ));
+                }
+                for dependency in dependencies {
+                    validate_single_line("dependency", dependency, MAX_NAME_BYTES)?;
+                }
+            }
+            if *origin == SnippetOrigin::Imported
+                && !sources.iter().any(|source| {
+                    trim_option(&source.locator).is_some()
+                        && trim_option(&source.content_hash).is_some()
+                })
+            {
+                return Err(Error::Invalid(
+                    "imported snippet requires a source with locator and content_hash".to_owned(),
+                ));
+            }
+        }
+        RecordPayload::Metric {
+            name,
+            value,
+            unit,
+            observed_at,
+            interval,
+            dimensions,
+            method,
+        } => {
+            validate_single_line("name", name, MAX_NAME_BYTES)?;
+            validate_single_line("unit", unit, MAX_NAME_BYTES)?;
+            if !value.is_finite() {
+                return Err(Error::Invalid("metric value must be finite".to_owned()));
+            }
+            if observed_at.is_some() && interval.is_some() {
+                return Err(Error::Invalid(
+                    "metric cannot have both observed_at and interval".to_owned(),
+                ));
+            }
+            validate_timestamp_option("observed_at", observed_at)?;
+            if let Some(interval) = interval {
+                let start = validate_timestamp("interval.start", &interval.start)?;
+                let end = validate_timestamp("interval.end", &interval.end)?;
+                if end < start {
+                    return Err(Error::Invalid(
+                        "metric interval end must not precede start".to_owned(),
+                    ));
+                }
+            }
+            if dimensions.len() > 100 {
+                return Err(Error::Invalid(
+                    "dimensions cannot contain more than 100 items".to_owned(),
+                ));
+            }
+            for (key, value) in dimensions {
+                validate_single_line("dimension key", key, MAX_NAME_BYTES)?;
+                validate_single_line("dimension value", value, MAX_NAME_BYTES)?;
+            }
+            validate_optional_text("method", method, true)?;
+            require_sources("metric", sources)?;
+        }
+        RecordPayload::Evidence {
+            claim,
+            action,
+            outcome,
+            impact,
+        } => {
+            validate_text("claim", claim, true, true)?;
+            validate_optional_text("action", action, true)?;
+            validate_optional_text("outcome", outcome, true)?;
+            validate_optional_text("impact", impact, true)?;
+            require_sources("evidence", sources)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_source(source: &SourceInput) -> Result<(), Error> {
+    validate_single_line("source identity", &source.identity, MAX_NAME_BYTES)?;
+    for (name, value) in [
+        ("source locator", &source.locator),
+        ("source version", &source.version),
+        ("source content_hash", &source.content_hash),
+        ("source anchor", &source.anchor),
+    ] {
+        if let Some(value) = value {
+            validate_single_line(name, value, MAX_NAME_BYTES)?;
+        }
+    }
+    if let Some(quote) = &source.quote {
+        validate_text("source quote", quote, false, true)?;
+    }
+    Ok(())
+}
+
+fn require_sources(kind: &str, sources: &[SourceInput]) -> Result<(), Error> {
+    if sources.is_empty() {
+        Err(Error::Invalid(format!(
+            "{kind} requires at least one source"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_text(
+    name: &str,
+    value: &str,
+    nonempty: bool,
+    validate_mermaid: bool,
+) -> Result<(), Error> {
+    if value.len() > MAX_BODY_BYTES {
+        return Err(Error::Invalid(format!(
+            "{name} exceeds {MAX_BODY_BYTES} bytes"
+        )));
+    }
+    if nonempty && value.trim().is_empty() {
+        return Err(Error::Invalid(format!("{name} must not be empty")));
+    }
+    if validate_mermaid {
+        crate::merman::validate_markdown_fences(value).map_err(Error::Invalid)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_text(
+    name: &str,
+    value: &Option<String>,
+    validate_mermaid: bool,
+) -> Result<(), Error> {
+    if let Some(value) = value {
+        validate_text(name, value, true, validate_mermaid)?;
+    }
+    Ok(())
+}
+
+fn validate_title(title: &str) -> Result<(), Error> {
+    validate_single_line("title", title, MAX_TITLE_BYTES).map(|_| ())
+}
+
+fn validate_reason(reason: &str) -> Result<(), Error> {
+    validate_single_line("reason", reason, MAX_NAME_BYTES).map(|_| ())
+}
+
+fn validate_single_line<'a>(
+    name: &str,
+    value: &'a str,
+    max_bytes: usize,
+) -> Result<&'a str, Error> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > max_bytes || value.contains(['\n', '\r']) {
+        Err(Error::Invalid(format!(
+            "{name} must be a non-empty single line of at most {max_bytes} bytes"
+        )))
+    } else {
+        Ok(value)
+    }
+}
+
+fn validate_scope_name(name: &str) -> Result<&str, Error> {
+    let name = validate_single_line("scope name", name, MAX_NAME_BYTES)?;
+    if name.eq_ignore_ascii_case("global") {
+        Ok("global")
+    } else {
+        Ok(name)
+    }
+}
+
+fn validate_label_part<'a>(name: &str, value: &'a str) -> Result<&'a str, Error> {
+    let value = validate_single_line(name, value, 64)?;
+    if value.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+    }) {
+        Ok(value)
+    } else {
+        Err(Error::Invalid(format!(
+            "{name} must contain only lowercase ASCII letters, digits, underscore, or hyphen"
+        )))
+    }
+}
+
+fn validate_aliases(aliases: &[String]) -> Result<Vec<String>, Error> {
+    if aliases.len() > 100 {
+        return Err(Error::Invalid(
+            "aliases cannot contain more than 100 items".to_owned(),
+        ));
+    }
+    let mut values = BTreeSet::new();
+    for alias in aliases {
+        values.insert(validate_single_line("alias", alias, MAX_NAME_BYTES)?.to_lowercase());
+    }
+    Ok(values.into_iter().collect())
+}
+
+fn validate_context(context: &WriteContext) -> Result<(), Error> {
+    validate_single_line("idempotency_key", &context.idempotency_key, MAX_NAME_BYTES)?;
+    validate_single_line("actor", &context.actor, MAX_PROVENANCE_BYTES)?;
+    validate_single_line("thread", &context.thread, MAX_PROVENANCE_BYTES)?;
+    validate_single_line("client", &context.client, MAX_PROVENANCE_BYTES)?;
+    Ok(())
+}
+
+fn validate_id(name: &str, id: i64) -> Result<(), Error> {
+    if id > 0 {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!("{name} must be positive")))
+    }
+}
+
+fn validate_limit(limit: usize) -> Result<(), Error> {
+    if (1..=SEARCH_RESULT_LIMIT).contains(&limit) {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "limit must be between 1 and {SEARCH_RESULT_LIMIT}"
+        )))
+    }
+}
+
+fn validate_query(query: &str) -> Result<(), Error> {
+    if query.len() <= MAX_SEARCH_QUERY_BYTES {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "search query exceeds {MAX_SEARCH_QUERY_BYTES} bytes"
+        )))
+    }
+}
+
+fn validate_timestamp(name: &str, value: &str) -> Result<DateTime<chrono::FixedOffset>, Error> {
+    DateTime::parse_from_rfc3339(value)
+        .map_err(|_| Error::Invalid(format!("{name} must be an RFC 3339 timestamp")))
+}
+
+fn validate_timestamp_option(name: &str, value: &Option<String>) -> Result<(), Error> {
+    if let Some(value) = value {
+        validate_timestamp(name, value)?;
+    }
+    Ok(())
+}
+
+fn distinct_ids(name: &str, ids: &[i64], max: usize) -> Result<Vec<i64>, Error> {
+    if ids.len() > max {
+        return Err(Error::Invalid(format!(
+            "{name} cannot contain more than {max} items"
+        )));
+    }
+    let mut values = Vec::new();
+    let mut seen = HashSet::new();
+    for id in ids {
+        validate_id(name, *id)?;
+        if seen.insert(*id) {
+            values.push(*id);
+        }
+    }
+    Ok(values)
+}
+
+fn trim_option(value: &Option<String>) -> Option<&str> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn fts_query(query: &str) -> Option<String> {
+    let terms = query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>();
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms.join(" AND "))
+    }
+}
+
+fn push_placeholders(sql: &mut String, count: usize, next: &mut usize) {
+    for index in 0..count {
+        if index != 0 {
+            sql.push(',');
+        }
+        sql.push('?');
+        sql.push_str(&next.to_string());
+        *next += 1;
+    }
+}
+
+fn now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn create_v3_schema(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
     transaction.execute_batch(
         "CREATE TABLE documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -312,11 +1886,11 @@ fn create_v3_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result
         );
         CREATE UNIQUE INDEX documents_daily_day ON documents(day) WHERE kind = 'daily';
         CREATE INDEX documents_day ON documents(day);
-        PRAGMA user_version = 3;"
+        PRAGMA user_version = 3;",
     )
 }
 
-fn create_v2_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+fn create_v2_schema(transaction: &Transaction<'_>) -> rusqlite::Result<()> {
     transaction.execute_batch("CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK (kind IN ('daily', 'note')), day TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL); CREATE UNIQUE INDEX documents_daily_day ON documents(day) WHERE kind = 'daily'; CREATE INDEX documents_day ON documents(day); PRAGMA user_version = 2;")
 }
 
@@ -350,7 +1924,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
                 if days.last().is_none_or(|item| item.1 != day) {
                     days.push((id, day, created_at, updated_at.clone(), Vec::new()));
                 }
-                let current = days.last_mut().ok_or(Error::MissingDocument(id))?;
+                let current = days.last_mut().ok_or(Error::MissingRecord(id))?;
                 if updated_at > current.3 {
                     current.3 = updated_at;
                 }
@@ -371,7 +1945,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
         transaction.execute_batch(
             "INSERT INTO documents (id, kind, visibility, author, day, created_at, updated_at, body)
              SELECT id, kind, 'shared', 'user', day, created_at, updated_at, body FROM documents_v2;
-             DROP TABLE documents_v2;"
+             DROP TABLE documents_v2;",
         )?;
     }
     let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -444,7 +2018,7 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
              CREATE INDEX document_attachments_parent ON document_attachments(parent_document_id);
              CREATE TABLE project_documents (project_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, added_by TEXT NOT NULL CHECK(added_by IN ('user', 'agent')), created_at TEXT NOT NULL, PRIMARY KEY(project_document_id, document_id), CHECK(project_document_id <> document_id));
              CREATE INDEX project_documents_document ON project_documents(document_id);
-             PRAGMA user_version = 6;"
+             PRAGMA user_version = 6;",
         )?;
         let sequence_updated = transaction.execute(
             "UPDATE sqlite_sequence SET seq = max(seq, ?1) WHERE name = 'documents'",
@@ -471,181 +2045,213 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
              PRAGMA user_version = 7;",
         )?;
     }
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 7 {
+        migrate_v8(&transaction)?;
+    }
     transaction.commit()?;
     Ok(())
 }
 
-fn validate_day(day: &str) -> Result<(), Error> {
-    if day.len() != 10 || NaiveDate::parse_from_str(day, "%Y-%m-%d").is_err() {
-        Err(Error::InvalidDay)
-    } else {
-        Ok(())
-    }
-}
-fn validate_id(id: i64) -> Result<(), Error> {
-    if id <= 0 {
-        Err(Error::InvalidId)
-    } else {
-        Ok(())
-    }
-}
-fn validate_query(query: &str) -> Result<(), Error> {
-    if query.len() > MAX_SEARCH_QUERY_BYTES {
-        Err(Error::SearchQueryTooLarge)
-    } else {
-        Ok(())
-    }
-}
-fn validate_title(title: &str) -> Result<(), Error> {
-    if title.trim().is_empty() || title.len() > MAX_TITLE_BYTES || title.contains(['\n', '\r']) {
-        Err(Error::InvalidTitle)
-    } else {
-        Ok(())
-    }
-}
-fn validate_status(status: &str) -> Result<(), Error> {
-    if matches!(status, "completed" | "blocked" | "failed") {
-        Ok(())
-    } else {
-        Err(Error::InvalidStatus)
-    }
-}
-fn validate_body_size(body: &str) -> Result<(), Error> {
-    if body.len() > MAX_BODY_BYTES {
-        Err(Error::BodyTooLarge)
-    } else {
-        Ok(())
-    }
-}
-fn distinct_valid_ids(ids: &[i64]) -> Result<Vec<i64>, Error> {
-    if ids.len() > MAX_REFERENCE_IDS {
-        return Err(Error::TooManyReferenceIds);
-    }
-    for &id in ids {
-        validate_id(id)?;
-    }
-    let mut seen = HashSet::new();
-    Ok(ids.iter().copied().filter(|id| seen.insert(*id)).collect())
-}
-fn now() -> String {
-    Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
-}
-fn escape_reference_label(label: &str) -> String {
-    label
-        .replace('\\', "\\\\")
-        .replace('|', "\\|")
-        .replace(']', "\\]")
-        .replace(['\n', '\r'], " ")
-}
-fn note_label(body: &str) -> String {
-    let Some(line) = body.lines().find(|line| !line.trim().is_empty()) else {
-        return "Untitled note".to_owned();
-    };
-    let line = line.trim();
-    let marker_count = line.bytes().take_while(|byte| *byte == b'#').count();
-    let label = if (1..=6).contains(&marker_count)
-        && line[marker_count..]
-            .chars()
-            .next()
-            .is_none_or(char::is_whitespace)
-    {
-        line[marker_count..].trim()
-    } else {
-        line
-    };
-    if label.is_empty() {
-        "Untitled note".to_owned()
-    } else {
-        label.to_owned()
-    }
-}
-fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
-    Ok(Document {
-        id: row.get(0)?,
-        kind: row.get(1)?,
-        visibility: row.get(2)?,
-        author: row.get(3)?,
-        day: row.get(4)?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        body: row.get(7)?,
-        revision: row.get(8)?,
-    })
-}
-fn reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceSummary> {
-    let id = row.get(0)?;
-    let kind: String = row.get(1)?;
-    let day: String = row.get(2)?;
-    let body: String = row.get(3)?;
-    let label = if kind == "daily" {
-        day.clone()
-    } else {
-        note_label(&body)
-    };
-    Ok(ReferenceSummary { id, label })
-}
-fn get_document_from(connection: &Connection, id: i64) -> Result<Option<Document>, Error> {
-    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents WHERE id = ?1", [id], document_from_row).optional()?)
-}
-fn get_shared_document_from(connection: &Connection, id: i64) -> Result<Option<Document>, Error> {
-    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents WHERE id = ?1 AND visibility = 'shared'", [id], document_from_row).optional()?)
-}
-fn get_daily(connection: &Connection, day: &str) -> Result<Option<Document>, Error> {
-    Ok(connection.query_row("SELECT id, kind, visibility, author, day, created_at, updated_at, body, revision FROM documents WHERE kind = 'daily' AND day = ?1", [day], document_from_row).optional()?)
-}
-fn project_documents(
-    connection: &Connection,
-    project_id: i64,
-    limit: usize,
-) -> Result<Vec<Document>, Error> {
-    let mut statement = connection.prepare(
-        "SELECT d.id, d.kind, d.visibility, d.author, d.day, d.created_at, d.updated_at, d.body, d.revision
-         FROM project_documents pd JOIN documents d ON d.id = pd.document_id
-         WHERE pd.project_document_id = ?1 AND d.visibility = 'shared'
-         ORDER BY d.updated_at DESC, d.id DESC LIMIT ?2",
+fn migrate_v8(transaction: &Transaction<'_>) -> Result<(), Error> {
+    transaction.execute_batch(
+        "CREATE TABLE scopes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE
+         );
+         CREATE TABLE records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_id INTEGER NOT NULL REFERENCES scopes(id),
+            kind TEXT NOT NULL CHECK(kind IN ('note','observation','decision','idea','snippet','metric','evidence')),
+            title TEXT NOT NULL,
+            lifecycle TEXT NOT NULL CHECK(lifecycle IN ('active','superseded','merged','retracted')),
+            current_revision INTEGER NOT NULL CHECK(current_revision > 0),
+            readable INTEGER NOT NULL CHECK(readable IN (0,1)),
+            created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            import_metadata TEXT
+         );
+         CREATE INDEX records_scope_lifecycle_id ON records(scope_id,lifecycle,id DESC);
+         CREATE TABLE record_revisions (
+            record_id INTEGER NOT NULL REFERENCES records(id),
+            revision INTEGER NOT NULL CHECK(revision > 0),
+            title TEXT NOT NULL, payload_json TEXT NOT NULL, reason TEXT NOT NULL,
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            PRIMARY KEY(record_id,revision)
+         );
+         CREATE TABLE source_references (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            position INTEGER NOT NULL,
+            identity TEXT NOT NULL, locator TEXT, version TEXT, content_hash TEXT, anchor TEXT, quote TEXT,
+            FOREIGN KEY(record_id,revision) REFERENCES record_revisions(record_id,revision),
+            UNIQUE(record_id,revision,position)
+         );
+         CREATE TABLE labels (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            facet TEXT NOT NULL, key TEXT NOT NULL, display_name TEXT NOT NULL,
+            active INTEGER NOT NULL CHECK(active IN (0,1)),
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            UNIQUE(facet,key)
+         );
+         CREATE TABLE label_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            label_id INTEGER NOT NULL REFERENCES labels(id),
+            alias TEXT NOT NULL UNIQUE COLLATE NOCASE
+         );
+         CREATE TABLE label_assertions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL REFERENCES records(id),
+            label_id INTEGER NOT NULL REFERENCES labels(id),
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE
+         );
+         CREATE INDEX label_assertions_record ON label_assertions(record_id,label_id,id);
+         CREATE TABLE label_retractions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            assertion_id INTEGER NOT NULL UNIQUE REFERENCES label_assertions(id),
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE
+         );
+         CREATE TABLE record_relations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_record_id INTEGER NOT NULL REFERENCES records(id),
+            target_record_id INTEGER NOT NULL REFERENCES records(id),
+            kind TEXT NOT NULL CHECK(kind IN ('references','mentions','derived_from','supports','contradicts','supersedes','merged_into','summarizes')),
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE,
+            CHECK(source_record_id <> target_record_id)
+         );
+         CREATE INDEX record_relations_source ON record_relations(source_record_id,id);
+         CREATE INDEX record_relations_target ON record_relations(target_record_id,id);
+         CREATE TABLE relation_retractions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            relation_id INTEGER NOT NULL UNIQUE REFERENCES record_relations(id),
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE
+         );
+         CREATE TABLE lifecycle_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            record_id INTEGER NOT NULL REFERENCES records(id),
+            from_state TEXT CHECK(from_state IS NULL OR from_state IN ('active','superseded','merged','retracted')),
+            to_state TEXT NOT NULL CHECK(to_state IN ('active','superseded','merged','retracted')),
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL UNIQUE
+         );
+         CREATE INDEX lifecycle_transitions_record ON lifecycle_transitions(record_id,id);
+         CREATE TABLE write_keys (
+            key TEXT PRIMARY KEY,
+            operation TEXT NOT NULL, request_json TEXT NOT NULL, result_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL, actor TEXT NOT NULL, thread TEXT NOT NULL, client TEXT NOT NULL
+         );
+         CREATE VIRTUAL TABLE record_fts USING fts5(record_id UNINDEXED,title,payload);
+         PRAGMA user_version = 8;",
     )?;
-    Ok(statement
-        .query_map(params![project_id, limit], document_from_row)?
-        .collect::<Result<Vec<_>, _>>()?)
-}
-fn validate_mcp_project(connection: &Connection, project_id: Option<i64>) -> Result<(), Error> {
-    let Some(id) = project_id else {
-        return Ok(());
+    let timestamp = now();
+    transaction.execute(
+        "INSERT INTO scopes(name,created_at,actor,thread,client,idempotency_key)
+         VALUES('global',?1,'archive','schema-v8','archive','schema-v8:scope:global')",
+        [&timestamp],
+    )?;
+    let global_scope = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO labels(facet,key,display_name,active,created_at,actor,thread,client,idempotency_key)
+         VALUES('workflow','inbox','Inbox',1,?1,'archive','schema-v8','archive','schema-v8:label:workflow:inbox')",
+        [&timestamp],
+    )?;
+    let inbox_label = transaction.last_insert_rowid();
+    let legacy = {
+        let mut statement = transaction.prepare(
+            "SELECT id,kind,visibility,author,day,created_at,updated_at,body,revision FROM documents ORDER BY id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
     };
-    validate_id(id)?;
-    let project = get_shared_document_from(connection, id)?.ok_or(Error::MissingDocument(id))?;
-    if project.kind != "project" {
-        return Err(Error::MissingDocument(id));
+    for (id, kind, visibility, author, day, created_at, updated_at, body, revision) in &legacy {
+        let title = format!("Imported legacy {kind} {id}");
+        let payload = RecordPayload::Note { body: body.clone() };
+        let payload_json = serde_json::to_string(&payload)?;
+        let metadata = serde_json::to_string(&json!({
+            "legacy": {
+                "created_at": created_at,
+                "updated_at": updated_at,
+                "author": author,
+                "day": day,
+                "kind": kind,
+                "visibility": visibility,
+                "revision": revision
+            }
+        }))?;
+        let key = format!("schema-v8:legacy-record:{id}");
+        transaction.execute(
+            "INSERT INTO records(id,scope_id,kind,title,lifecycle,current_revision,readable,created_at,updated_at,actor,thread,client,idempotency_key,import_metadata)
+             VALUES(?1,?2,'note',?3,'active',1,?4,?5,?5,'archive','schema-v8','archive',?6,?7)",
+            params![id,global_scope,title,if visibility == "shared" { 1 } else { 0 },timestamp,key,metadata],
+        )?;
+        transaction.execute(
+            "INSERT INTO record_revisions(record_id,revision,title,payload_json,reason,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,1,?2,?3,'legacy import',?4,'archive','schema-v8','archive',?5)",
+            params![id,title,payload_json,timestamp,format!("{key}:revision")],
+        )?;
+        transaction.execute(
+            "INSERT INTO label_assertions(record_id,label_id,reason,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,?2,'legacy import fallback',?3,'archive','schema-v8','archive',?4)",
+            params![id,inbox_label,timestamp,format!("{key}:label")],
+        )?;
+        transaction.execute(
+            "INSERT INTO lifecycle_transitions(record_id,from_state,to_state,reason,created_at,actor,thread,client,idempotency_key)
+             VALUES(?1,NULL,'active','legacy import',?2,'archive','schema-v8','archive',?3)",
+            params![id,timestamp,format!("{key}:lifecycle")],
+        )?;
     }
+    for (source_id, _, _, _, _, _, _, body, _) in &legacy {
+        let mut seen = HashSet::new();
+        for target_id in parsed_reference_ids(body) {
+            if target_id != *source_id
+                && legacy.iter().any(|row| row.0 == target_id)
+                && seen.insert(target_id)
+            {
+                transaction.execute(
+                    "INSERT INTO record_relations(source_record_id,target_record_id,kind,reason,created_at,actor,thread,client,idempotency_key)
+                     VALUES(?1,?2,'references','legacy note link',?3,'archive','schema-v8','archive',?4)",
+                    params![source_id,target_id,timestamp,format!("schema-v8:legacy-reference:{source_id}:{target_id}")],
+                )?;
+            }
+        }
+    }
+    let maximum = legacy.iter().map(|row| row.0).max().unwrap_or(0);
+    if maximum > 0 {
+        transaction.execute(
+            "UPDATE sqlite_sequence SET seq=max(seq,?1) WHERE name='records'",
+            [maximum],
+        )?;
+    }
+    rebuild_fts(transaction)?;
     Ok(())
-}
-fn associate_mcp_project(
-    connection: &Connection,
-    project_id: Option<i64>,
-    document_id: i64,
-) -> Result<(), Error> {
-    if let Some(project_id) = project_id {
-        connection.execute("INSERT INTO project_documents(project_document_id, document_id, added_by, created_at) VALUES(?1, ?2, 'agent', ?3)", params![project_id, document_id, now()])?;
-    }
-    Ok(())
-}
-fn resolve_shared_references(
-    connection: &Connection,
-    ids: &[i64],
-) -> Result<Vec<ReferenceSummary>, Error> {
-    if ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let placeholders = std::iter::repeat_n("?", ids.len())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "SELECT id, kind, day, body FROM documents WHERE visibility = 'shared' AND id IN ({placeholders})"
-    );
-    let mut statement = connection.prepare(&sql)?;
-    Ok(statement
-        .query_map(params_from_iter(ids), reference_from_row)?
-        .collect::<Result<Vec<_>, _>>()?)
 }
 
 #[derive(Clone, Copy)]
@@ -655,7 +2261,7 @@ struct ParsedReference {
     id: i64,
 }
 
-fn parse_references(body: &str) -> Vec<ParsedReference> {
+fn parsed_references(body: &str) -> Vec<ParsedReference> {
     let bytes = body.as_bytes();
     let mut references = Vec::new();
     let mut start = 0;
@@ -705,712 +2311,53 @@ fn parse_references(body: &str) -> Vec<ParsedReference> {
     references
 }
 
-fn sanitize_mcp_document(connection: &Connection, document: Document) -> Result<Document, Error> {
-    let references = parse_references(&document.body);
-    let ids = bounded_reference_ids(&references);
-    let shared_ids = resolve_shared_references(connection, &ids)?
+fn parsed_reference_ids(body: &str) -> Vec<i64> {
+    parsed_references(body)
         .into_iter()
         .map(|reference| reference.id)
-        .collect::<HashSet<_>>();
-    Ok(sanitize_document_with_ids(
-        document,
-        &references,
-        &shared_ids,
-    ))
+        .collect()
 }
 
-fn sanitize_mcp_documents(
-    connection: &Connection,
-    documents: Vec<Document>,
-) -> Result<Vec<Document>, Error> {
-    let parsed = documents
-        .iter()
-        .map(|document| parse_references(&document.body))
-        .collect::<Vec<_>>();
-    let mut all_ids = HashSet::new();
-    for references in &parsed {
-        all_ids.extend(bounded_reference_ids(references));
-    }
-    let all_ids = all_ids.into_iter().collect::<Vec<_>>();
-    let mut shared_ids = HashSet::new();
-    for ids in all_ids.chunks(MAX_REFERENCE_IDS) {
-        shared_ids.extend(
-            resolve_shared_references(connection, ids)?
-                .into_iter()
-                .map(|reference| reference.id),
-        );
-    }
-    Ok(documents
-        .into_iter()
-        .zip(parsed.iter())
-        .map(|(document, references)| sanitize_document_with_ids(document, references, &shared_ids))
-        .collect())
-}
-
-fn bounded_reference_ids(references: &[ParsedReference]) -> Vec<i64> {
-    let mut ids = Vec::new();
-    let mut seen = HashSet::new();
-    for reference in references {
-        if seen.contains(&reference.id) || ids.len() < MAX_REFERENCE_IDS {
-            if seen.insert(reference.id) {
-                ids.push(reference.id);
-            }
-        }
-    }
-    ids
-}
-
-fn sanitize_document_with_ids(
-    mut document: Document,
-    references: &[ParsedReference],
-    shared_ids: &HashSet<i64>,
-) -> Document {
-    let allowed_ids = bounded_reference_ids(references)
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let mut body = String::with_capacity(document.body.len());
+fn sanitize_legacy_body(body: &str, readable_ids: &HashSet<i64>) -> String {
+    let references = parsed_references(body);
+    let mut visible = String::with_capacity(body.len());
     let mut cursor = 0;
     for reference in references {
-        body.push_str(&document.body[cursor..reference.from]);
-        if allowed_ids.contains(&reference.id) && shared_ids.contains(&reference.id) {
-            body.push_str(&document.body[reference.from..reference.to]);
+        visible.push_str(&body[cursor..reference.from]);
+        if readable_ids.contains(&reference.id) {
+            visible.push_str(&body[reference.from..reference.to]);
         }
         cursor = reference.to;
     }
-    body.push_str(&document.body[cursor..]);
-    document.body = body;
-    document
+    visible.push_str(&body[cursor..]);
+    visible
+}
+
+fn sanitize_imported_payload(
+    connection: &Connection,
+    payload: &mut RecordPayload,
+) -> Result<(), Error> {
+    let RecordPayload::Note { body } = payload else {
+        return Ok(());
+    };
+    let ids = parsed_reference_ids(body);
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let mut readable = HashSet::new();
+    for id in ids {
+        let visible: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM records WHERE id=?1 AND readable=1)",
+            [id],
+            |row| row.get(0),
+        )?;
+        if visible {
+            readable.insert(id);
+        }
+    }
+    *body = sanitize_legacy_body(body, &readable);
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn database() -> Database {
-        Database::from_connection(Connection::open_in_memory().unwrap()).unwrap()
-    }
-
-    fn insert_document(
-        database: &Database,
-        kind: &str,
-        visibility: &str,
-        author: &str,
-        day: &str,
-        body: &str,
-    ) -> Document {
-        let connection = database.connection.lock().unwrap();
-        connection
-            .execute(
-                "INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body)
-             VALUES(?1,?2,?3,?4,'a','a',?5)",
-                params![kind, visibility, author, day, body],
-            )
-            .unwrap();
-        let id = connection.last_insert_rowid();
-        get_document_from(&connection, id).unwrap().unwrap()
-    }
-
-    fn document(database: &Database, id: i64) -> Document {
-        get_document_from(&database.connection.lock().unwrap(), id)
-            .unwrap()
-            .unwrap()
-    }
-
-    fn add_to_project(database: &Database, project_id: i64, document_id: i64) {
-        database
-            .connection
-            .lock()
-            .unwrap()
-            .execute(
-                "INSERT INTO project_documents(project_document_id,document_id,added_by,created_at)
-             VALUES(?1,?2,'user','a')",
-                [project_id, document_id],
-            )
-            .unwrap();
-    }
-
-    #[test]
-    fn fresh_schema_is_v7_with_constraints() {
-        let database = database();
-        let connection = database.connection.lock().unwrap();
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 7);
-        assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','private','user','2026-01-01','a','a','')", []).is_err());
-        assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('daily','shared','agent','2026-01-01','a','a','')", []).is_err());
-        assert!(connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('project','shared','agent','2026-01-01','a','a','')", []).is_err());
-        connection.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('project','shared','user','2026-01-01','a','a','')", []).unwrap();
-        let table: String = connection
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='document_attachments'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(table.contains("completed"));
-        assert!(table.contains("blocked"));
-        assert!(table.contains("failed"));
-        assert!(table.contains("reviewed_at"));
-    }
-
-    #[test]
-    fn v4_migration_adds_document_attachments() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("archive.sqlite3");
-        {
-            let mut connection = Connection::open(&path).unwrap();
-            {
-                let tx = connection.transaction().unwrap();
-                create_v3_schema(&tx).unwrap();
-                tx.execute(
-                    "INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body)
-                     VALUES('daily','shared','user','2026-08-04','a','b','user body')",
-                    [],
-                )
-                .unwrap();
-                tx.execute_batch(
-                    "ALTER TABLE documents ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
-                     CREATE TABLE presence (
-                        session_id TEXT PRIMARY KEY,
-                        actor TEXT NOT NULL CHECK(actor IN ('user', 'agent')),
-                        document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-                        last_heartbeat INTEGER NOT NULL
-                     );
-                     PRAGMA user_version = 4;",
-                )
-                .unwrap();
-                tx.commit().unwrap();
-            }
-        }
-        let database = Database::open(&path).unwrap();
-        let version: i64 = database
-            .connection
-            .lock()
-            .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, 7);
-        assert_eq!(document(&database, 1).body, "user body");
-        assert_eq!(
-            database
-                .connection
-                .lock()
-                .unwrap()
-                .query_row("SELECT count(*) FROM document_attachments", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ))
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn v5_migration_preserves_documents_children_ids_and_reopens() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("archive.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(
-            "PRAGMA foreign_keys=ON;
-             CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL CHECK(kind IN ('daily','note','artifact')), visibility TEXT NOT NULL CHECK(visibility IN ('shared','private')), author TEXT NOT NULL CHECK(author IN ('user','agent')), day TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1, CHECK(kind <> 'daily' OR (visibility='shared' AND author='user')));
-             CREATE UNIQUE INDEX documents_daily_day ON documents(day) WHERE kind='daily';
-             CREATE INDEX documents_day ON documents(day);
-             CREATE TABLE presence (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL CHECK(actor IN ('user','agent')), document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, last_heartbeat INTEGER NOT NULL);
-             CREATE INDEX presence_document ON presence(document_id);
-             CREATE TABLE document_attachments (parent_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, attached_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, status TEXT NOT NULL CHECK(status IN ('completed','blocked','failed')), PRIMARY KEY(parent_document_id,attached_document_id), UNIQUE(attached_document_id));
-             CREATE INDEX document_attachments_parent ON document_attachments(parent_document_id);
-             INSERT INTO documents VALUES(3,'daily','shared','user','2026-08-04','a','b','daily',4);
-             INSERT INTO documents VALUES(7,'note','private','user','2026-08-04','c','d','note',2);
-             INSERT INTO documents VALUES(11,'artifact','shared','agent','2026-08-04','e','f','artifact',3);
-             INSERT INTO documents VALUES(50,'note','shared','user','2026-08-04','g','h','deleted',1);
-             DELETE FROM documents WHERE id=50;
-             INSERT INTO presence VALUES('session','user',7,123);
-             INSERT INTO document_attachments VALUES(3,11,'blocked');
-             PRAGMA user_version=5;"
-        ).unwrap();
-        drop(connection);
-
-        let database = Database::open(&path).unwrap();
-        assert_eq!(document(&database, 3).body, "daily");
-        assert_eq!(document(&database, 7).revision, 2);
-        assert_eq!(document(&database, 11).author, "agent");
-        let connection = database.connection.lock().unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT seq FROM sqlite_sequence WHERE name='documents'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            50
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM presence WHERE session_id='session' AND document_id=7",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            1
-        );
-        assert_eq!(connection.query_row("SELECT count(*) FROM document_attachments WHERE parent_document_id=3 AND attached_document_id=11 AND status='blocked'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
-                    row.get::<_, i64>(0)
-                })
-                .unwrap(),
-            0
-        );
-        drop(connection);
-        let project = insert_document(&database, "project", "shared", "user", "2026-08-04", "");
-        assert!(project.id > 50);
-        drop(database);
-        let reopened = Database::open(&path).unwrap();
-        assert_eq!(document(&reopened, project.id), project);
-        assert_eq!(
-            reopened.connection.lock().unwrap().query_row(
-                "SELECT attached_document_id FROM document_attachments WHERE parent_document_id=3",
-                [],
-                |row| row.get::<_, i64>(0),
-            ).unwrap(),
-            11
-        );
-    }
-
-    #[test]
-    fn migrates_v1_exactly_and_reopens_idempotently() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("archive.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch("CREATE TABLE entries (id INTEGER PRIMARY KEY, day TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL); INSERT INTO entries VALUES (9,'2026-08-02','2026-08-02T12:00:00Z','2026-08-05T00:00:00Z','second'),(3,'2026-08-02','2026-08-02T08:00:00Z','2026-08-02T09:00:00Z','first\n'),(7,'2026-08-02','2026-08-02T10:00:00Z','2026-08-06T00:00:00Z',''),(12,'2026-08-03','2026-08-03T08:00:00Z','2026-08-03T09:00:00Z','only'); PRAGMA user_version=1;").unwrap();
-        let large = "x".repeat(600_000);
-        connection.execute("INSERT INTO entries VALUES(20,'2026-08-04','2026-08-04T08:00:00Z','2026-08-04T08:00:00Z',?1)",[&large]).unwrap();
-        connection.execute("INSERT INTO entries VALUES(21,'2026-08-04','2026-08-04T09:00:00Z','2026-08-04T09:00:00Z',?1)",[&large]).unwrap();
-        drop(connection);
-        let database = Database::open(&path).unwrap();
-        let first = document(&database, 3);
-        assert_eq!(first.body, "first\n\n\nsecond");
-        assert_eq!(first.created_at, "2026-08-02T08:00:00Z");
-        assert_eq!(first.updated_at, "2026-08-06T00:00:00Z");
-        assert_eq!(
-            (&first.visibility, &first.author),
-            (&"shared".to_owned(), &"user".to_owned())
-        );
-        assert_eq!(document(&database, 20).body.len(), 1_200_002);
-        drop(database);
-        assert_eq!(document(&Database::open(&path).unwrap(), 3), first);
-    }
-
-    #[test]
-    fn v2_migration_preserves_rows_and_ids() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        {
-            let tx = connection.transaction().unwrap();
-            create_v2_schema(&tx).unwrap();
-            tx.execute(
-                "INSERT INTO documents VALUES(7,'note','2020-01-01','a','b','body')",
-                [],
-            )
-            .unwrap();
-            tx.commit().unwrap();
-        }
-        let database = Database::from_connection(connection).unwrap();
-        let row = document(&database, 7);
-        assert_eq!(
-            (&row.visibility, &row.author),
-            (&"shared".to_owned(), &"user".to_owned())
-        );
-    }
-
-    #[test]
-    fn v3_migration_assigns_revision_one() {
-        let mut connection = Connection::open_in_memory().unwrap();
-        {
-            let tx = connection.transaction().unwrap();
-            create_v3_schema(&tx).unwrap();
-            tx.execute("INSERT INTO documents(kind,visibility,author,day,created_at,updated_at,body) VALUES('note','shared','user','2026-08-04','a','b','body')", []).unwrap();
-            tx.commit().unwrap();
-        }
-        let database = Database::from_connection(connection).unwrap();
-        assert_eq!(document(&database, 1).revision, 1);
-    }
-
-    #[test]
-    fn mcp_project_context_is_private_safe_sanitized_and_bounded() {
-        let d = database();
-        let private = insert_document(
-            &d,
-            "note",
-            "private",
-            "user",
-            "2026-08-04",
-            "# Secret member",
-        );
-        let shared = insert_document(
-            &d,
-            "note",
-            "shared",
-            "user",
-            "2026-08-04",
-            &format!("# Shared\n[[note:{}|Secret label]]", private.id),
-        );
-        let project = insert_document(
-            &d,
-            "project",
-            "shared",
-            "user",
-            "2026-08-04",
-            &format!("# Project\n[[note:{}|Private project label]]", private.id),
-        );
-        add_to_project(&d, project.id, shared.id);
-        add_to_project(&d, project.id, private.id);
-        let (visible_project, members) = d.mcp_project_context(project.id, 1).unwrap();
-        assert_eq!(members.len(), 1);
-        assert_eq!(members[0].id, shared.id);
-        for secret in [
-            private.id.to_string(),
-            "Secret label".into(),
-            "Private project label".into(),
-        ] {
-            assert!(!visible_project.body.contains(&secret));
-            assert!(!members[0].body.contains(&secret));
-        }
-        assert!(matches!(
-            d.mcp_project_context(project.id, 0),
-            Err(Error::InvalidLimit)
-        ));
-        assert!(matches!(
-            d.mcp_project_context(project.id, 51),
-            Err(Error::InvalidLimit)
-        ));
-        let private_project = insert_document(&d, "project", "private", "user", "2026-08-04", "");
-        assert!(matches!(
-            d.mcp_project_context(private_project.id, 20),
-            Err(Error::MissingDocument(_))
-        ));
-        assert!(matches!(
-            d.mcp_project_context(9999, 20),
-            Err(Error::MissingDocument(_))
-        ));
-    }
-
-    #[test]
-    fn invalid_mcp_project_associations_roll_back_every_related_row() {
-        let d = database();
-        let private = insert_document(&d, "project", "private", "user", "2026-08-04", "");
-        let note = insert_document(&d, "note", "shared", "user", "2026-08-04", "");
-        for project_id in [Some(private.id), Some(note.id), Some(9999)] {
-            assert!(matches!(
-                d.mcp_create_artifact("Rejected", "body", &[], project_id),
-                Err(Error::MissingDocument(_))
-            ));
-            assert!(matches!(
-                d.mcp_create_daily_attachment("2026-08-04", "Rejected", "body", None, project_id),
-                Err(Error::MissingDocument(_))
-            ));
-        }
-        let connection = d.connection.lock().unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM documents WHERE body LIKE '# Rejected%'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM document_attachments", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ))
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row("SELECT count(*) FROM project_documents", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn mcp_private_and_missing_are_indistinguishable() {
-        let d = database();
-        let private = insert_document(
-            &d,
-            "note",
-            "private",
-            "user",
-            "2026-08-04",
-            "SECRET TITLE body [[note:998|meta]]",
-        );
-        let missing = private.id + 1000;
-        assert_eq!(
-            d.mcp_read_document(private.id).unwrap_err().to_string(),
-            d.mcp_read_document(missing)
-                .unwrap_err()
-                .to_string()
-                .replace(&missing.to_string(), &private.id.to_string())
-        );
-        assert!(d.mcp_search_documents("SECRET", 50).unwrap().is_empty());
-        assert!(
-            d.mcp_search_documents(&private.id.to_string(), 50)
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn mcp_sanitizes_private_and_missing_references_before_read_and_search() {
-        let d = database();
-        let shared_target = insert_document(
-            &d,
-            "note",
-            "shared",
-            "user",
-            "2026-08-04",
-            "# Visible target",
-        );
-        let private_target = insert_document(
-            &d,
-            "note",
-            "private",
-            "user",
-            "2026-08-04",
-            "# Authoritative private title",
-        );
-        let missing_id = private_target.id + 10_000;
-        let shared_reference = format!("[[note:{}|Visible \\| label]]", shared_target.id);
-        let private_reference = format!("[[note:{}|Private stored label]]", private_target.id);
-        let missing_reference = format!("[[note:{missing_id}|Missing stored label]]");
-        let source = insert_document(
-            &d,
-            "note",
-            "shared",
-            "user",
-            "2026-08-04",
-            &format!("# Source\n{shared_reference}\n{private_reference}\n{missing_reference}"),
-        );
-
-        let visible = d.mcp_read_document(source.id).unwrap().body;
-        assert!(visible.contains(&shared_reference));
-        for secret in [
-            private_target.id.to_string(),
-            missing_id.to_string(),
-            "Private stored label".to_owned(),
-            "Missing stored label".to_owned(),
-        ] {
-            assert!(!visible.contains(&secret));
-        }
-        assert!(
-            d.mcp_search_documents("Private stored label", 50)
-                .unwrap()
-                .is_empty()
-        );
-        assert!(
-            d.mcp_search_documents("Missing stored label", 50)
-                .unwrap()
-                .is_empty()
-        );
-        assert_eq!(
-            d.mcp_search_documents("Visible", 50).unwrap()[0].id,
-            source.id
-        );
-        assert_eq!(
-            visible.contains(&private_target.id.to_string()),
-            visible.contains(&missing_id.to_string())
-        );
-    }
-
-    #[test]
-    fn artifact_dedupes_and_escapes_references_atomically() {
-        let d = database();
-        let note = insert_document(&d, "note", "shared", "user", "2026-08-04", "# a|b]\\c");
-        let artifact = d
-            .mcp_create_artifact("Title", "Body", &[note.id, note.id], None)
-            .unwrap();
-        assert_eq!(artifact.kind, "artifact");
-        assert_eq!(artifact.author, "agent");
-        assert_eq!(artifact.body.matches("[[note:").count(), 1);
-        assert!(artifact.body.contains("a\\|b\\]\\\\c"));
-        let before = d.mcp_search_documents("Title", 50).unwrap().len();
-        assert!(d.mcp_create_artifact("Other", "", &[999999], None).is_err());
-        assert_eq!(d.mcp_search_documents("Other", 50).unwrap().len(), 0);
-        assert_eq!(d.mcp_search_documents("Title", 50).unwrap().len(), before);
-    }
-
-    #[test]
-    fn mcp_body_limits_are_enforced() {
-        let d = database();
-        assert!(matches!(
-            d.mcp_create_daily_attachment(
-                "2026-08-04",
-                "x",
-                &"x".repeat(MAX_BODY_BYTES + 1),
-                None,
-                None
-            ),
-            Err(Error::BodyTooLarge)
-        ));
-        assert!(matches!(
-            d.mcp_create_artifact("x", &"x".repeat(MAX_BODY_BYTES + 1), &[], None),
-            Err(Error::BodyTooLarge)
-        ));
-    }
-
-    #[test]
-    fn daily_attachment_leaves_daily_body_untouched() {
-        let d = database();
-        let daily = insert_document(&d, "daily", "shared", "user", "2026-08-04", "user thoughts");
-        let first = d
-            .mcp_create_daily_attachment("2026-08-04", "Run A", "details a", Some("blocked"), None)
-            .unwrap();
-        let second = d
-            .mcp_create_daily_attachment("2026-08-04", "Run B", "details b", Some("failed"), None)
-            .unwrap();
-        assert_ne!(first.id, second.id);
-        assert_eq!(first.kind, "artifact");
-        assert_eq!(first.author, "agent");
-        assert_eq!(first.body, "# Run A\n\ndetails a");
-        assert_eq!(document(&d, daily.id).body, "user thoughts");
-        assert_eq!(document(&d, daily.id).revision, 1);
-        let connection = d.connection.lock().unwrap();
-        let mut statement = connection
-            .prepare(
-                "SELECT attached_document_id,status FROM document_attachments
-             WHERE parent_document_id=?1 ORDER BY attached_document_id",
-            )
-            .unwrap();
-        let attachments = statement
-            .query_map([daily.id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert_eq!(
-            attachments,
-            vec![(first.id, "blocked".into()), (second.id, "failed".into())]
-        );
-        drop(statement);
-        drop(connection);
-        assert!(matches!(
-            d.mcp_create_daily_attachment("2026-08-04", "Bad", "x", Some("running"), None),
-            Err(Error::InvalidStatus)
-        ));
-    }
-
-    #[test]
-    fn v6_attachment_migrates_unreviewed_and_reopens() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("archive.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection.execute_batch(
-            "CREATE TABLE documents (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, visibility TEXT NOT NULL, author TEXT NOT NULL, day TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, body TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1);
-             CREATE UNIQUE INDEX documents_daily_day ON documents(day) WHERE kind='daily';
-             CREATE INDEX documents_day ON documents(day);
-             CREATE TABLE presence (session_id TEXT PRIMARY KEY, actor TEXT NOT NULL, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, last_heartbeat INTEGER NOT NULL);
-             CREATE INDEX presence_document ON presence(document_id);
-             CREATE TABLE document_attachments (parent_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, attached_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, status TEXT NOT NULL, PRIMARY KEY(parent_document_id,attached_document_id), UNIQUE(attached_document_id));
-             CREATE INDEX document_attachments_parent ON document_attachments(parent_document_id);
-             CREATE TABLE project_documents (project_document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE, added_by TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(project_document_id,document_id));
-             CREATE INDEX project_documents_document ON project_documents(document_id);
-             INSERT INTO documents VALUES(3,'daily','shared','user','2026-08-01','a','b','daily',2);
-             INSERT INTO documents VALUES(8,'artifact','shared','agent','2026-08-01','c','d','# Work',4);
-             INSERT INTO document_attachments VALUES(3,8,'blocked');
-             PRAGMA user_version=6;",
-        ).unwrap();
-        drop(connection);
-        let database = Database::open(&path).unwrap();
-        assert_eq!(
-            database
-                .connection
-                .lock()
-                .unwrap()
-                .query_row(
-                    "SELECT attached_document_id,status,reviewed_at FROM document_attachments",
-                    [],
-                    |row| Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, Option<String>>(2)?
-                    )),
-                )
-                .unwrap(),
-            (8, "blocked".to_owned(), None)
-        );
-        drop(database);
-        let reopened = Database::open(&path).unwrap();
-        assert_eq!(
-            reopened.connection.lock().unwrap().query_row(
-                "SELECT attached_document_id FROM document_attachments WHERE reviewed_at IS NULL",
-                [],
-                |row| row.get::<_, i64>(0),
-            ).unwrap(),
-            8
-        );
-    }
-
-    #[test]
-    fn invalid_mermaid_rejects_create_and_attachment_without_mutation() {
-        let d = database();
-        let invalid = "```mermaid\nflowchart TD\nA-->\n```";
-        let create_error = d
-            .mcp_create_artifact("Rejected", invalid, &[], None)
-            .unwrap_err();
-        assert!(create_error.to_string().contains("Mermaid block 1"));
-        assert!(d.mcp_search_documents("Rejected", 50).unwrap().is_empty());
-
-        let daily = insert_document(&d, "daily", "shared", "user", "2026-08-04", "before");
-        let attach_error = d
-            .mcp_create_daily_attachment("2026-08-04", "Rejected", invalid, None, None)
-            .unwrap_err();
-        assert!(attach_error.to_string().contains("Mermaid block 1"));
-        assert_eq!(document(&d, daily.id).body, "before");
-        assert_eq!(
-            d.connection
-                .lock()
-                .unwrap()
-                .query_row("SELECT count(*) FROM document_attachments", [], |row| row
-                    .get::<_, i64>(
-                    0
-                ))
-                .unwrap(),
-            0
-        );
-    }
-
-    #[test]
-    fn valid_mermaid_artifact_round_trips_and_existing_daily_is_not_revalidated() {
-        let d = database();
-        let body = "```mermaid\nsequenceDiagram\nAlice->>Bob: Hi\n```";
-        let artifact = d.mcp_create_artifact("Diagram", body, &[], None).unwrap();
-        assert_eq!(
-            d.mcp_read_document(artifact.id).unwrap().body,
-            artifact.body
-        );
-
-        let daily = insert_document(
-            &d,
-            "daily",
-            "shared",
-            "user",
-            "2026-08-04",
-            "```mermaid\ninvalid",
-        );
-        assert!(
-            d.mcp_create_daily_attachment("2026-08-04", "Plain", "plain addition", None, None)
-                .is_ok()
-        );
-        assert_eq!(document(&d, daily.id).body, "```mermaid\ninvalid");
-    }
-}
+mod tests;

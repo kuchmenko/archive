@@ -1,6 +1,7 @@
 mod database;
 mod mcp;
 mod merman;
+mod model;
 
 use database::Database;
 
