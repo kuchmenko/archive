@@ -11,8 +11,6 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, param
 use serde::Serialize;
 
 const SCHEMA_VERSION: i64 = 7;
-const MAX_SESSION_ID_BYTES: usize = 128;
-const PRESENCE_TTL_SECONDS: i64 = 10;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const SEARCH_RESULT_LIMIT: usize = 50;
 const MAX_REFERENCE_IDS: usize = 200;
@@ -48,7 +46,6 @@ pub enum Error {
     TooManyReferenceIds,
     SearchQueryTooLarge,
     InvalidLimit,
-    InvalidSessionId,
     InvalidMermaid(String),
     MissingDocument(i64),
     UnsupportedSchema(i64),
@@ -81,10 +78,6 @@ impl fmt::Display for Error {
             Self::InvalidLimit => write!(
                 formatter,
                 "limit must be between 1 and {SEARCH_RESULT_LIMIT}"
-            ),
-            Self::InvalidSessionId => write!(
-                formatter,
-                "session id must be non-empty and at most {MAX_SESSION_ID_BYTES} bytes"
             ),
             Self::InvalidMermaid(message) => message.fmt(formatter),
             Self::MissingDocument(id) => write!(formatter, "document {id} does not exist"),
@@ -156,27 +149,6 @@ impl Database {
         let project = sanitize_mcp_document(&connection, project)?;
         let documents = project_documents(&connection, project_id, limit)?;
         Ok((project, sanitize_mcp_documents(&connection, documents)?))
-    }
-
-    pub fn set_agent_presence(&self, session_id: &str, document_id: i64) -> Result<(), Error> {
-        validate_session_id(session_id)?;
-        validate_id(document_id)?;
-        let mut connection = self.connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        if get_shared_document_from(&transaction, document_id)?.is_none() {
-            return Err(Error::MissingDocument(document_id));
-        }
-        delete_stale_presence(&transaction)?;
-        transaction.execute("INSERT INTO presence(session_id, actor, document_id, last_heartbeat) VALUES(?1, 'agent', ?2, unixepoch()) ON CONFLICT(session_id) DO UPDATE SET actor=excluded.actor, document_id=excluded.document_id, last_heartbeat=excluded.last_heartbeat", params![session_id, document_id])?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn remove_presence(&self, session_id: &str) -> Result<(), Error> {
-        validate_session_id(session_id)?;
-        self.connection()?
-            .execute("DELETE FROM presence WHERE session_id=?1", [session_id])?;
-        Ok(())
     }
 
     pub fn mcp_read_document(&self, id: i64) -> Result<Document, Error> {
@@ -517,13 +489,6 @@ fn validate_id(id: i64) -> Result<(), Error> {
         Ok(())
     }
 }
-fn validate_session_id(value: &str) -> Result<(), Error> {
-    if value.is_empty() || value.len() > MAX_SESSION_ID_BYTES {
-        Err(Error::InvalidSessionId)
-    } else {
-        Ok(())
-    }
-}
 fn validate_query(query: &str) -> Result<(), Error> {
     if query.len() > MAX_SEARCH_QUERY_BYTES {
         Err(Error::SearchQueryTooLarge)
@@ -606,13 +571,6 @@ fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Document> {
         body: row.get(7)?,
         revision: row.get(8)?,
     })
-}
-fn delete_stale_presence(connection: &Connection) -> Result<(), Error> {
-    connection.execute(
-        "DELETE FROM presence WHERE last_heartbeat < unixepoch() - ?1",
-        [PRESENCE_TTL_SECONDS],
-    )?;
-    Ok(())
 }
 fn reference_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReferenceSummary> {
     let id = row.get(0)?;
@@ -1399,60 +1357,6 @@ mod tests {
                 |row| row.get::<_, i64>(0),
             ).unwrap(),
             8
-        );
-    }
-
-    #[test]
-    fn stale_presence_expires_and_agents_cannot_claim_private_documents() {
-        let d = database();
-        let shared = insert_document(&d, "note", "shared", "user", "2026-08-04", "");
-        let private = insert_document(&d, "note", "private", "user", "2026-08-04", "");
-        d.set_agent_presence("stale", shared.id).unwrap();
-        d.connection
-            .lock()
-            .unwrap()
-            .execute("UPDATE presence SET last_heartbeat=unixepoch()-11", [])
-            .unwrap();
-        d.set_agent_presence("current", shared.id).unwrap();
-        let connection = d.connection.lock().unwrap();
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT count(*) FROM presence WHERE session_id='stale'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            connection
-                .query_row(
-                    "SELECT document_id FROM presence WHERE session_id='current'",
-                    [],
-                    |row| row.get::<_, i64>(0)
-                )
-                .unwrap(),
-            shared.id
-        );
-        drop(connection);
-        assert!(matches!(
-            d.set_agent_presence("agent", private.id),
-            Err(Error::MissingDocument(_))
-        ));
-        assert!(matches!(
-            d.set_agent_presence("agent", private.id + 1000),
-            Err(Error::MissingDocument(_))
-        ));
-        d.remove_presence("current").unwrap();
-        assert_eq!(
-            d.connection
-                .lock()
-                .unwrap()
-                .query_row("SELECT count(*) FROM presence", [], |row| row
-                    .get::<_, i64>(0))
-                .unwrap(),
-            0
         );
     }
 

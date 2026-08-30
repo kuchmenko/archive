@@ -155,15 +155,6 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
     let persisted: i64 = observer.query_row("SELECT count(*) FROM project_documents WHERE project_document_id=?1 AND document_id=?2 AND added_by='agent'", [project_id, id], |row| row.get(0)).unwrap();
     assert_eq!(persisted, 1);
 
-    let agent_document: i64 = observer
-        .query_row(
-            "SELECT document_id FROM presence WHERE actor='agent'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(agent_document, project_id);
-
     for (request_id, title, body, status) in [
         (7, "First run", "first attachment", "blocked"),
         (8, "Second run", "second attachment", "failed"),
@@ -212,14 +203,6 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
         )
         .unwrap();
     assert_eq!(attachment_count, 2);
-    let agent_on_artifact: i64 = observer
-        .query_row(
-            "SELECT count(*) FROM presence p JOIN documents d ON d.id=p.document_id WHERE p.actor='agent' AND d.kind='artifact'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(agent_on_artifact, 1);
 
     send(
         &mut stdin,
@@ -247,8 +230,4 @@ fn built_binary_stdio_stays_clean_across_invalid_and_valid_mermaid_calls() {
     assert!(output.status.success());
     assert!(remaining_stdout.is_empty());
     assert!(output.stderr.is_empty());
-    let remaining_presence: i64 = observer
-        .query_row("SELECT count(*) FROM presence", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(remaining_presence, 0);
 }
