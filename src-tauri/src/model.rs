@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -320,6 +319,22 @@ pub struct Relation {
     pub retracted: Option<Retraction>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ImportMetadata {
+    pub legacy: LegacyImportMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct LegacyImportMetadata {
+    pub created_at: String,
+    pub updated_at: String,
+    pub author: String,
+    pub day: String,
+    pub kind: String,
+    pub visibility: String,
+    pub revision: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct Record {
     pub id: i64,
@@ -335,7 +350,7 @@ pub struct Record {
     pub labels: Vec<Label>,
     pub relations: Vec<Relation>,
     pub lifecycle_history: Vec<LifecycleTransition>,
-    pub import_metadata: Option<Value>,
+    pub import_metadata: Option<ImportMetadata>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]

@@ -716,10 +716,7 @@ fn v7_migration_preserves_legacy_data_hides_private_and_reopens_idempotently() {
     assert_eq!(source.id, 4);
     assert_eq!(source.kind, RecordKind::Note);
     assert_eq!(source.labels[0].canonical, "workflow:inbox");
-    assert_eq!(
-        source.import_metadata.as_ref().unwrap()["legacy"]["revision"],
-        3
-    );
+    assert_eq!(source.import_metadata.as_ref().unwrap().legacy.revision, 3);
     assert!(matches!(
         database.read_record(7, false),
         Err(Error::MissingRecord(7))
@@ -840,10 +837,7 @@ fn historical_v1_migration_still_preserves_merged_body_and_id() {
         panic!()
     };
     assert_eq!(body, "first\n\nsecond");
-    assert_eq!(
-        record.import_metadata.unwrap()["legacy"]["day"],
-        "2026-08-02"
-    );
+    assert_eq!(record.import_metadata.unwrap().legacy.day, "2026-08-02");
     assert_eq!(
         database
             .connection

@@ -69,6 +69,9 @@ fn generated_router_has_exact_structured_record_tools_and_closed_payload_schema(
     assert!(schema.contains("idempotency_key"));
     assert!(schema.contains("label_ids"));
     assert!(schema.contains("sources"));
+    let output_schema = create.output_schema.as_ref().unwrap();
+    let import_metadata = &output_schema["properties"]["import_metadata"];
+    assert!(import_metadata.is_object());
 
     let add_relation = tools
         .iter()
