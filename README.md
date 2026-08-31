@@ -42,7 +42,7 @@ The seeded scope is `global`. The seeded fallback label is `workflow:inbox`. Lab
 
 - Scopes: `create_scope`, `list_scopes`
 - Labels: `create_label`, `search_labels`, `add_label`, `retract_label`
-- Records: `create_record`, `search_records`, `read_record`, `revise_record`
+- Records: `create_record`, `search_records`, `recall_context`, `read_record`, `revise_record`
 - Embeddings: `embedding_status`, `sync_embeddings`, `semantic_search_records`
 - Relations: `add_relation`, `retract_relation`, `list_relations`
 - Lifecycle: `transition_record`, `supersede_record`, `merge_records`
@@ -82,6 +82,10 @@ A minimal `create_record` argument is:
 Search defaults to the exact requested scope, active lifecycle, and current revisions. `include_global` adds the global scope. Results use descending record IDs as a stable order and `next_before_id` for pagination. `search_records` uses FTS5 over current readable titles and payloads; deterministic kind, lifecycle, and label filters are applied with a match explanation. `include_history` returns revision history for matching current records; historical revisions are not separate FTS matches.
 
 `semantic_search_records` is a separate similarity search. It uses one 768-dimensional, L2-normalized vector for each whole readable record: the normalized title plus its typed payload values. It does not chunk records. Inference uses CPUExecutionProvider, batch size 1, CLS pooling, and a disabled CPU memory arena. Vectors are stored as revision-bound little-endian FP32 blobs and compared by brute-force cosine similarity in Rust. Scope, global opt-in, kind, lifecycle, label, readability, and history behavior match deterministic search.
+
+`recall_context` retrieves top-20 OR/BM25 and Granite candidates, deduplicates them, and returns 3–5 compact evidence records when the filters admit at least three matches. Each evidence record contains identity, scope, lifecycle, current-revision provenance, up to three source references with `source_count`, a query-relevant excerpt, BM25/dense/RRF scores, and a match explanation. It never returns labels, relations, history, or the full payload. `max_bytes` bounds the serialized structured result deterministically from 4,000 through 32,000 bytes and defaults to 12,000. Exact full records remain available through `read_record`.
+
+Dense ordering is used when the selected model is installed and its derived index is complete. BM25 ordering keeps recall available when semantic retrieval is unavailable.
 
 Embeddings are a rebuildable derived index, not canonical record data. When the model is installed, `create_record`, `revise_record`, `supersede_record`, and `merge_records` synchronously generate all missing or stale embeddings before returning success. `sync_embeddings` and `archive embeddings backfill` remain available for initial installation and recovery. Semantic search refuses to return a partial index while any readable record is missing its current embedding. Unreadable legacy private records are never passed to the model or stored in the embedding index.
 

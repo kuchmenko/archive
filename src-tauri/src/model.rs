@@ -120,6 +120,95 @@ impl RecordPayload {
             Self::Evidence { .. } => RecordKind::Evidence,
         }
     }
+
+    pub fn text(&self) -> String {
+        let mut values = Vec::new();
+        match self {
+            Self::Note { body } => values.push(body.clone()),
+            Self::Observation {
+                statement,
+                observed_at,
+            } => {
+                values.push(statement.clone());
+                push_option(&mut values, observed_at);
+            }
+            Self::Decision {
+                choice,
+                question,
+                rationale,
+                decided_at,
+            } => {
+                values.push(choice.clone());
+                push_option(&mut values, question);
+                push_option(&mut values, rationale);
+                push_option(&mut values, decided_at);
+            }
+            Self::Idea { proposal } => values.push(proposal.clone()),
+            Self::Snippet {
+                language,
+                code,
+                origin,
+                runtime,
+                dependencies,
+            } => {
+                values.push(language.clone());
+                values.push(code.clone());
+                values.push(match origin {
+                    SnippetOrigin::Imported => "imported".to_owned(),
+                    SnippetOrigin::Generated => "generated".to_owned(),
+                });
+                push_option(&mut values, runtime);
+                if let Some(dependencies) = dependencies {
+                    values.extend(dependencies.iter().cloned());
+                }
+            }
+            Self::Metric {
+                name,
+                value,
+                unit,
+                observed_at,
+                interval,
+                dimensions,
+                method,
+            } => {
+                values.push(name.clone());
+                values.push(
+                    serde_json::Number::from_f64(*value)
+                        .map_or_else(|| value.to_string(), |value| value.to_string()),
+                );
+                values.push(unit.clone());
+                push_option(&mut values, observed_at);
+                if let Some(interval) = interval {
+                    values.push(format!("start: {}", interval.start));
+                    values.push(format!("end: {}", interval.end));
+                }
+                values.extend(
+                    dimensions
+                        .iter()
+                        .map(|(key, value)| format!("{key}: {value}")),
+                );
+                push_option(&mut values, method);
+            }
+            Self::Evidence {
+                claim,
+                action,
+                outcome,
+                impact,
+            } => {
+                values.push(claim.clone());
+                push_option(&mut values, action);
+                push_option(&mut values, outcome);
+                push_option(&mut values, impact);
+            }
+        }
+        values.join("\n")
+    }
+}
+
+fn push_option(values: &mut Vec<String>, value: &Option<String>) {
+    if let Some(value) = value {
+        values.push(value.clone());
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -378,6 +467,66 @@ pub struct SemanticSearchResult {
     pub model: String,
     pub model_revision: String,
     pub dimensions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecallStrategy {
+    Bm25,
+    Dense,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct RecallScope {
+    pub id: i64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct RecallSource {
+    pub id: i64,
+    pub identity: String,
+    pub locator: Option<String>,
+    pub version: Option<String>,
+    pub content_hash: Option<String>,
+    pub anchor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct RecallScores {
+    pub matched_by: Vec<RecallStrategy>,
+    pub bm25_rank: Option<usize>,
+    pub bm25_score: Option<f64>,
+    pub dense_rank: Option<usize>,
+    pub dense_similarity: Option<f32>,
+    pub rrf_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct RecallEvidence {
+    pub record_id: i64,
+    pub kind: RecordKind,
+    pub title: String,
+    pub excerpt: String,
+    pub scope: RecallScope,
+    pub lifecycle: Lifecycle,
+    pub current_revision: i64,
+    pub provenance: Provenance,
+    pub sources: Vec<RecallSource>,
+    pub source_count: usize,
+    pub retrieval: RecallScores,
+    pub match_explanation: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct RecallContext {
+    pub strategy: RecallStrategy,
+    pub semantic_available: bool,
+    pub model: Option<String>,
+    pub model_revision: Option<String>,
+    pub budget_bytes: usize,
+    pub used_bytes: usize,
+    pub records: Vec<RecallEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]

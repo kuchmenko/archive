@@ -8,13 +8,13 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::database::{Database, Error};
+use crate::database::{DEFAULT_RECALL_BUDGET_BYTES, Database, Error};
 use crate::embeddings::{self, DIMENSIONS, Embeddings, MODEL, MODEL_REVISION};
 use crate::merman::{self, MermaidResult};
 use crate::model::{
-    DirectRelationKind, EmbeddingStatus, EmbeddingSync, Label, Lifecycle, LifecycleTarget, Record,
-    RecordInput, RecordKind, RecordPayload, Relation, Scope, SearchPage, SemanticSearchResult,
-    SourceInput, WriteContext,
+    DirectRelationKind, EmbeddingStatus, EmbeddingSync, Label, Lifecycle, LifecycleTarget,
+    RecallContext, Record, RecordInput, RecordKind, RecordPayload, Relation, Scope, SearchPage,
+    SemanticSearchResult, SourceInput, WriteContext,
 };
 
 #[derive(Clone)]
@@ -80,6 +80,18 @@ struct SemanticSearchRecordsArgs {
     label_ids: Option<Vec<i64>>,
     include_history: Option<bool>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct RecallContextArgs {
+    query: String,
+    scope_id: i64,
+    include_global: Option<bool>,
+    kinds: Option<Vec<RecordKind>>,
+    lifecycles: Option<Vec<Lifecycle>>,
+    label_ids: Option<Vec<i64>>,
+    max_bytes: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -326,6 +338,42 @@ impl ArchiveMcp {
                 args.label_ids.as_deref().unwrap_or(&[]),
                 args.include_history.unwrap_or(false),
                 args.limit.unwrap_or(20),
+            )
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(
+        description = "Recall 3–5 bounded evidence excerpts from durable Archive knowledge. Uses benchmark-selected dense ordering when the complete local embedding index is available and BM25 otherwise; read_record remains the exact full-record follow-up."
+    )]
+    fn recall_context(
+        &self,
+        Parameters(args): Parameters<RecallContextArgs>,
+    ) -> Result<Json<RecallContext>, String> {
+        let semantic_available = self.embeddings.is_installed()
+            && self
+                .embeddings
+                .status(&self.database)
+                .map_err(embedding_tool_error)?
+                .pending_records
+                == 0;
+        let embedding = semantic_available
+            .then(|| self.embeddings.embed_query(&args.query))
+            .transpose()
+            .map_err(embedding_tool_error)?;
+        self.database
+            .recall_context(
+                &args.query,
+                embedding.as_deref(),
+                MODEL,
+                MODEL_REVISION,
+                DIMENSIONS,
+                args.scope_id,
+                args.include_global.unwrap_or(false),
+                args.kinds.as_deref().unwrap_or(&[]),
+                args.lifecycles.as_deref().unwrap_or(&[]),
+                args.label_ids.as_deref().unwrap_or(&[]),
+                args.max_bytes.unwrap_or(DEFAULT_RECALL_BUDGET_BYTES),
             )
             .map(Json)
             .map_err(tool_error)

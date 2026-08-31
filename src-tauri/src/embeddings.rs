@@ -18,7 +18,7 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     database::{self, Database, EmbeddingRecord},
-    model::{EmbeddingStatus, EmbeddingSync, RecordPayload, SnippetOrigin},
+    model::{EmbeddingStatus, EmbeddingSync},
 };
 
 pub const MODEL: &str = "ibm-granite/granite-embedding-311m-multilingual-r2";
@@ -363,100 +363,7 @@ fn link_or_copy(source: &Path, destination: &Path) -> Result<(), Error> {
 }
 
 fn record_text(record: &EmbeddingRecord) -> String {
-    normalize_text(&format!(
-        "{}\n{}",
-        record.title,
-        payload_text(&record.payload)
-    ))
-}
-
-fn payload_text(payload: &RecordPayload) -> String {
-    let mut values = Vec::new();
-    match payload {
-        RecordPayload::Note { body } => values.push(body.clone()),
-        RecordPayload::Observation {
-            statement,
-            observed_at,
-        } => {
-            values.push(statement.clone());
-            push_option(&mut values, observed_at);
-        }
-        RecordPayload::Decision {
-            choice,
-            question,
-            rationale,
-            decided_at,
-        } => {
-            values.push(choice.clone());
-            push_option(&mut values, question);
-            push_option(&mut values, rationale);
-            push_option(&mut values, decided_at);
-        }
-        RecordPayload::Idea { proposal } => values.push(proposal.clone()),
-        RecordPayload::Snippet {
-            language,
-            code,
-            origin,
-            runtime,
-            dependencies,
-        } => {
-            values.push(language.clone());
-            values.push(code.clone());
-            values.push(match origin {
-                SnippetOrigin::Imported => "imported".to_owned(),
-                SnippetOrigin::Generated => "generated".to_owned(),
-            });
-            push_option(&mut values, runtime);
-            if let Some(dependencies) = dependencies {
-                values.extend(dependencies.iter().cloned());
-            }
-        }
-        RecordPayload::Metric {
-            name,
-            value,
-            unit,
-            observed_at,
-            interval,
-            dimensions,
-            method,
-        } => {
-            values.push(name.clone());
-            values.push(
-                serde_json::Number::from_f64(*value)
-                    .map_or_else(|| value.to_string(), |value| value.to_string()),
-            );
-            values.push(unit.clone());
-            push_option(&mut values, observed_at);
-            if let Some(interval) = interval {
-                values.push(format!("start: {}", interval.start));
-                values.push(format!("end: {}", interval.end));
-            }
-            values.extend(
-                dimensions
-                    .iter()
-                    .map(|(key, value)| format!("{key}: {value}")),
-            );
-            push_option(&mut values, method);
-        }
-        RecordPayload::Evidence {
-            claim,
-            action,
-            outcome,
-            impact,
-        } => {
-            values.push(claim.clone());
-            push_option(&mut values, action);
-            push_option(&mut values, outcome);
-            push_option(&mut values, impact);
-        }
-    }
-    values.join("\n")
-}
-
-fn push_option(values: &mut Vec<String>, value: &Option<String>) {
-    if let Some(value) = value {
-        values.push(value.clone());
-    }
+    normalize_text(&format!("{}\n{}", record.title, record.payload.text()))
 }
 
 fn normalize_text(value: &str) -> String {
@@ -475,6 +382,8 @@ fn ort_error<R>(error: ort::Error<R>) -> Error {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    use crate::model::RecordPayload;
 
     use super::*;
 

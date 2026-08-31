@@ -31,6 +31,7 @@ fn generated_router_has_exact_structured_record_tools_and_closed_payload_schema(
             "list_scopes",
             "merge_records",
             "read_record",
+            "recall_context",
             "retract_label",
             "retract_relation",
             "revise_record",
@@ -106,6 +107,40 @@ fn generated_router_has_exact_structured_record_tools_and_closed_payload_schema(
     assert!(!schema.contains("\"active\""));
     assert!(!schema.contains("\"superseded\""));
     assert!(!schema.contains("\"merged\""));
+
+    let recall = tools
+        .iter()
+        .find(|tool| tool.name == "recall_context")
+        .unwrap();
+    let schema = serde_json::to_string(&recall.input_schema).unwrap();
+    for field in [
+        "query",
+        "scope_id",
+        "include_global",
+        "kinds",
+        "lifecycles",
+        "label_ids",
+        "max_bytes",
+    ] {
+        assert!(schema.contains(field));
+    }
+    assert!(!schema.contains("include_history"));
+    let output = serde_json::to_string(recall.output_schema.as_ref().unwrap()).unwrap();
+    for field in [
+        "record_id",
+        "excerpt",
+        "provenance",
+        "sources",
+        "retrieval",
+        "match_explanation",
+        "budget_bytes",
+        "used_bytes",
+    ] {
+        assert!(output.contains(field));
+    }
+    for excluded in ["payload", "history", "labels", "relations", "quote"] {
+        assert!(!output.contains(excluded));
+    }
 }
 
 #[test]
@@ -194,6 +229,24 @@ async fn duplex_dispatches_typed_create_search_read_and_rejects_unknown_fields()
         .structured_content
         .unwrap();
     assert_eq!(searched["records"][0]["record"]["id"], id);
+    let recalled = client
+        .call_tool(
+            CallToolRequestParams::new("recall_context").with_arguments(
+                json!({"scope_id": 1, "query": "typed body", "max_bytes": 4000})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .structured_content
+        .unwrap();
+    assert_eq!(recalled["strategy"], "bm25");
+    assert_eq!(recalled["semantic_available"], false);
+    assert_eq!(recalled["records"][0]["record_id"], id);
+    assert!(recalled["records"][0].get("payload").is_none());
+    assert!(recalled["used_bytes"].as_u64().unwrap() <= 4000);
     let read = client
         .call_tool(
             CallToolRequestParams::new("read_record").with_arguments(

@@ -91,7 +91,7 @@ fn mcp_stdio_built_binary_runs_representative_record_flow_with_clean_framing() {
     );
     let tools = response(&mut stdout, 2);
     let tools = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 20);
+    assert_eq!(tools.len(), 21);
     assert!(tools.iter().all(|tool| {
         tool.get("inputSchema").is_some() && tool["outputSchema"]["type"] == "object"
     }));
@@ -271,10 +271,28 @@ fn mcp_stdio_built_binary_runs_representative_record_flow_with_clean_framing() {
             .iter()
             .any(|value| value == "fts:title_or_payload")
     );
-    let read = call(
+    let recalled = call(
         &mut stdin,
         &mut stdout,
         13,
+        "recall_context",
+        json!({
+            "scope_id": work_id,
+            "query": "corrected knowledge",
+            "label_ids": [label_id],
+            "max_bytes": 4000
+        }),
+    );
+    let recalled = &recalled["result"]["structuredContent"];
+    assert_eq!(recalled["strategy"], "bm25");
+    assert_eq!(recalled["semantic_available"], false);
+    assert_eq!(recalled["records"][0]["record_id"], record_id);
+    assert!(recalled["records"][0].get("payload").is_none());
+    assert!(recalled["used_bytes"].as_u64().unwrap() <= 4000);
+    let read = call(
+        &mut stdin,
+        &mut stdout,
+        14,
         "read_record",
         json!({"record_id": record_id, "include_history": true}),
     );
@@ -285,12 +303,12 @@ fn mcp_stdio_built_binary_runs_representative_record_flow_with_clean_framing() {
     let mermaid = call(
         &mut stdin,
         &mut stdout,
-        14,
+        15,
         "validate_mermaid",
         json!({"source": "flowchart TD\nA-->B"}),
     );
     assert_eq!(mermaid["result"]["structuredContent"]["valid"], true);
-    let embeddings = call(&mut stdin, &mut stdout, 15, "embedding_status", json!({}));
+    let embeddings = call(&mut stdin, &mut stdout, 16, "embedding_status", json!({}));
     assert_eq!(
         embeddings["result"]["structuredContent"]["eligible_records"],
         2

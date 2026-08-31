@@ -539,6 +539,321 @@ fn scopes_global_opt_in_filters_and_pagination_are_deterministic() {
 }
 
 #[test]
+fn bm25_recall_uses_or_matches_relevance_order_and_deterministic_ties() {
+    let database = database();
+    let partial = create_note(&database, "bm25-partial", "Partial", "alpha only");
+    let relevant = create_note(
+        &database,
+        "bm25-relevant",
+        "Relevant",
+        "alpha beta beta beta",
+    );
+    let strict = database
+        .search_records(Some("alpha beta"), 1, false, &[], &[], &[], false, None, 20)
+        .unwrap();
+    assert_eq!(strict.records.len(), 1);
+    assert_eq!(strict.records[0].record.id, relevant.id);
+    let ranked = database
+        .bm25_search_records("alpha beta", 1, false, &[], &[], &[], 20)
+        .unwrap();
+    assert_eq!(ranked[0].record.id, relevant.id);
+    assert!(ranked.iter().any(|hit| hit.record.id == partial.id));
+
+    let older = create_note(&database, "bm25-tie-old", "Tie", "equal terms");
+    let newer = create_note(&database, "bm25-tie-new", "Tie", "equal terms");
+    let tied = database
+        .bm25_search_records("equal terms", 1, false, &[], &[], &[], 20)
+        .unwrap();
+    assert_eq!(
+        tied.iter()
+            .take(2)
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>(),
+        vec![newer.id, older.id]
+    );
+}
+
+#[test]
+fn recall_filtering_matches_search_and_excludes_unreadable_records() {
+    let database = database();
+    let work = database
+        .create_scope("work", &context("recall-filter-work"))
+        .unwrap();
+    let other = database
+        .create_scope("other", &context("recall-filter-other"))
+        .unwrap();
+    let rust = database
+        .create_label(
+            "topic",
+            "rust",
+            "Rust",
+            &[],
+            &context("recall-filter-label"),
+        )
+        .unwrap();
+    let eligible = database
+        .create_record(
+            &note(work.id, vec![rust.id], "Eligible", "filter needle"),
+            &context("recall-filter-eligible"),
+        )
+        .unwrap();
+    let global = database
+        .create_record(
+            &note(1, vec![rust.id], "Global", "filter needle"),
+            &context("recall-filter-global"),
+        )
+        .unwrap();
+    let other_scope = database
+        .create_record(
+            &note(other.id, vec![rust.id], "Other", "filter needle"),
+            &context("recall-filter-other-record"),
+        )
+        .unwrap();
+    let other_kind = database
+        .create_record(
+            &RecordInput {
+                scope_id: work.id,
+                title: "Idea".to_owned(),
+                payload: RecordPayload::Idea {
+                    proposal: "filter needle".to_owned(),
+                },
+                sources: Vec::new(),
+                label_ids: vec![rust.id],
+            },
+            &context("recall-filter-kind"),
+        )
+        .unwrap();
+    let wrong_label = database
+        .create_record(
+            &note(work.id, vec![1], "Inbox", "filter needle"),
+            &context("recall-filter-inbox"),
+        )
+        .unwrap();
+    let retracted = database
+        .create_record(
+            &note(work.id, vec![rust.id], "Retracted", "filter needle"),
+            &context("recall-filter-retracted"),
+        )
+        .unwrap();
+    database
+        .transition_record(
+            retracted.id,
+            &Lifecycle::Retracted,
+            "exclude from active recall",
+            &context("recall-filter-transition"),
+        )
+        .unwrap();
+    {
+        let connection = database.connection.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO records(id,scope_id,kind,title,lifecycle,current_revision,readable,created_at,updated_at,actor,thread,client,idempotency_key)
+                 VALUES(900,?1,'note','Hidden','active',1,0,'now','now','agent','hidden','test','recall-hidden')",
+                [work.id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO record_revisions(record_id,revision,title,payload_json,reason,created_at,actor,thread,client,idempotency_key)
+                 VALUES(900,1,'Hidden','{\"kind\":\"note\",\"body\":\"filter needle\"}','hidden','now','agent','hidden','test','recall-hidden-revision')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO record_fts(record_id,title,payload) VALUES(900,'Hidden','filter needle')",
+                [],
+            )
+            .unwrap();
+    }
+    let filtered = database
+        .recall_context(
+            "filter needle",
+            None,
+            "unused",
+            "unused",
+            2,
+            work.id,
+            false,
+            &[RecordKind::Note],
+            &[],
+            &[rust.id],
+            DEFAULT_RECALL_BUDGET_BYTES,
+        )
+        .unwrap();
+    assert_eq!(
+        filtered
+            .records
+            .iter()
+            .map(|record| record.record_id)
+            .collect::<Vec<_>>(),
+        vec![eligible.id]
+    );
+    let with_global = database
+        .recall_context(
+            "filter needle",
+            None,
+            "unused",
+            "unused",
+            2,
+            work.id,
+            true,
+            &[RecordKind::Note],
+            &[],
+            &[rust.id],
+            DEFAULT_RECALL_BUDGET_BYTES,
+        )
+        .unwrap();
+    let ids = with_global
+        .records
+        .iter()
+        .map(|record| record.record_id)
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&eligible.id));
+    assert!(ids.contains(&global.id));
+    for excluded in [
+        other_scope.id,
+        other_kind.id,
+        wrong_label.id,
+        retracted.id,
+        900,
+    ] {
+        assert!(!ids.contains(&excluded));
+    }
+}
+
+#[test]
+fn recall_deduplicates_dense_and_bm25_candidates_and_uses_dense_ordering() {
+    let database = database();
+    let records = [
+        ("first", "no lexical match", [0.8, 0.6]),
+        ("second", "dense needle", [1.0, 0.0]),
+        ("third", "another body", [0.6, 0.8]),
+        ("fourth", "another body", [0.6, 0.8]),
+        ("fifth", "needle lexical only", [0.0, 1.0]),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (title, body, vector))| {
+        let record = create_note(&database, &format!("recall-dense-{index}"), title, body);
+        (record, vector)
+    })
+    .collect::<Vec<_>>();
+    for (record, vector) in &records {
+        database
+            .store_embedding(record.id, 1, "test/recall", "v1", 2, vector)
+            .unwrap();
+    }
+    let result = database
+        .recall_context(
+            "needle",
+            Some(&[1.0, 0.0]),
+            "test/recall",
+            "v1",
+            2,
+            1,
+            false,
+            &[],
+            &[],
+            &[],
+            DEFAULT_RECALL_BUDGET_BYTES,
+        )
+        .unwrap();
+    assert_eq!(result.strategy, RecallStrategy::Dense);
+    assert!(result.semantic_available);
+    assert_eq!(result.records.len(), 5);
+    assert_eq!(result.records[0].record_id, records[1].0.id);
+    assert_eq!(result.records[1].record_id, records[0].0.id);
+    assert_eq!(result.records[2].record_id, records[3].0.id);
+    assert_eq!(result.records[3].record_id, records[2].0.id);
+    assert_eq!(
+        result
+            .records
+            .iter()
+            .filter(|record| record.record_id == records[1].0.id)
+            .count(),
+        1
+    );
+    assert_eq!(
+        result.records[0].retrieval.matched_by,
+        vec![RecallStrategy::Bm25, RecallStrategy::Dense]
+    );
+    assert!(result.records[0].retrieval.rrf_score.unwrap() > 1.0 / 61.0);
+}
+
+#[test]
+fn recall_returns_bounded_excerpts_with_current_sources_and_provenance() {
+    let database = database();
+    for index in 0..5 {
+        let mut sources = Vec::new();
+        for source_index in 0..4 {
+            sources.push(SourceInput {
+                identity: format!("source-{index}-{source_index}"),
+                ..source()
+            });
+        }
+        database
+            .create_record(
+                &RecordInput {
+                    scope_id: 1,
+                    title: format!("Evidence {index}"),
+                    payload: RecordPayload::Observation {
+                        statement: format!(
+                            "{} query-relevant-marker {}",
+                            "leading context ".repeat(80),
+                            "trailing context ".repeat(80)
+                        ),
+                        observed_at: Some("2026-08-31T10:00:00Z".to_owned()),
+                    },
+                    sources,
+                    label_ids: vec![1],
+                },
+                &context(&format!("recall-budget-{index}")),
+            )
+            .unwrap();
+    }
+    let result = database
+        .recall_context(
+            "query-relevant-marker",
+            None,
+            "unused",
+            "unused",
+            2,
+            1,
+            false,
+            &[],
+            &[],
+            &[],
+            4_000,
+        )
+        .unwrap();
+    assert!((3..=5).contains(&result.records.len()));
+    assert_eq!(result.strategy, RecallStrategy::Bm25);
+    assert!(!result.semantic_available);
+    assert_eq!(
+        serde_json::to_vec(&result).unwrap().len(),
+        result.used_bytes
+    );
+    assert!(result.used_bytes <= result.budget_bytes);
+    for record in &result.records {
+        assert!(record.excerpt.contains("query-relevant-marker"));
+        assert!(record.excerpt.len() < 1_000);
+        assert_eq!(record.scope.name, "global");
+        assert_eq!(record.lifecycle, Lifecycle::Active);
+        assert_eq!(record.current_revision, 1);
+        assert_eq!(record.provenance.actor, "agent-a");
+        assert_eq!(record.source_count, 4);
+        assert_eq!(record.sources.len(), 3);
+    }
+    let json = serde_json::to_value(result).unwrap();
+    let record = &json["records"][0];
+    for excluded in ["payload", "history", "labels", "relations"] {
+        assert!(record.get(excluded).is_none());
+    }
+    assert!(record["sources"][0].get("quote").is_none());
+}
+
+#[test]
 fn embedding_index_is_complete_revision_bound_private_safe_and_filterable() {
     let database = database();
     let work = database
