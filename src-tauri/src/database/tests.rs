@@ -47,13 +47,23 @@ fn create_note(database: &Database, key: &str, title: &str, body: &str) -> Recor
 }
 
 #[test]
-fn fresh_schema_is_v8_and_seeds_global_inbox() {
+fn fresh_schema_is_v9_and_seeds_global_inbox() {
     let database = database();
     let connection = database.connection.lock().unwrap();
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
+    assert_eq!(
+        connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE type='table' AND name='record_embeddings'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+        1
+    );
     assert_eq!(
         connection
             .query_row("SELECT name FROM scopes WHERE id=1", [], |row| {
@@ -80,6 +90,37 @@ fn fresh_schema_is_v8_and_seeds_global_inbox() {
     assert_eq!(
         connection
             .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn v8_migration_adds_the_derived_embedding_index_without_changing_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("archive.sqlite3");
+    let id = {
+        let database = Database::open(&path).unwrap();
+        create_note(&database, "v8-record", "Preserved", "body").id
+    };
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute("DROP TABLE record_embeddings", [])
+        .unwrap();
+    connection.pragma_update(None, "user_version", 8).unwrap();
+    drop(connection);
+    let database = Database::open(&path).unwrap();
+    assert_eq!(database.read_record(id, false).unwrap().title, "Preserved");
+    let connection = database.connection.lock().unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 9);
+    assert_eq!(
+        connection
+            .query_row("SELECT count(*) FROM record_embeddings", [], |row| {
                 row.get::<_, i64>(0)
             })
             .unwrap(),
@@ -494,6 +535,266 @@ fn scopes_global_opt_in_filters_and_pagination_are_deterministic() {
         with_global.records[0]
             .match_explanation
             .contains(&"fts:title_or_payload".to_owned())
+    );
+}
+
+#[test]
+fn embedding_index_is_complete_revision_bound_private_safe_and_filterable() {
+    let database = database();
+    let work = database
+        .create_scope("work", &context("embedding-scope"))
+        .unwrap();
+    let rust = database
+        .create_label("topic", "rust", "Rust", &[], &context("embedding-label"))
+        .unwrap();
+    let global = create_note(&database, "embedding-global", "Global", "global body");
+    let first = database
+        .create_record(
+            &note(work.id, vec![1], "First", "first body"),
+            &context("embedding-first"),
+        )
+        .unwrap();
+    let first = database
+        .add_label(
+            first.id,
+            rust.id,
+            "semantic filter",
+            &context("embedding-first-label"),
+        )
+        .unwrap();
+    let second = database
+        .create_record(
+            &note(work.id, vec![1], "Second", "second body"),
+            &context("embedding-second"),
+        )
+        .unwrap();
+    let model = "test/embedding";
+    let revision = "revision-1";
+    for (record, vector) in [
+        (&global, [1.0, 0.0]),
+        (&first, [0.8, 0.6]),
+        (&second, [0.8, 0.6]),
+    ] {
+        assert!(
+            database
+                .store_embedding(record.id, 1, model, revision, 2, &vector)
+                .unwrap()
+        );
+    }
+    assert_eq!(
+        database.embedding_status(model, revision, 2).unwrap(),
+        EmbeddingStatus {
+            model: model.to_owned(),
+            model_revision: revision.to_owned(),
+            dimensions: 2,
+            eligible_records: 3,
+            indexed_records: 3,
+            pending_records: 0,
+        }
+    );
+    let exact = database
+        .semantic_search_records(
+            &[1.0, 0.0],
+            model,
+            revision,
+            2,
+            work.id,
+            false,
+            &[],
+            &[],
+            &[],
+            false,
+            20,
+        )
+        .unwrap();
+    assert_eq!(
+        exact
+            .records
+            .iter()
+            .map(|hit| hit.record.id)
+            .collect::<Vec<_>>(),
+        vec![second.id, first.id]
+    );
+    assert_eq!(exact.records[0].similarity, 0.8);
+    let with_global = database
+        .semantic_search_records(
+            &[1.0, 0.0],
+            model,
+            revision,
+            2,
+            work.id,
+            true,
+            &[RecordKind::Note],
+            &[Lifecycle::Active],
+            &[1],
+            false,
+            20,
+        )
+        .unwrap();
+    assert_eq!(with_global.records[0].record.id, global.id);
+    assert_eq!(with_global.records.len(), 3);
+    assert!(
+        with_global.records[0]
+            .match_explanation
+            .contains(&"semantic:cosine".to_owned())
+    );
+    let labeled = database
+        .semantic_search_records(
+            &[1.0, 0.0],
+            model,
+            revision,
+            2,
+            work.id,
+            false,
+            &[],
+            &[],
+            &[rust.id],
+            false,
+            20,
+        )
+        .unwrap();
+    assert_eq!(labeled.records.len(), 1);
+    assert_eq!(labeled.records[0].record.id, first.id);
+    database
+        .transition_record(
+            first.id,
+            &Lifecycle::Retracted,
+            "test lifecycle filter",
+            &context("embedding-retract"),
+        )
+        .unwrap();
+    let active = database
+        .semantic_search_records(
+            &[1.0, 0.0],
+            model,
+            revision,
+            2,
+            work.id,
+            false,
+            &[],
+            &[],
+            &[],
+            false,
+            20,
+        )
+        .unwrap();
+    assert_eq!(active.records.len(), 1);
+    assert_eq!(active.records[0].record.id, second.id);
+    let retracted = database
+        .semantic_search_records(
+            &[1.0, 0.0],
+            model,
+            revision,
+            2,
+            work.id,
+            false,
+            &[],
+            &[Lifecycle::Retracted],
+            &[],
+            false,
+            20,
+        )
+        .unwrap();
+    assert_eq!(retracted.records[0].record.id, first.id);
+    {
+        let connection = database.connection.lock().unwrap();
+        connection
+            .execute(
+                "INSERT INTO records(id,scope_id,kind,title,lifecycle,current_revision,readable,created_at,updated_at,actor,thread,client,idempotency_key)
+                 VALUES(900,1,'note','Private','active',1,0,'now','now','user','private','test','private-record')",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO record_revisions(record_id,revision,title,payload_json,reason,created_at,actor,thread,client,idempotency_key)
+                 VALUES(900,1,'Private','{\"kind\":\"note\",\"body\":\"secret\"}','private','now','user','private','test','private-revision')",
+                [],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        database
+            .embedding_status(model, revision, 2)
+            .unwrap()
+            .pending_records,
+        0
+    );
+    assert!(
+        database
+            .pending_embedding_records(model, revision, 2)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        database.store_embedding(900, 1, model, revision, 2, &[1.0, 0.0]),
+        Err(Error::MissingRecord(900))
+    ));
+    let revised = database
+        .revise_record(
+            second.id,
+            1,
+            "Second revised",
+            &RecordPayload::Note {
+                body: "revised body".to_owned(),
+            },
+            &[],
+            "correct text",
+            &context("embedding-revision"),
+        )
+        .unwrap();
+    let status = database.embedding_status(model, revision, 2).unwrap();
+    assert_eq!(status.eligible_records, 3);
+    assert_eq!(status.indexed_records, 2);
+    assert_eq!(status.pending_records, 1);
+    assert!(
+        database
+            .semantic_search_records(
+                &[1.0, 0.0],
+                model,
+                revision,
+                2,
+                work.id,
+                false,
+                &[],
+                &[],
+                &[],
+                false,
+                20,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("run sync_embeddings")
+    );
+    let pending = database
+        .pending_embedding_records(model, revision, 2)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, second.id);
+    assert_eq!(pending[0].revision, 2);
+    assert!(
+        !database
+            .store_embedding(second.id, 1, model, revision, 2, &[0.0, 1.0])
+            .unwrap()
+    );
+    assert!(
+        database
+            .store_embedding(
+                second.id,
+                revised.current_revision,
+                model,
+                revision,
+                2,
+                &[0.0, 1.0]
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        database
+            .embedding_status(model, revision, 2)
+            .unwrap()
+            .pending_records,
+        0
     );
 }
 

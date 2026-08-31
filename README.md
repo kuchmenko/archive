@@ -1,6 +1,6 @@
 # Archive
 
-Archive is a local-only agent knowledge archive. One Rust process stores text and structured JSON in one local SQLite database and exposes typed tools over MCP stdio. It has no HTTP transport, network service, authentication, sync, embeddings, LLM extraction, graph database, binary storage, or GUI.
+Archive is a local-only agent knowledge archive. One Rust process stores text and structured JSON in one local SQLite database, generates local embeddings with ONNX Runtime, and exposes typed tools over MCP stdio. It has no HTTP transport, network service, authentication, remote sync, LLM extraction, graph database, binary storage, or GUI.
 
 ## Build and run
 
@@ -10,6 +10,17 @@ cargo run --manifest-path src-tauri/Cargo.toml -- mcp
 ```
 
 The release executable is `src-tauri/target/release/archive`. `archive mcp` stores SQLite data at the platform data directory under `dev.kuchmenko.archive/archive.sqlite3`. On Linux, `XDG_DATA_HOME` selects a different data root.
+
+The selected embedding runtime is the official FP32 ONNX export of `ibm-granite/granite-embedding-311m-multilingual-r2` at revision `44399559930365213510b1ee2eb15ded83374f0e`. Archive does not download models. Install an existing Hugging Face snapshot, inspect coverage, and generate missing embeddings explicitly:
+
+```sh
+snapshot="$HOME/.cache/huggingface/hub/models--ibm-granite--granite-embedding-311m-multilingual-r2/snapshots/44399559930365213510b1ee2eb15ded83374f0e"
+archive embeddings install "$snapshot"
+archive embeddings status
+archive embeddings backfill
+```
+
+The installer verifies the exact model and tokenizer sizes and SHA-256 hashes, then hard-links them into the application data directory when both locations use the same filesystem. It copies them otherwise.
 
 ## Record model
 
@@ -32,6 +43,7 @@ The seeded scope is `global`. The seeded fallback label is `workflow:inbox`. Lab
 - Scopes: `create_scope`, `list_scopes`
 - Labels: `create_label`, `search_labels`, `add_label`, `retract_label`
 - Records: `create_record`, `search_records`, `read_record`, `revise_record`
+- Embeddings: `embedding_status`, `sync_embeddings`, `semantic_search_records`
 - Relations: `add_relation`, `retract_relation`, `list_relations`
 - Lifecycle: `transition_record`, `supersede_record`, `merge_records`
 - Validation: `validate_mermaid`
@@ -67,11 +79,15 @@ A minimal `create_record` argument is:
 }
 ```
 
-Search defaults to the exact requested scope, active lifecycle, and current revisions. `include_global` adds the global scope. Results use descending record IDs as a stable order and `next_before_id` for pagination. FTS5 searches current readable titles and payloads; deterministic kind, lifecycle, and label filters are applied with a match explanation. `include_history` returns revision history for matching current records; historical revisions are not separate FTS matches.
+Search defaults to the exact requested scope, active lifecycle, and current revisions. `include_global` adds the global scope. Results use descending record IDs as a stable order and `next_before_id` for pagination. `search_records` uses FTS5 over current readable titles and payloads; deterministic kind, lifecycle, and label filters are applied with a match explanation. `include_history` returns revision history for matching current records; historical revisions are not separate FTS matches.
+
+`semantic_search_records` is a separate similarity search. It uses one 768-dimensional, L2-normalized vector for each whole readable record: the normalized title plus its typed payload values. It does not chunk records. Inference uses CPUExecutionProvider, batch size 1, CLS pooling, and a disabled CPU memory arena. Vectors are stored as revision-bound little-endian FP32 blobs and compared by brute-force cosine similarity in Rust. Scope, global opt-in, kind, lifecycle, label, readability, and history behavior match deterministic search.
+
+Embeddings are a rebuildable derived index, not canonical record data. Creating or revising a readable record makes the index pending until `sync_embeddings` or `archive embeddings backfill` runs. Semantic search refuses to return a partial index while any readable record is missing its current embedding. Unreadable legacy private records are never passed to the model or stored in the embedding index.
 
 ## Migration
 
-Schema version 8 adds the typed record model in one transaction while retaining all version 1–7 migrations and every legacy table. Each legacy document becomes a global `note` record with the same numeric ID and exact stored body, plus `workflow:inbox`. Legacy timestamps, author, day, kind, visibility, and revision are retained in import metadata. Existing project memberships and daily attachments stay in their legacy tables.
+Schema version 8 adds the typed record model in one transaction while retaining all version 1–7 migrations and every legacy table. Schema version 9 adds the revision-bound derived embedding index. Each legacy document becomes a global `note` record with the same numeric ID and exact stored body, plus `workflow:inbox`. Legacy timestamps, author, day, kind, visibility, and revision are retained in import metadata. Existing project memberships and daily attachments stay in their legacy tables.
 
 Valid legacy `[[note:id|label]]` links become `references` relations. Legacy private records are imported as unreadable compatibility data and are omitted from MCP reads, relation results, and FTS. Links to private records remain unchanged in canonical imported bodies but are removed from agent-facing payloads and the rebuildable FTS index.
 

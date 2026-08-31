@@ -364,3 +364,34 @@ pub struct SearchPage {
     pub records: Vec<SearchHit>,
     pub next_before_id: Option<i64>,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct SemanticSearchHit {
+    pub record: Record,
+    pub similarity: f32,
+    pub match_explanation: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
+pub struct SemanticSearchResult {
+    pub records: Vec<SemanticSearchHit>,
+    pub model: String,
+    pub model_revision: String,
+    pub dimensions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct EmbeddingStatus {
+    pub model: String,
+    pub model_revision: String,
+    pub dimensions: usize,
+    pub eligible_records: usize,
+    pub indexed_records: usize,
+    pub pending_records: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
+pub struct EmbeddingSync {
+    pub indexed_records: usize,
+    pub status: EmbeddingStatus,
+}

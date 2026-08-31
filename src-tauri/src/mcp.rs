@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use rmcp::{
     ServiceExt,
@@ -9,15 +9,18 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 
 use crate::database::{Database, Error};
+use crate::embeddings::{self, DIMENSIONS, Embeddings, MODEL, MODEL_REVISION};
 use crate::merman::{self, MermaidResult};
 use crate::model::{
-    DirectRelationKind, Label, Lifecycle, LifecycleTarget, Record, RecordInput, RecordKind,
-    RecordPayload, Relation, Scope, SearchPage, SourceInput, WriteContext,
+    DirectRelationKind, EmbeddingStatus, EmbeddingSync, Label, Lifecycle, LifecycleTarget, Record,
+    RecordInput, RecordKind, RecordPayload, Relation, Scope, SearchPage, SemanticSearchResult,
+    SourceInput, WriteContext,
 };
 
 #[derive(Clone)]
 pub struct ArchiveMcp {
     database: Arc<Database>,
+    embeddings: Arc<Embeddings>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -63,6 +66,19 @@ struct SearchRecordsArgs {
     label_ids: Option<Vec<i64>>,
     include_history: Option<bool>,
     before_id: Option<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SemanticSearchRecordsArgs {
+    query: String,
+    scope_id: i64,
+    include_global: Option<bool>,
+    kinds: Option<Vec<RecordKind>>,
+    lifecycles: Option<Vec<Lifecycle>>,
+    label_ids: Option<Vec<i64>>,
+    include_history: Option<bool>,
     limit: Option<usize>,
 }
 
@@ -175,11 +191,19 @@ fn tool_error(error: Error) -> String {
     }
 }
 
+fn embedding_tool_error(error: embeddings::Error) -> String {
+    match error {
+        embeddings::Error::Database(error) => tool_error(error),
+        error => error.to_string(),
+    }
+}
+
 #[tool_router(server_handler)]
 impl ArchiveMcp {
-    pub fn new(database: Database) -> Self {
+    pub fn new(database: Database, data_directory: &Path) -> Self {
         Self {
             database: Arc::new(database),
+            embeddings: Arc::new(Embeddings::new(data_directory)),
         }
     }
 
@@ -262,6 +286,53 @@ impl ArchiveMcp {
             )
             .map(Json)
             .map_err(tool_error)
+    }
+
+    #[tool(
+        description = "Search complete current Archive embeddings by semantic similarity with the same scope, lifecycle, kind, and label eligibility rules as deterministic search"
+    )]
+    fn semantic_search_records(
+        &self,
+        Parameters(args): Parameters<SemanticSearchRecordsArgs>,
+    ) -> Result<Json<SemanticSearchResult>, String> {
+        let embedding = self
+            .embeddings
+            .embed_query(&args.query)
+            .map_err(embedding_tool_error)?;
+        self.database
+            .semantic_search_records(
+                &embedding,
+                MODEL,
+                MODEL_REVISION,
+                DIMENSIONS,
+                args.scope_id,
+                args.include_global.unwrap_or(false),
+                args.kinds.as_deref().unwrap_or(&[]),
+                args.lifecycles.as_deref().unwrap_or(&[]),
+                args.label_ids.as_deref().unwrap_or(&[]),
+                args.include_history.unwrap_or(false),
+                args.limit.unwrap_or(20),
+            )
+            .map(Json)
+            .map_err(tool_error)
+    }
+
+    #[tool(description = "Report coverage of the selected local whole-record embedding index")]
+    fn embedding_status(&self) -> Result<Json<EmbeddingStatus>, String> {
+        self.embeddings
+            .status(&self.database)
+            .map(Json)
+            .map_err(embedding_tool_error)
+    }
+
+    #[tool(
+        description = "Generate selected local whole-record embeddings for all readable records that are missing or stale"
+    )]
+    fn sync_embeddings(&self) -> Result<Json<EmbeddingSync>, String> {
+        self.embeddings
+            .sync(&self.database)
+            .map(Json)
+            .map_err(embedding_tool_error)
     }
 
     #[tool(
@@ -412,8 +483,11 @@ impl ArchiveMcp {
     }
 }
 
-pub async fn run(database: Database) -> Result<(), Box<dyn std::error::Error>> {
-    ArchiveMcp::new(database)
+pub async fn run(
+    database: Database,
+    data_directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    ArchiveMcp::new(database, data_directory)
         .serve(stdio())
         .await?
         .waiting()

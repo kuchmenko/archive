@@ -5,7 +5,10 @@ use serde_json::json;
 use super::*;
 
 fn server() -> ArchiveMcp {
-    ArchiveMcp::new(Database::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap())
+    ArchiveMcp::new(
+        Database::open(tempfile::NamedTempFile::new().unwrap().path()).unwrap(),
+        std::env::temp_dir().as_path(),
+    )
 }
 
 #[test]
@@ -23,6 +26,7 @@ fn generated_router_has_exact_structured_record_tools_and_closed_payload_schema(
             "create_label",
             "create_record",
             "create_scope",
+            "embedding_status",
             "list_relations",
             "list_scopes",
             "merge_records",
@@ -32,7 +36,9 @@ fn generated_router_has_exact_structured_record_tools_and_closed_payload_schema(
             "revise_record",
             "search_labels",
             "search_records",
+            "semantic_search_records",
             "supersede_record",
+            "sync_embeddings",
             "transition_record",
             "validate_mermaid",
         ]
@@ -106,7 +112,7 @@ fn generated_router_has_exact_structured_record_tools_and_closed_payload_schema(
 fn hidden_and_missing_record_errors_are_identical() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("archive.sqlite3");
-    let archive = ArchiveMcp::new(Database::open(&path).unwrap());
+    let archive = ArchiveMcp::new(Database::open(&path).unwrap(), directory.path());
     let observer = Connection::open(path).unwrap();
     observer
         .execute(

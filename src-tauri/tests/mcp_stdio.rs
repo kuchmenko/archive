@@ -91,7 +91,7 @@ fn mcp_stdio_built_binary_runs_representative_record_flow_with_clean_framing() {
     );
     let tools = response(&mut stdout, 2);
     let tools = tools["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 17);
+    assert_eq!(tools.len(), 20);
     assert!(tools.iter().all(|tool| {
         tool.get("inputSchema").is_some() && tool["outputSchema"]["type"] == "object"
     }));
@@ -290,6 +290,15 @@ fn mcp_stdio_built_binary_runs_representative_record_flow_with_clean_framing() {
         json!({"source": "flowchart TD\nA-->B"}),
     );
     assert_eq!(mermaid["result"]["structuredContent"]["valid"], true);
+    let embeddings = call(&mut stdin, &mut stdout, 15, "embedding_status", json!({}));
+    assert_eq!(
+        embeddings["result"]["structuredContent"]["eligible_records"],
+        2
+    );
+    assert_eq!(
+        embeddings["result"]["structuredContent"]["pending_records"],
+        2
+    );
 
     let observer = Connection::open(&database_path).unwrap();
     observer.busy_timeout(Duration::from_secs(5)).unwrap();

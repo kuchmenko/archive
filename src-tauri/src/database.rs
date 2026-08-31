@@ -11,12 +11,13 @@ use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, 
 use serde_json::{Value, json};
 
 use crate::model::{
-    DirectRelationKind, Label, Lifecycle, LifecycleTransition, Provenance, Record, RecordInput,
-    RecordKind, RecordPayload, Relation, RelationKind, Retraction, Revision, Scope, SearchHit,
-    SearchPage, SnippetOrigin, SourceInput, SourceReference, WriteContext,
+    DirectRelationKind, EmbeddingStatus, Label, Lifecycle, LifecycleTransition, Provenance, Record,
+    RecordInput, RecordKind, RecordPayload, Relation, RelationKind, Retraction, Revision, Scope,
+    SearchHit, SearchPage, SemanticSearchHit, SemanticSearchResult, SnippetOrigin, SourceInput,
+    SourceReference, WriteContext,
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const MAX_SEARCH_QUERY_BYTES: usize = 256;
 const SEARCH_RESULT_LIMIT: usize = 50;
 pub const MAX_BODY_BYTES: usize = 1_000_000;
@@ -85,6 +86,13 @@ impl From<rusqlite::Error> for Error {
 
 pub struct Database {
     connection: Mutex<Connection>,
+}
+
+pub struct EmbeddingRecord {
+    pub id: i64,
+    pub revision: i64,
+    pub title: String,
+    pub payload: RecordPayload,
 }
 
 impl Database {
@@ -415,6 +423,256 @@ impl Database {
         Ok(SearchPage {
             records,
             next_before_id,
+        })
+    }
+
+    pub fn embedding_status(
+        &self,
+        model: &str,
+        model_revision: &str,
+        dimensions: usize,
+    ) -> Result<EmbeddingStatus, Error> {
+        validate_embedding_model(model, model_revision, dimensions)?;
+        let connection = self.connection()?;
+        embedding_status_from(&connection, model, model_revision, dimensions)
+    }
+
+    pub fn pending_embedding_records(
+        &self,
+        model: &str,
+        model_revision: &str,
+        dimensions: usize,
+    ) -> Result<Vec<EmbeddingRecord>, Error> {
+        validate_embedding_model(model, model_revision, dimensions)?;
+        let connection = self.connection()?;
+        let rows = {
+            let mut statement = connection.prepare(
+                "SELECT r.id,r.current_revision,r.title,rr.payload_json,r.import_metadata IS NOT NULL
+                 FROM records r
+                 JOIN record_revisions rr
+                   ON rr.record_id=r.id AND rr.revision=r.current_revision
+                 LEFT JOIN record_embeddings e
+                   ON e.record_id=r.id AND e.model=?1 AND e.model_revision=?2
+                 WHERE r.readable=1
+                   AND (e.record_id IS NULL OR e.revision<>r.current_revision OR e.dimensions<>?3)
+                 ORDER BY r.id",
+            )?;
+            statement
+                .query_map(params![model, model_revision, dimensions as i64], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, bool>(4)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        rows.into_iter()
+            .map(|(id, revision, title, payload_json, imported)| {
+                let mut payload: RecordPayload = serde_json::from_str(&payload_json)?;
+                if imported {
+                    sanitize_imported_payload(&connection, &mut payload)?;
+                }
+                Ok(EmbeddingRecord {
+                    id,
+                    revision,
+                    title,
+                    payload,
+                })
+            })
+            .collect()
+    }
+
+    pub fn store_embedding(
+        &self,
+        record_id: i64,
+        revision: i64,
+        model: &str,
+        model_revision: &str,
+        dimensions: usize,
+        embedding: &[f32],
+    ) -> Result<bool, Error> {
+        validate_id("record_id", record_id)?;
+        validate_id("revision", revision)?;
+        validate_embedding_model(model, model_revision, dimensions)?;
+        validate_embedding(embedding, dimensions)?;
+        let vector = embedding
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        let mut connection = self.connection()?;
+        let transaction = immediate(&mut connection)?;
+        let current_revision: Option<i64> = transaction
+            .query_row(
+                "SELECT current_revision FROM records WHERE id=?1 AND readable=1",
+                [record_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(current_revision) = current_revision else {
+            return Err(Error::MissingRecord(record_id));
+        };
+        if current_revision != revision {
+            return Ok(false);
+        }
+        transaction.execute(
+            "INSERT INTO record_embeddings(record_id,revision,model,model_revision,dimensions,vector,embedded_at)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(record_id,model,model_revision) DO UPDATE SET
+               revision=excluded.revision,
+               dimensions=excluded.dimensions,
+               vector=excluded.vector,
+               embedded_at=excluded.embedded_at",
+            params![
+                record_id,
+                revision,
+                model,
+                model_revision,
+                dimensions as i64,
+                vector,
+                now()
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn semantic_search_records(
+        &self,
+        query_embedding: &[f32],
+        model: &str,
+        model_revision: &str,
+        dimensions: usize,
+        scope_id: i64,
+        include_global: bool,
+        kinds: &[RecordKind],
+        lifecycles: &[Lifecycle],
+        label_ids: &[i64],
+        include_history: bool,
+        limit: usize,
+    ) -> Result<SemanticSearchResult, Error> {
+        validate_embedding_model(model, model_revision, dimensions)?;
+        validate_embedding(query_embedding, dimensions)?;
+        validate_id("scope_id", scope_id)?;
+        validate_limit(limit)?;
+        let label_ids = distinct_ids("label_ids", label_ids, MAX_LABEL_IDS)?;
+        let connection = self.connection()?;
+        if scope_from(&connection, scope_id)?.is_none() {
+            return Err(Error::MissingScope(scope_id));
+        }
+        for id in &label_ids {
+            if label_from(&connection, *id)?.is_none() {
+                return Err(Error::MissingLabel(*id));
+            }
+        }
+        let status = embedding_status_from(&connection, model, model_revision, dimensions)?;
+        if status.pending_records != 0 {
+            return Err(Error::Conflict(format!(
+                "embedding index has {} pending records; run sync_embeddings",
+                status.pending_records
+            )));
+        }
+        let lifecycle_values = if lifecycles.is_empty() {
+            vec![Lifecycle::Active]
+        } else {
+            lifecycles.to_vec()
+        };
+        let mut sql = String::from(
+            "SELECT r.id,e.vector FROM record_embeddings e
+             JOIN records r ON r.id=e.record_id AND r.current_revision=e.revision
+             JOIN scopes s ON s.id=r.scope_id
+             WHERE e.model=?1 AND e.model_revision=?2 AND e.dimensions=?3
+               AND r.readable=1 AND (r.scope_id=?4 OR (?5=1 AND s.name='global')) ",
+        );
+        let mut values: Vec<rusqlite::types::Value> = vec![
+            model.to_owned().into(),
+            model_revision.to_owned().into(),
+            (dimensions as i64).into(),
+            scope_id.into(),
+            if include_global { 1_i64 } else { 0_i64 }.into(),
+        ];
+        let mut next = 6;
+        sql.push_str("AND r.lifecycle IN (");
+        push_placeholders(&mut sql, lifecycle_values.len(), &mut next);
+        sql.push_str(") ");
+        values.extend(
+            lifecycle_values
+                .iter()
+                .map(|value| value.as_str().to_owned().into()),
+        );
+        if !kinds.is_empty() {
+            sql.push_str("AND r.kind IN (");
+            push_placeholders(&mut sql, kinds.len(), &mut next);
+            sql.push_str(") ");
+            values.extend(kinds.iter().map(|value| value.as_str().to_owned().into()));
+        }
+        for label_id in &label_ids {
+            sql.push_str(&format!(
+                "AND EXISTS(SELECT 1 FROM label_assertions la WHERE la.record_id=r.id AND la.label_id=?{next} AND NOT EXISTS(SELECT 1 FROM label_retractions lr WHERE lr.assertion_id=la.id)) "
+            ));
+            values.push((*label_id).into());
+            next += 1;
+        }
+        sql.push_str("ORDER BY r.id");
+        let mut statement = connection.prepare(&sql)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut scored = rows
+            .into_iter()
+            .map(|(id, bytes)| {
+                let vector = embedding_from_bytes(&bytes, dimensions)?;
+                let similarity = query_embedding
+                    .iter()
+                    .zip(vector)
+                    .map(|(left, right)| left * right)
+                    .sum::<f32>();
+                Ok((id, similarity))
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        scored.sort_by(|(left_id, left_score), (right_id, right_score)| {
+            right_score
+                .total_cmp(left_score)
+                .then_with(|| right_id.cmp(left_id))
+        });
+        scored.truncate(limit);
+        let mut explanation = vec![
+            "semantic:cosine".to_owned(),
+            format!("model:{model}@{model_revision}"),
+            if include_global {
+                "scope:exact_or_global".to_owned()
+            } else {
+                "scope:exact".to_owned()
+            },
+        ];
+        if !kinds.is_empty() {
+            explanation.push("kind".to_owned());
+        }
+        explanation.push("lifecycle".to_owned());
+        if !label_ids.is_empty() {
+            explanation.push("labels:all".to_owned());
+        }
+        let records = scored
+            .into_iter()
+            .map(|(id, similarity)| {
+                Ok(SemanticSearchHit {
+                    record: record_from(&connection, id, include_history)?
+                        .ok_or(Error::MissingRecord(id))?,
+                    similarity,
+                    match_explanation: explanation.clone(),
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(SemanticSearchResult {
+            records,
+            model: model.to_owned(),
+            model_revision: model_revision.to_owned(),
+            dimensions,
         })
     }
 
@@ -1783,6 +2041,90 @@ fn validate_context(context: &WriteContext) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_embedding_model(
+    model: &str,
+    model_revision: &str,
+    dimensions: usize,
+) -> Result<(), Error> {
+    validate_single_line("embedding model", model, MAX_PROVENANCE_BYTES)?;
+    validate_single_line(
+        "embedding model revision",
+        model_revision,
+        MAX_PROVENANCE_BYTES,
+    )?;
+    if dimensions == 0 || dimensions > 4096 {
+        return Err(Error::Invalid(
+            "embedding dimensions must be between 1 and 4096".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_embedding(embedding: &[f32], dimensions: usize) -> Result<(), Error> {
+    if embedding.len() != dimensions || embedding.iter().any(|value| !value.is_finite()) {
+        return Err(Error::Invalid(
+            "embedding has invalid dimensions or values".to_owned(),
+        ));
+    }
+    let norm = embedding
+        .iter()
+        .map(|value| value * value)
+        .sum::<f32>()
+        .sqrt();
+    if (norm - 1.0).abs() > 0.001 {
+        return Err(Error::Invalid("embedding must be L2-normalized".to_owned()));
+    }
+    Ok(())
+}
+
+fn embedding_from_bytes(bytes: &[u8], dimensions: usize) -> Result<Vec<f32>, Error> {
+    if bytes.len() != dimensions * size_of::<f32>() {
+        return Err(Error::Invalid(
+            "stored embedding has invalid dimensions".to_owned(),
+        ));
+    }
+    let embedding = bytes
+        .chunks_exact(size_of::<f32>())
+        .map(|chunk| {
+            let bytes: [u8; size_of::<f32>()] = chunk.try_into().map_err(|_| {
+                Error::Invalid("stored embedding has invalid dimensions".to_owned())
+            })?;
+            Ok(f32::from_le_bytes(bytes))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    validate_embedding(&embedding, dimensions)?;
+    Ok(embedding)
+}
+
+fn embedding_status_from(
+    connection: &Connection,
+    model: &str,
+    model_revision: &str,
+    dimensions: usize,
+) -> Result<EmbeddingStatus, Error> {
+    let eligible_records: i64 =
+        connection.query_row("SELECT count(*) FROM records WHERE readable=1", [], |row| {
+            row.get(0)
+        })?;
+    let indexed_records: i64 = connection.query_row(
+        "SELECT count(*)
+         FROM records r
+         JOIN record_embeddings e
+           ON e.record_id=r.id AND e.revision=r.current_revision
+         WHERE r.readable=1 AND e.model=?1 AND e.model_revision=?2 AND e.dimensions=?3",
+        params![model, model_revision, dimensions as i64],
+        |row| row.get(0),
+    )?;
+    Ok(EmbeddingStatus {
+        model: model.to_owned(),
+        model_revision: model_revision.to_owned(),
+        dimensions,
+        eligible_records: eligible_records as usize,
+        indexed_records: indexed_records as usize,
+        pending_records: (eligible_records - indexed_records) as usize,
+    })
+}
+
 fn validate_id(name: &str, id: i64) -> Result<(), Error> {
     if id > 0 {
         Ok(())
@@ -2049,6 +2391,10 @@ fn migrate(connection: &mut Connection) -> Result<(), Error> {
     if version == 7 {
         migrate_v8(&transaction)?;
     }
+    let version: i64 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 8 {
+        migrate_v9(&transaction)?;
+    }
     transaction.commit()?;
     Ok(())
 }
@@ -2251,6 +2597,26 @@ fn migrate_v8(transaction: &Transaction<'_>) -> Result<(), Error> {
         )?;
     }
     rebuild_fts(transaction)?;
+    Ok(())
+}
+
+fn migrate_v9(transaction: &Transaction<'_>) -> Result<(), Error> {
+    transaction.execute_batch(
+        "CREATE TABLE record_embeddings (
+            record_id INTEGER NOT NULL,
+            revision INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            model_revision TEXT NOT NULL,
+            dimensions INTEGER NOT NULL CHECK(dimensions > 0),
+            vector BLOB NOT NULL CHECK(length(vector) = dimensions * 4),
+            embedded_at TEXT NOT NULL,
+            PRIMARY KEY(record_id,model,model_revision),
+            FOREIGN KEY(record_id,revision) REFERENCES record_revisions(record_id,revision)
+         );
+         CREATE INDEX record_embeddings_model_revision
+           ON record_embeddings(model,model_revision,dimensions,record_id);
+         PRAGMA user_version = 9;",
+    )?;
     Ok(())
 }
 
