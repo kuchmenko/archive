@@ -207,6 +207,23 @@ impl ArchiveMcp {
         }
     }
 
+    fn finish_record_write(&self, record: Result<Record, Error>) -> Result<Json<Record>, String> {
+        let record = record.map_err(tool_error)?;
+        if self.embeddings.is_installed() {
+            let sync = self
+                .embeddings
+                .sync(&self.database)
+                .map_err(embedding_tool_error)?;
+            if sync.status.pending_records != 0 {
+                return Err(format!(
+                    "embedding index still has {} pending records",
+                    sync.status.pending_records
+                ));
+            }
+        }
+        Ok(Json(record))
+    }
+
     #[tool(description = "Create or return one named Archive scope")]
     fn create_scope(
         &self,
@@ -259,10 +276,7 @@ impl ArchiveMcp {
         &self,
         Parameters(args): Parameters<CreateRecordArgs>,
     ) -> Result<Json<Record>, String> {
-        self.database
-            .create_record(&args.record, &args.context)
-            .map(Json)
-            .map_err(tool_error)
+        self.finish_record_write(self.database.create_record(&args.record, &args.context))
     }
 
     #[tool(
@@ -353,18 +367,15 @@ impl ArchiveMcp {
         &self,
         Parameters(args): Parameters<ReviseRecordArgs>,
     ) -> Result<Json<Record>, String> {
-        self.database
-            .revise_record(
-                args.record_id,
-                args.expected_revision,
-                &args.title,
-                &args.payload,
-                &args.sources,
-                &args.reason,
-                &args.context,
-            )
-            .map(Json)
-            .map_err(tool_error)
+        self.finish_record_write(self.database.revise_record(
+            args.record_id,
+            args.expected_revision,
+            &args.title,
+            &args.payload,
+            &args.sources,
+            &args.reason,
+            &args.context,
+        ))
     }
 
     #[tool(description = "Append an active label assertion to a record")]
@@ -447,15 +458,12 @@ impl ArchiveMcp {
         &self,
         Parameters(args): Parameters<SupersedeRecordArgs>,
     ) -> Result<Json<Record>, String> {
-        self.database
-            .supersede_record(
-                args.record_id,
-                &args.replacement,
-                &args.reason,
-                &args.context,
-            )
-            .map(Json)
-            .map_err(tool_error)
+        self.finish_record_write(self.database.supersede_record(
+            args.record_id,
+            &args.replacement,
+            &args.reason,
+            &args.context,
+        ))
     }
 
     #[tool(description = "Create an aggregate and atomically mark all input records merged")]
@@ -463,15 +471,12 @@ impl ArchiveMcp {
         &self,
         Parameters(args): Parameters<MergeRecordsArgs>,
     ) -> Result<Json<Record>, String> {
-        self.database
-            .merge_records(
-                &args.record_ids,
-                &args.aggregate,
-                &args.reason,
-                &args.context,
-            )
-            .map(Json)
-            .map_err(tool_error)
+        self.finish_record_write(self.database.merge_records(
+            &args.record_ids,
+            &args.aggregate,
+            &args.reason,
+            &args.context,
+        ))
     }
 
     #[tool(description = "Validate Mermaid source and return its type and structured diagnostics")]

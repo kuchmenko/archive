@@ -165,6 +165,10 @@ impl Embeddings {
         Ok(database.embedding_status(MODEL, MODEL_REVISION, DIMENSIONS)?)
     }
 
+    pub fn is_installed(&self) -> bool {
+        self.directory.is_dir()
+    }
+
     pub fn sync(&self, database: &Database) -> Result<EmbeddingSync, Error> {
         let records = database.pending_embedding_records(MODEL, MODEL_REVISION, DIMENSIONS)?;
         if records.is_empty() {

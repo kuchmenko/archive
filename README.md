@@ -83,7 +83,7 @@ Search defaults to the exact requested scope, active lifecycle, and current revi
 
 `semantic_search_records` is a separate similarity search. It uses one 768-dimensional, L2-normalized vector for each whole readable record: the normalized title plus its typed payload values. It does not chunk records. Inference uses CPUExecutionProvider, batch size 1, CLS pooling, and a disabled CPU memory arena. Vectors are stored as revision-bound little-endian FP32 blobs and compared by brute-force cosine similarity in Rust. Scope, global opt-in, kind, lifecycle, label, readability, and history behavior match deterministic search.
 
-Embeddings are a rebuildable derived index, not canonical record data. Creating or revising a readable record makes the index pending until `sync_embeddings` or `archive embeddings backfill` runs. Semantic search refuses to return a partial index while any readable record is missing its current embedding. Unreadable legacy private records are never passed to the model or stored in the embedding index.
+Embeddings are a rebuildable derived index, not canonical record data. When the model is installed, `create_record`, `revise_record`, `supersede_record`, and `merge_records` synchronously generate all missing or stale embeddings before returning success. `sync_embeddings` and `archive embeddings backfill` remain available for initial installation and recovery. Semantic search refuses to return a partial index while any readable record is missing its current embedding. Unreadable legacy private records are never passed to the model or stored in the embedding index.
 
 ## Migration
 
