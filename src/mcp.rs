@@ -344,7 +344,7 @@ impl ArchiveMcp {
     }
 
     #[tool(
-        description = "Recall 3–5 bounded evidence excerpts from durable Archive knowledge. Uses benchmark-selected dense ordering when the complete local embedding index is available and BM25 otherwise; read_record remains the exact full-record follow-up."
+        description = "Recall 3–5 bounded evidence excerpts from durable Archive knowledge. Uses dense ordering when the complete local embedding index is available and BM25 otherwise; read_record remains the exact full-record follow-up."
     )]
     fn recall_context(
         &self,

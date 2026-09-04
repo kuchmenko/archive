@@ -2447,10 +2447,10 @@ fn recall_explanation(candidate: &RecallCandidate, semantic_available: bool) -> 
         candidate.bm25_score,
     ) {
         (Some(dense_rank), Some(similarity), Some(bm25_rank), Some(bm25_score)) => format!(
-            "Dense rank {dense_rank} with cosine {similarity:.4}; BM25 rank {bm25_rank} with score {bm25_score:.6}. Dense ordering is the benchmark-selected default."
+            "Dense rank {dense_rank} with cosine {similarity:.4}; BM25 rank {bm25_rank} with score {bm25_score:.6}. Dense ordering is used because the semantic index is complete."
         ),
         (Some(dense_rank), Some(similarity), _, _) => format!(
-            "Dense rank {dense_rank} with cosine {similarity:.4}; no top-{RECALL_CANDIDATE_LIMIT} BM25 match. Dense ordering is the benchmark-selected default."
+            "Dense rank {dense_rank} with cosine {similarity:.4}; no top-{RECALL_CANDIDATE_LIMIT} BM25 match. Dense ordering is used because the semantic index is complete."
         ),
         (_, _, Some(bm25_rank), Some(bm25_score)) if semantic_available => format!(
             "BM25 rank {bm25_rank} with score {bm25_score:.6}; no top-{RECALL_CANDIDATE_LIMIT} dense match."

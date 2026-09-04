@@ -1,42 +1,133 @@
 # Archive
 
-Archive is a local-only agent knowledge archive. One Rust process stores text and structured JSON in one local SQLite database, generates local embeddings with ONNX Runtime, and exposes typed tools over MCP stdio. It has no HTTP transport, network service, authentication, remote sync, LLM extraction, graph database, binary storage, or GUI.
+**Durable local memory for coding agents.**
 
-## Build and run
+Archive gives agents a small, structured knowledge base they can carry across sessions. It stores decisions, observations, evidence, snippets, and other useful context in SQLite, then makes that knowledge available through [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) tools.
+
+Use Archive when chat history is too temporary, but a shared document or hosted memory service is too broad. An agent can save a decision with its source, recall a few relevant excerpts later, and open the full record only when needed.
+
+Archive is:
+
+- **Local:** one process and one SQLite database on your machine
+- **Agent-friendly:** typed MCP tools with bounded recall results
+- **Traceable:** sources, labels, revisions, and lifecycle history stay attached to records
+- **Private by default:** no HTTP server, remote sync, telemetry, or hosted service
+- **Useful without a model:** full-text search and BM25 recall work out of the box
+
+Archive does not copy chat history automatically or decide what an agent should remember. You choose when to read and write knowledge through your agent's instructions.
+
+## Quick start
+
+You need a current stable Rust toolchain.
 
 ```sh
-cargo build --release
-cargo run -- mcp
+git clone https://github.com/kuchmenko/archive.git
+cd archive
+cargo install --locked --path .
 ```
 
-The release executable is `target/release/archive`. `archive mcp` stores SQLite data at the platform data directory under `dev.kuchmenko.archive/archive.sqlite3`. On Linux, `XDG_DATA_HOME` selects a different data root.
+This installs `archive` in Cargo's binary directory, usually `~/.cargo/bin`. Make sure that directory is on your `PATH`.
 
-The selected embedding runtime is the official FP32 ONNX export of `ibm-granite/granite-embedding-311m-multilingual-r2` at revision `44399559930365213510b1ee2eb15ded83374f0e`. Archive does not download models. Install an existing Hugging Face snapshot, inspect coverage, and generate missing embeddings explicitly:
+### Connect an MCP client
 
-```sh
-snapshot="$HOME/.cache/huggingface/hub/models--ibm-granite--granite-embedding-311m-multilingual-r2/snapshots/44399559930365213510b1ee2eb15ded83374f0e"
-archive embeddings install "$snapshot"
-archive embeddings status
-archive embeddings backfill
+Add Archive as a local stdio server in your MCP client:
+
+```json
+{
+  "mcpServers": {
+    "archive": {
+      "command": "archive",
+      "args": ["mcp"]
+    }
+  }
+}
 ```
 
-The installer verifies the exact model and tokenizer sizes and SHA-256 hashes, then hard-links them into the application data directory when both locations use the same filesystem. It copies them otherwise.
+The exact configuration file depends on your client. Use the absolute path to the executable if the client does not inherit your shell's `PATH`.
+
+The client starts `archive mcp` when it needs the server. On first use, Archive creates a `global` scope and a `workflow:inbox` label.
+
+### Give your agent a memory policy
+
+Connecting the tools does not tell an agent when to use them. Add instructions like these to your agent configuration:
+
+```text
+Use Archive for knowledge that will be useful in future sessions, such as
+decisions, verified observations, reusable snippets, and evidence. Recall
+relevant context before starting related work. Save only explicit, durable
+knowledge; do not archive routine chat or unverified guesses. Use read_record
+when a recall excerpt needs its full context or revision history.
+```
+
+## First workflow
+
+An agent can complete a useful write-and-recall flow with four tools:
+
+1. Call `list_scopes` and `search_labels` with `{"query":"workflow:inbox"}`.
+2. Save knowledge with `create_record`, using the returned scope and label IDs.
+3. In a later session, call `recall_context` with a plain-language query.
+4. Call `read_record` for the complete record when an excerpt is relevant.
+
+A minimal `create_record` request looks like this:
+
+```json
+{
+  "record": {
+    "scope_id": 1,
+    "title": "Use transactions for multi-table imports",
+    "payload": {
+      "kind": "decision",
+      "choice": "Commit the imported records and relations in one transaction.",
+      "rationale": "A failed import must not leave partial knowledge behind."
+    },
+    "sources": [],
+    "label_ids": [1]
+  },
+  "context": {
+    "idempotency_key": "import-transaction-decision",
+    "actor": "coding-agent",
+    "thread": "task-123",
+    "client": "mcp-client"
+  }
+}
+```
+
+Recall related knowledge later:
+
+```json
+{
+  "query": "How should multi-table imports handle partial failures?",
+  "scope_id": 1,
+  "include_global": true,
+  "max_bytes": 4000
+}
+```
+
+Use caller-stable idempotency keys for writes. Retrying the same logical write with the same key is safe.
+
+## Privacy and storage
+
+Archive keeps its canonical data in `archive.sqlite3` under the platform data directory `dev.kuchmenko.archive`. On Linux, set `XDG_DATA_HOME` to choose a different data root.
+
+The MCP server communicates only through stdin and stdout. It has no network listener, account system, or remote backup. Files remain subject to your operating system's permissions and backup settings, so protect the data directory as you would any other local private data.
+
+Embeddings are optional and local. Archive does not download a model or send record content to a model provider. Without a model, `recall_context` uses SQLite full-text search and BM25 ordering.
 
 ## Record model
 
-Every record has a title, one primary scope, at least one active controlled label, lifecycle state, server timestamp, and caller-provided actor, thread, client, and idempotency key. Content is a closed tagged payload:
+Every record has a title, one scope, at least one active controlled label, a lifecycle state, a server timestamp, and caller-provided write context. Content uses one of seven typed payloads:
 
-- `note`: `body`
-- `observation`: `statement`, optional `observed_at`; requires a source
-- `decision`: `choice`, optional `question`, `rationale`, and `decided_at`
-- `idea`: `proposal`
-- `snippet`: `language`, `code`, `origin` (`imported` or `generated`), optional `runtime` and `dependencies`; imported snippets require a source locator and content hash
-- `metric`: `name`, numeric `value`, `unit`, optional `observed_at` or interval, dimensions, and method; requires a source
-- `evidence`: `claim`, optional `action`, `outcome`, and `impact`; requires a source
+- `note`: free-form knowledge
+- `observation`: something observed, with a required source
+- `decision`: a choice with optional question, rationale, and date
+- `idea`: a proposal
+- `snippet`: imported or generated code with language and origin metadata
+- `metric`: a measured value with a required source
+- `evidence`: a sourced claim with optional action, outcome, and impact
 
-Sources can carry identity, locator, version, content hash, anchor, and quote. Corrections append immutable revisions with an expected revision and reason. Semantic replacements use `supersede_record`; merges use `merge_records` so input identities and lifecycle histories remain intact.
+Sources can include an identity, locator, version, content hash, anchor, and quote. Corrections append immutable revisions. Records can also be superseded, merged, retracted, labeled, and related without erasing their history.
 
-The seeded scope is `global`. The seeded fallback label is `workflow:inbox`. Labels are explicit stable `facet:key` concepts with display names and aliases. Direct relation creation accepts `references`, `mentions`, `derived_from`, `supports`, `contradicts`, and `summarizes`. `supersedes` and `merged_into` are created only by their lifecycle operations.
+Scopes separate bodies of knowledge. The seeded `global` scope can hold context that applies everywhere. Labels are stable `facet:key` concepts with display names and aliases.
 
 ## MCP tools
 
@@ -48,7 +139,7 @@ The seeded scope is `global`. The seeded fallback label is `workflow:inbox`. Lab
 - Lifecycle: `transition_record`, `supersede_record`, `merge_records`
 - Validation: `validate_mermaid`
 
-Write tools require a context object:
+Write tools require this context:
 
 ```json
 {
@@ -59,47 +150,40 @@ Write tools require a context object:
 }
 ```
 
-A minimal `create_record` argument is:
+`search_records` provides deterministic full-text search and filters. `recall_context` returns 3–5 compact, relevant excerpts within a configurable 4,000–32,000 byte budget when enough records match. `read_record` returns exact content and optional revision history.
 
-```json
-{
-  "record": {
-    "scope_id": 1,
-    "title": "Local design note",
-    "payload": { "kind": "note", "body": "The explicit knowledge." },
-    "sources": [],
-    "label_ids": [1]
-  },
-  "context": {
-    "idempotency_key": "design-note-1",
-    "actor": "agent-name",
-    "thread": "thread-id",
-    "client": "client-name"
-  }
-}
-```
+## Optional semantic search
 
-Search defaults to the exact requested scope, active lifecycle, and current revisions. `include_global` adds the global scope. Results use descending record IDs as a stable order and `next_before_id` for pagination. `search_records` uses FTS5 over current readable titles and payloads; deterministic kind, lifecycle, and label filters are applied with a match explanation. `include_history` returns revision history for matching current records; historical revisions are not separate FTS matches.
-
-`semantic_search_records` is a separate similarity search. It uses one 768-dimensional, L2-normalized vector for each whole readable record: the normalized title plus its typed payload values. It does not chunk records. Inference uses CPUExecutionProvider, batch size 1, CLS pooling, and a disabled CPU memory arena. Vectors are stored as revision-bound little-endian FP32 blobs and compared by brute-force cosine similarity in Rust. Scope, global opt-in, kind, lifecycle, label, readability, and history behavior match deterministic search.
-
-`recall_context` retrieves top-20 OR/BM25 and Granite candidates, deduplicates them, and returns 3–5 compact evidence records when the filters admit at least three matches. Each evidence record contains identity, scope, lifecycle, current-revision provenance, up to three source references with `source_count`, a query-relevant excerpt, BM25/dense/RRF scores, and a match explanation. It never returns labels, relations, history, or the full payload. `max_bytes` bounds the serialized structured result deterministically from 4,000 through 32,000 bytes and defaults to 12,000. Exact full records remain available through `read_record`.
-
-Dense ordering is used when the selected model is installed and its derived index is complete. BM25 ordering keeps recall available when semantic retrieval is unavailable.
-
-Embeddings are a rebuildable derived index, not canonical record data. When the model is installed, `create_record`, `revise_record`, `supersede_record`, and `merge_records` synchronously generate all missing or stale embeddings before returning success. `sync_embeddings` and `archive embeddings backfill` remain available for initial installation and recovery. Semantic search refuses to return a partial index while any readable record is missing its current embedding. Unreadable legacy private records are never passed to the model or stored in the embedding index.
-
-## Migration
-
-Schema version 8 adds the typed record model in one transaction while retaining all version 1–7 migrations and every legacy table. Schema version 9 adds the revision-bound derived embedding index. Each legacy document becomes a global `note` record with the same numeric ID and exact stored body, plus `workflow:inbox`. Legacy timestamps, author, day, kind, visibility, and revision are retained in import metadata. Existing project memberships and daily attachments stay in their legacy tables.
-
-Valid legacy `[[note:id|label]]` links become `references` relations. Legacy private records are imported as unreadable compatibility data and are omitted from MCP reads, relation results, and FTS. Links to private records remain unchanged in canonical imported bodies but are removed from agent-facing payloads and the rebuildable FTS index.
-
-## Verify
+Archive supports the official FP32 ONNX export of [`ibm-granite/granite-embedding-311m-multilingual-r2`](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2) at revision `44399559930365213510b1ee2eb15ded83374f0e`. It does not download the model. Install an existing Hugging Face snapshot explicitly:
 
 ```sh
-just fmt
-just test
-just mcp-stdio
-just clippy
+snapshot="$HOME/.cache/huggingface/hub/models--ibm-granite--granite-embedding-311m-multilingual-r2/snapshots/44399559930365213510b1ee2eb15ded83374f0e"
+archive embeddings install "$snapshot"
+archive embeddings status
+archive embeddings backfill
+```
+
+The installer verifies exact model and tokenizer sizes and SHA-256 hashes. It hard-links files when possible and copies them otherwise.
+
+Archive stores one 768-dimensional vector for each readable record revision. The index is derived data and can be rebuilt. Semantic search is available only when the index is complete, so it never returns silently partial results. `recall_context` uses semantic ordering when the complete index is available and BM25 otherwise.
+
+## Existing databases
+
+Archive applies SQLite migrations at startup. The current schema keeps migrations from the earlier daily-notes application so existing databases can be opened without losing legacy data.
+
+Legacy documents become typed `note` records while their original metadata and tables remain intact. Legacy private records stay unreadable through MCP and are excluded from full-text and embedding indexes.
+
+## Development
+
+Build and run from the repository without installing:
+
+```sh
+cargo build --release
+cargo run -- mcp
+```
+
+Run all checks:
+
+```sh
+just check
 ```

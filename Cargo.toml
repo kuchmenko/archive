@@ -1,7 +1,7 @@
 [package]
 name = "archive"
 version = "0.1.0"
-description = "A local knowledge archive with an MCP stdio server"
+description = "Durable local memory for coding agents, exposed over MCP"
 edition = "2024"
 
 [dependencies]
