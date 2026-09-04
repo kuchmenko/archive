@@ -5,11 +5,11 @@ Archive is a local-only agent knowledge archive. One Rust process stores text an
 ## Build and run
 
 ```sh
-cargo build --release --manifest-path src-tauri/Cargo.toml
-cargo run --manifest-path src-tauri/Cargo.toml -- mcp
+cargo build --release
+cargo run -- mcp
 ```
 
-The release executable is `src-tauri/target/release/archive`. `archive mcp` stores SQLite data at the platform data directory under `dev.kuchmenko.archive/archive.sqlite3`. On Linux, `XDG_DATA_HOME` selects a different data root.
+The release executable is `target/release/archive`. `archive mcp` stores SQLite data at the platform data directory under `dev.kuchmenko.archive/archive.sqlite3`. On Linux, `XDG_DATA_HOME` selects a different data root.
 
 The selected embedding runtime is the official FP32 ONNX export of `ibm-granite/granite-embedding-311m-multilingual-r2` at revision `44399559930365213510b1ee2eb15ded83374f0e`. Archive does not download models. Install an existing Hugging Face snapshot, inspect coverage, and generate missing embeddings explicitly:
 

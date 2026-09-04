@@ -388,7 +388,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn record_text_matches_the_benchmark_contract() {
+    fn record_text_is_normalized_deterministically() {
         let record = EmbeddingRecord {
             id: 1,
             revision: 1,

@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(inline)]
 pub struct WriteContext {
     pub idempotency_key: String,
     pub actor: String,
@@ -14,6 +15,7 @@ pub struct WriteContext {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 pub enum RecordKind {
     Note,
     Observation,
@@ -53,6 +55,7 @@ impl RecordKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 pub enum SnippetOrigin {
     Imported,
     Generated,
@@ -60,6 +63,7 @@ pub enum SnippetOrigin {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(inline)]
 pub struct MetricInterval {
     pub start: String,
     pub end: String,
@@ -213,6 +217,7 @@ fn push_option(values: &mut Vec<String>, value: &Option<String>) {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(inline)]
 pub struct SourceInput {
     pub identity: String,
     pub locator: Option<String>,
@@ -224,6 +229,7 @@ pub struct SourceInput {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+#[schemars(inline)]
 pub struct RecordInput {
     pub scope_id: i64,
     pub title: String,
@@ -272,6 +278,7 @@ pub struct Label {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 pub enum Lifecycle {
     Active,
     Superseded,
@@ -281,6 +288,7 @@ pub enum Lifecycle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 pub enum LifecycleTarget {
     Retracted,
 }
@@ -340,6 +348,7 @@ pub enum RelationKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
+#[schemars(inline)]
 pub enum DirectRelationKind {
     References,
     Mentions,

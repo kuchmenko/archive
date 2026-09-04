@@ -60,6 +60,25 @@ fn generated_router_has_exact_structured_record_tools_and_closed_payload_schema(
         .iter()
         .find(|tool| tool.name == "create_record")
         .unwrap();
+    assert_eq!(
+        create.input_schema["properties"]["record"]["type"],
+        "object"
+    );
+    assert_eq!(
+        create.input_schema["properties"]["context"]["type"],
+        "object"
+    );
+    assert_eq!(
+        create.input_schema["properties"]["record"]["properties"]["payload"]["$ref"],
+        "#/$defs/RecordPayload"
+    );
+    assert_eq!(
+        create.input_schema["$defs"]["RecordPayload"]["oneOf"]
+            .as_array()
+            .unwrap()
+            .len(),
+        7
+    );
     let schema = serde_json::to_string(&create.input_schema).unwrap();
     for kind in [
         "note",
