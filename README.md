@@ -1,14 +1,23 @@
 # Archive
 
-**Durable local memory for coding agents.**
+**Local, inspectable, harness-independent memory for coding agents.**
 
-Archive gives agents a small, structured knowledge base they can carry across sessions. It stores decisions, observations, evidence, snippets, and other useful context in SQLite, then makes that knowledge available through [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) tools.
+Archive is a research project exploring how coding agents can retain useful knowledge across sessions. It runs as a local [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server, with no dependency on a specific agent harness, model provider, or hosted service.
 
-Use Archive when chat history is too temporary, but a shared document or hosted memory service is too broad. An agent can save a decision with its source, recall a few relevant excerpts later, and open the full record only when needed.
+Any MCP-capable agent can use the same structured knowledge base. Archive stores decisions, observations, evidence, snippets, and other useful context in SQLite, then returns a few relevant excerpts within a fixed context budget. Sources and revision history remain available for inspection and correction.
+
+The project explores three questions:
+
+1. What knowledge is worth keeping when an agent can read the code again?
+2. How should an agent retrieve useful context within a fixed token budget?
+3. How can stored knowledge remain inspectable, correctable, and attributable?
+
+Archive focuses on knowledge that cannot be reliably recovered from the current checkout: decisions, rationale, incidents, evidence, preferences, and prior outcomes. It is both a working local MCP server and a testbed for memory policies, retrieval methods, and evaluations.
 
 Archive is:
 
 - **Local:** one process and one SQLite database on your machine
+- **Harness-independent:** usable from any MCP-capable client, without an SDK or framework integration
 - **Agent-friendly:** typed MCP tools with bounded recall results
 - **Traceable:** sources, labels, revisions, and lifecycle history stay attached to records
 - **Private by default:** no HTTP server, remote sync, telemetry, or hosted service
@@ -187,3 +196,7 @@ Run all checks:
 ```sh
 just check
 ```
+
+## License
+
+[MIT](LICENSE)
