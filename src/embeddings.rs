@@ -173,8 +173,10 @@ impl Embeddings {
         Ok(database.embedding_status(MODEL, MODEL_REVISION, DIMENSIONS)?)
     }
 
+    /// Without `model.ort` the model cannot load, so record writes and recall use BM25 only
+    /// instead of failing after the write has already committed.
     pub fn is_installed(&self) -> bool {
-        self.directory.is_dir()
+        self.directory.join("model.ort").is_file()
     }
 
     pub fn sync(&self, database: &Database) -> Result<EmbeddingSync, Error> {
@@ -496,6 +498,17 @@ mod tests {
         let (shape, y) = outputs["Y"].try_extract_tensor::<f32>().unwrap();
         assert_eq!(shape.as_ref(), [3, 2]);
         assert_eq!(y, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn installation_without_ort_model_is_not_installed() {
+        let data_directory = tempfile::tempdir().unwrap();
+        let directory = model_directory(data_directory.path());
+        fs::create_dir_all(&directory).unwrap();
+        assert!(!Embeddings::new(data_directory.path()).is_installed());
+
+        fs::write(directory.join("model.ort"), b"").unwrap();
+        assert!(Embeddings::new(data_directory.path()).is_installed());
     }
 
     #[test]

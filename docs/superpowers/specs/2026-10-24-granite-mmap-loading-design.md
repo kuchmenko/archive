@@ -44,7 +44,7 @@ Embeddings matched the current output: maximum absolute difference 0 with prepac
 - `GraniteModel::load` opens `model.ort` with `memmap2::Mmap` and builds the session with `GraphOptimizationLevel::Disable`, prepacking off, and `commit_from_memory_directly`. That call sets `session.use_ort_model_bytes_directly` and `session.use_ort_model_bytes_for_initializers`, so the weights are read from the mapped bytes.
 - `commit_from_memory_directly` returns `InMemorySession<'m>`, which borrows the mapping. The mapping is leaked with `Box::leak` to get a `&'static` slice. The model already stays loaded for the life of the process, so this does not change behaviour. If unloading after idle time is added later, this part must change.
 - If `model.ort` is missing, loading fails with an error that tells the user to run `archive embeddings install`. MCP never converts the model: up to 12 processes would each write 1.25 GB at once, in the middle of a tool call.
-- `is_installed()` stays a directory check. A missing `model.ort` shows up as the load error above on the first dense call, the same way a broken installation does today.
+- `is_installed()` checks that `model.ort` exists. Without it, record writes skip embedding and `recall_context` uses BM25, so a write never commits and then reports failure. `semantic_search_records` still returns the load error above. (Changed after the final review: a directory check made every record write fail after commit until `install` ran again, which invites duplicate retries.)
 - New dependency: `memmap2`.
 
 ### 3. Prepacking off
