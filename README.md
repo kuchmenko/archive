@@ -174,6 +174,8 @@ archive embeddings backfill
 
 The installer verifies exact model and tokenizer sizes and SHA-256 hashes. It hard-links files when possible and copies them otherwise.
 
+The installer also writes an optimized `model.ort` next to the model. Archive maps that file into memory instead of copying the weights, so several `archive mcp` processes share one copy. Installations made before this change need one more run of `archive embeddings install "$snapshot"`. After upgrading the `ort` dependency, delete `model.ort` and run `install` again.
+
 Archive stores one 768-dimensional vector for each readable record revision. The index is derived data and can be rebuilt. Semantic search is available only when the index is complete, so it never returns silently partial results. `recall_context` uses semantic ordering when the complete index is available and BM25 otherwise.
 
 ## Existing databases
