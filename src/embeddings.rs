@@ -32,6 +32,8 @@ const MODEL_FILE_SIZE: u64 = 1_247_170_481;
 const MODEL_SHA256: &str = "75f9f258bf5013f5fe8a4dad61dd0fd16ac0cbaa7a106e3d3f41c2d04a42d541";
 const TOKENIZER_FILE_SIZE: u64 = 33_384_821;
 const TOKENIZER_SHA256: &str = "0087c868b33bad550a78a08d19798cfd7f713cde4f020803b8f51f405503e15f";
+const DOWNLOAD_URL: &str =
+    "https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2/resolve";
 
 #[derive(Debug)]
 pub enum Error {
@@ -167,6 +169,38 @@ impl Embeddings {
         write_ort_model(&temporary.join("model.onnx"), &temporary.join("model.ort"))?;
         fs::rename(&temporary, &destination)?;
         Ok(destination)
+    }
+
+    /// Downloads the pinned model revision from Hugging Face and installs it. An existing
+    /// installation is only verified, so nothing is downloaded twice.
+    pub fn download_and_install(data_directory: &Path) -> Result<PathBuf, Error> {
+        let destination = model_directory(data_directory);
+        if destination.exists() {
+            // install() ignores the source when the model directory already exists.
+            return Self::install(&destination, data_directory);
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| Error::Invalid("embedding model directory has no parent".to_owned()))?;
+        fs::create_dir_all(parent)?;
+        // Same file system as the model directory, so install() can hard-link instead of copy.
+        let temporary = parent.join(format!(".download-{}", std::process::id()));
+        let result = (|| {
+            fs::create_dir_all(temporary.join("onnx"))?;
+            for (file, size) in [
+                ("onnx/model.onnx", MODEL_FILE_SIZE),
+                ("tokenizer.json", TOKENIZER_FILE_SIZE),
+            ] {
+                eprintln!("downloading {file} ({} MB)", size / 1_000_000);
+                download_file(
+                    &format!("{DOWNLOAD_URL}/{MODEL_REVISION}/{file}"),
+                    &temporary.join(file),
+                )?;
+            }
+            Self::install(&temporary, data_directory)
+        })();
+        let _ = fs::remove_dir_all(&temporary);
+        result
     }
 
     pub fn status(&self, database: &Database) -> Result<EmbeddingStatus, Error> {
@@ -348,11 +382,29 @@ fn write_ort_model(onnx: &Path, ort: &Path) -> Result<(), Error> {
     result
 }
 
+/// Streams `url` into `destination`. The file is created only after a successful response.
+fn download_file(url: &str, destination: &Path) -> Result<(), Error> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(
+            ureq::tls::TlsConfig::builder()
+                .provider(ureq::tls::TlsProvider::NativeTls)
+                .build(),
+        )
+        .build()
+        .into();
+    let response = agent
+        .get(url)
+        .call()
+        .map_err(|error| Error::Invalid(format!("download of {url} failed: {error}")))?;
+    let mut file = File::create(destination)?;
+    std::io::copy(&mut response.into_body().into_reader(), &mut file)?;
+    Ok(())
+}
+
 fn load_ort_session(path: &Path) -> Result<InMemorySession<'static>, Error> {
     if !path.exists() {
         return Err(Error::Invalid(
-            "embedding model.ort is missing; run archive embeddings install <model-snapshot>"
-                .to_owned(),
+            "embedding model.ort is missing; run archive embeddings install".to_owned(),
         ));
     }
     let file = File::open(path)?;
@@ -509,6 +561,42 @@ mod tests {
 
         fs::write(directory.join("model.ort"), b"").unwrap();
         assert!(Embeddings::new(data_directory.path()).is_installed());
+    }
+
+    /// Serves one HTTP response on a local port and returns its URL.
+    fn serve_once(response: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = std::io::Read::read(&mut stream, &mut request);
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        });
+        format!("http://{address}/file")
+    }
+
+    #[test]
+    fn download_writes_response_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("tokenizer.json");
+        let url =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+
+        download_file(&url, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn failed_download_writes_no_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("tokenizer.json");
+        let url =
+            serve_once("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+
+        let error = download_file(&url, &destination).err().unwrap();
+        assert!(error.to_string().contains(&url));
+        assert!(!destination.exists());
     }
 
     #[test]

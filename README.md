@@ -120,7 +120,7 @@ Archive keeps its canonical data in `archive.sqlite3` under the platform data di
 
 The MCP server communicates only through stdin and stdout. It has no network listener, account system, or remote backup. Files remain subject to your operating system's permissions and backup settings, so protect the data directory as you would any other local private data.
 
-Embeddings are optional and local. Archive does not download a model or send record content to a model provider. Without a model, `recall_context` uses SQLite full-text search and BM25 ordering.
+Embeddings are optional and local. Archive downloads a model only when you run `archive embeddings install` without a path, and it never sends record content to a model provider. Without a model, `recall_context` uses SQLite full-text search and BM25 ordering.
 
 ## Record model
 
@@ -163,18 +163,24 @@ Write tools require this context:
 
 ## Optional semantic search
 
-Archive supports the official FP32 ONNX export of [`ibm-granite/granite-embedding-311m-multilingual-r2`](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2) at revision `44399559930365213510b1ee2eb15ded83374f0e`. It does not download the model. Install an existing Hugging Face snapshot explicitly:
+Archive supports the official FP32 ONNX export of [`ibm-granite/granite-embedding-311m-multilingual-r2`](https://huggingface.co/ibm-granite/granite-embedding-311m-multilingual-r2) at revision `44399559930365213510b1ee2eb15ded83374f0e`. Download and install it (about 1.3 GB from Hugging Face):
 
 ```sh
-snapshot="$HOME/.cache/huggingface/hub/models--ibm-granite--granite-embedding-311m-multilingual-r2/snapshots/44399559930365213510b1ee2eb15ded83374f0e"
-archive embeddings install "$snapshot"
+archive embeddings install
 archive embeddings status
 archive embeddings backfill
 ```
 
-The installer verifies exact model and tokenizer sizes and SHA-256 hashes. It hard-links files when possible and copies them otherwise.
+If you already have that Hugging Face snapshot, install from it instead of downloading:
 
-The installer also writes an optimized `model.ort` next to the model. Archive maps that file into memory instead of copying the weights, so several `archive mcp` processes share one copy. Installations made before this change need one more run of `archive embeddings install "$snapshot"`. After upgrading the `ort` dependency, delete `model.ort` and run `install` again.
+```sh
+snapshot="$HOME/.cache/huggingface/hub/models--ibm-granite--granite-embedding-311m-multilingual-r2/snapshots/44399559930365213510b1ee2eb15ded83374f0e"
+archive embeddings install "$snapshot"
+```
+
+Without a path, `install` downloads from the pinned revision only when the model is not installed yet. A failed download leaves nothing behind; run `install` again to retry. The installer verifies exact model and tokenizer sizes and SHA-256 hashes. It hard-links files when possible and copies them otherwise.
+
+The installer also writes an optimized `model.ort` next to the model. Archive maps that file into memory instead of copying the weights, so several `archive mcp` processes share one copy. Installations made before this change need one more run of `archive embeddings install`; it does not download anything when the model is already installed. After upgrading the `ort` dependency, delete `model.ort` and run `install` again.
 
 Archive stores one 768-dimensional vector for each readable record revision. The index is derived data and can be rebuilt. Semantic search is available only when the index is complete, so it never returns silently partial results. `recall_context` uses semantic ordering when the complete index is available and BM25 otherwise.
 
