@@ -8,7 +8,10 @@ use std::{
 
 use ort::{
     ep,
-    session::{Session, builder::GraphOptimizationLevel},
+    session::{
+        InMemorySession, Session,
+        builder::{GraphOptimizationLevel, SessionBuilder},
+    },
     value::TensorRef,
 };
 use serde::{Deserialize, Serialize};
@@ -131,6 +134,10 @@ impl Embeddings {
                 TOKENIZER_SHA256,
                 "tokenizer",
             )?;
+            write_ort_model(
+                &destination.join("model.onnx"),
+                &destination.join("model.ort"),
+            )?;
             return Ok(destination);
         }
         let source_model = fs::canonicalize(source.join("onnx/model.onnx"))?;
@@ -157,6 +164,7 @@ impl Embeddings {
             temporary.join("manifest.json"),
             serde_json::to_vec_pretty(&Manifest::expected())?,
         )?;
+        write_ort_model(&temporary.join("model.onnx"), &temporary.join("model.ort"))?;
         fs::rename(&temporary, &destination)?;
         Ok(destination)
     }
@@ -223,7 +231,7 @@ impl Embeddings {
 
 struct GraniteModel {
     tokenizer: Tokenizer,
-    session: Session,
+    session: InMemorySession<'static>,
 }
 
 impl GraniteModel {
@@ -231,19 +239,7 @@ impl GraniteModel {
         verify_installation(directory)?;
         let tokenizer = Tokenizer::from_file(directory.join("tokenizer.json"))
             .map_err(|error| Error::Tokenizer(error.to_string()))?;
-        let session = Session::builder()?
-            .with_execution_providers([ep::CPU::default()
-                .with_arena_allocator(false)
-                .build()
-                .error_on_failure()])
-            .map_err(ort_error)?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(ort_error)?
-            .with_inter_threads(1)
-            .map_err(ort_error)?
-            .with_memory_pattern(false)
-            .map_err(ort_error)?
-            .commit_from_file(directory.join("model.onnx"))?;
+        let session = load_ort_session(&directory.join("model.ort"))?;
         Ok(Self { tokenizer, session })
     }
 
@@ -302,6 +298,68 @@ impl GraniteModel {
         }
         Ok(embedding)
     }
+}
+
+/// Settings shared by conversion and loading. Prepacking is off because it copies
+/// weights into each process, which defeats sharing the mapped model file.
+fn session_builder(level: GraphOptimizationLevel) -> Result<SessionBuilder, Error> {
+    Session::builder()?
+        .with_execution_providers([ep::CPU::default()
+            .with_arena_allocator(false)
+            .build()
+            .error_on_failure()])
+        .map_err(ort_error)?
+        .with_optimization_level(level)
+        .map_err(ort_error)?
+        .with_inter_threads(1)
+        .map_err(ort_error)?
+        .with_memory_pattern(false)
+        .map_err(ort_error)?
+        .with_prepacking(false)
+        .map_err(ort_error)
+}
+
+/// Writes an optimized ORT-format copy of `onnx` to `ort` unless it already exists.
+/// The file appears only through `rename`, so processes that map it never see it change.
+fn write_ort_model(onnx: &Path, ort: &Path) -> Result<(), Error> {
+    if ort.exists() {
+        return Ok(());
+    }
+    let temporary = ort.with_extension(format!("ort.{}.tmp", std::process::id()));
+    let result = session_builder(GraphOptimizationLevel::Level3)
+        .and_then(|builder| {
+            builder
+                .with_config_entry("session.save_model_format", "ORT")
+                .map_err(ort_error)?
+                .with_optimized_model_path(&temporary)
+                .map_err(ort_error)?
+                .commit_from_file(onnx)
+                .map_err(Error::from)
+        })
+        .and_then(|session| {
+            drop(session);
+            Ok(fs::rename(&temporary, ort)?)
+        });
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn load_ort_session(path: &Path) -> Result<InMemorySession<'static>, Error> {
+    if !path.exists() {
+        return Err(Error::Invalid(
+            "embedding model.ort is missing; run archive embeddings install <model-snapshot>"
+                .to_owned(),
+        ));
+    }
+    let file = File::open(path)?;
+    // SAFETY: model.ort is only ever replaced by rename, never written in place,
+    // so the mapped bytes do not change while the process uses them.
+    let map = unsafe { memmap2::Mmap::map(&file)? };
+    // The model stays loaded for the life of the process, so the mapping is never freed.
+    let bytes: &'static [u8] = Box::leak(Box::new(map));
+    Ok(session_builder(GraphOptimizationLevel::Disable)?.commit_from_memory_directly(bytes)?)
 }
 
 fn model_directory(data_directory: &Path) -> PathBuf {
@@ -407,5 +465,56 @@ mod tests {
             record_text(&record),
             "Résumé metric latency 1.0 ms runtime: ONNX local test"
         );
+    }
+
+    // Y = X * W with a 3x2 initializer W; copied from ONNX Runtime's test datasets (MIT).
+    const MUL_MODEL: &[u8] = include_bytes!("../tests/fixtures/mul_1.onnx");
+
+    #[test]
+    fn ort_model_is_written_once_and_loads_from_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let onnx = directory.path().join("model.onnx");
+        let ort = directory.path().join("model.ort");
+        fs::write(&onnx, MUL_MODEL).unwrap();
+
+        write_ort_model(&onnx, &ort).unwrap();
+        let bytes = fs::read(&ort).unwrap();
+        let modified = fs::metadata(&ort).unwrap().modified().unwrap();
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+
+        write_ort_model(&onnx, &ort).unwrap();
+        assert_eq!(fs::read(&ort).unwrap(), bytes);
+        assert_eq!(fs::metadata(&ort).unwrap().modified().unwrap(), modified);
+
+        let mut session = load_ort_session(&ort).unwrap();
+        let x = [1.0_f32; 6];
+        let outputs = session
+            .run(ort::inputs! {
+                "X" => TensorRef::from_array_view(([3_usize, 2], x.as_slice())).unwrap(),
+            })
+            .unwrap();
+        let (shape, y) = outputs["Y"].try_extract_tensor::<f32>().unwrap();
+        assert_eq!(shape.as_ref(), [3, 2]);
+        assert_eq!(y, [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn missing_ort_model_reports_install_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = load_ort_session(&directory.path().join("model.ort"))
+            .err()
+            .unwrap();
+        assert!(matches!(error, Error::Invalid(_)));
+        assert!(error.to_string().contains("archive embeddings install"));
+    }
+
+    #[test]
+    fn failed_conversion_leaves_no_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let onnx = directory.path().join("model.onnx");
+        fs::write(&onnx, b"not an onnx model").unwrap();
+
+        assert!(write_ort_model(&onnx, &directory.path().join("model.ort")).is_err());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 }
