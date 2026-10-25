@@ -3,8 +3,11 @@ use std::{
     fs::File,
     io::{BufReader, Read},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
 };
+
+use memmap2::{Mmap, UncheckedAdvice};
 
 use ort::{
     ep,
@@ -107,8 +110,13 @@ impl Manifest {
     }
 }
 
+/// A loaded model costs about 110 MB of private memory, mostly the tokenizer.
+pub const MODEL_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 pub struct Embeddings {
     directory: PathBuf,
+    /// Mapped once and kept for the life of the process, because the session borrows it.
+    model_file: OnceLock<&'static Mmap>,
     model: Mutex<Option<GraniteModel>>,
 }
 
@@ -116,6 +124,7 @@ impl Embeddings {
     pub fn new(data_directory: &Path) -> Self {
         Self {
             directory: model_directory(data_directory),
+            model_file: OnceLock::new(),
             model: Mutex::new(None),
         }
     }
@@ -259,12 +268,42 @@ impl Embeddings {
     ) -> Result<T, Error> {
         let mut model = self.model.lock().map_err(|_| Error::Lock)?;
         if model.is_none() {
-            *model = Some(GraniteModel::load(&self.directory)?);
+            let file = match self.model_file.get() {
+                Some(file) => *file,
+                None => {
+                    let file = map_model(&self.directory.join("model.ort"))?;
+                    *self.model_file.get_or_init(|| file)
+                }
+            };
+            *model = Some(GraniteModel::load(&self.directory, file)?);
             release_freed_memory();
         }
-        let result = operation(model.as_mut().expect("embedding model was initialized"));
+        let loaded = model.as_mut().expect("embedding model was initialized");
+        let result = operation(loaded);
+        loaded.last_used = Instant::now();
         release_freed_memory();
         result
+    }
+
+    /// Drops the tokenizer and session after `idle` without use; the next call loads them again.
+    /// Skips a model that is in use right now.
+    pub fn unload_if_idle(&self, idle: Duration) {
+        let Ok(mut model) = self.model.try_lock() else {
+            return;
+        };
+        if model
+            .as_ref()
+            .is_none_or(|model| model.last_used.elapsed() < idle)
+        {
+            return;
+        }
+        *model = None;
+        if let Some(file) = self.model_file.get() {
+            // SAFETY: the session that read this read-only file mapping was just dropped,
+            // and later reads fault the pages back in from the file.
+            let _ = unsafe { file.unchecked_advise(UncheckedAdvice::DontNeed) };
+        }
+        release_freed_memory();
     }
 }
 
@@ -284,18 +323,41 @@ fn release_freed_memory() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn release_freed_memory() {}
 
+/// The model loads on whichever thread serves the call, and glibc gives each thread its own
+/// heap. After repeated unload and reload, freed memory spreads across those heaps and the
+/// idle process grows (34 to 74 MB over 6 cycles). Two shared heaps keep it at ~41 MB.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn limit_malloc_arenas() {
+    const M_ARENA_MAX: i32 = -8;
+    unsafe extern "C" {
+        fn mallopt(param: i32, value: i32) -> i32;
+    }
+    // SAFETY: called once at startup before the model or other worker threads allocate.
+    unsafe {
+        mallopt(M_ARENA_MAX, 2);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn limit_malloc_arenas() {}
+
 struct GraniteModel {
     tokenizer: Tokenizer,
     session: InMemorySession<'static>,
+    last_used: Instant,
 }
 
 impl GraniteModel {
-    fn load(directory: &Path) -> Result<Self, Error> {
+    fn load(directory: &Path, file: &'static Mmap) -> Result<Self, Error> {
         verify_installation(directory)?;
         let tokenizer = Tokenizer::from_file(directory.join("tokenizer.json"))
             .map_err(|error| Error::Tokenizer(error.to_string()))?;
-        let session = load_ort_session(&directory.join("model.ort"))?;
-        Ok(Self { tokenizer, session })
+        let session = load_ort_session(file)?;
+        Ok(Self {
+            tokenizer,
+            session,
+            last_used: Instant::now(),
+        })
     }
 
     fn embed(&mut self, text: &str) -> Result<Vec<f32>, Error> {
@@ -420,7 +482,7 @@ fn download_file(url: &str, destination: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn load_ort_session(path: &Path) -> Result<InMemorySession<'static>, Error> {
+fn map_model(path: &Path) -> Result<&'static Mmap, Error> {
     if !path.exists() {
         return Err(Error::Invalid(
             "embedding model.ort is missing; run archive embeddings install".to_owned(),
@@ -429,10 +491,13 @@ fn load_ort_session(path: &Path) -> Result<InMemorySession<'static>, Error> {
     let file = File::open(path)?;
     // SAFETY: model.ort is only ever replaced by rename, never written in place,
     // so the mapped bytes do not change while the process uses them.
-    let map = unsafe { memmap2::Mmap::map(&file)? };
-    // The model stays loaded for the life of the process, so the mapping is never freed.
-    let bytes: &'static [u8] = Box::leak(Box::new(map));
-    Ok(session_builder(GraphOptimizationLevel::Disable)?.commit_from_memory_directly(bytes)?)
+    let map = unsafe { Mmap::map(&file)? };
+    // Sessions borrow the mapping, so it is never freed; unloading only drops its pages.
+    Ok(Box::leak(Box::new(map)))
+}
+
+fn load_ort_session(file: &'static Mmap) -> Result<InMemorySession<'static>, Error> {
+    Ok(session_builder(GraphOptimizationLevel::Disable)?.commit_from_memory_directly(file)?)
 }
 
 fn model_directory(data_directory: &Path) -> PathBuf {
@@ -559,7 +624,7 @@ mod tests {
         assert_eq!(fs::read(&ort).unwrap(), bytes);
         assert_eq!(fs::metadata(&ort).unwrap().modified().unwrap(), modified);
 
-        let mut session = load_ort_session(&ort).unwrap();
+        let mut session = load_ort_session(map_model(&ort).unwrap()).unwrap();
         let x = [1.0_f32; 6];
         let outputs = session
             .run(ort::inputs! {
@@ -621,7 +686,7 @@ mod tests {
     #[test]
     fn missing_ort_model_reports_install_command() {
         let directory = tempfile::tempdir().unwrap();
-        let error = load_ort_session(&directory.path().join("model.ort"))
+        let error = map_model(&directory.path().join("model.ort"))
             .err()
             .unwrap();
         assert!(matches!(error, Error::Invalid(_)));

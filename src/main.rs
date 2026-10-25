@@ -45,6 +45,7 @@ fn main() {
 }
 
 fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
+    embeddings::limit_malloc_arenas();
     let data_directory = app_data_directory().map_err(std::io::Error::other)?;
     let database = Database::open(data_directory.join("archive.sqlite3"))?;
     tokio::runtime::Runtime::new()?.block_on(mcp::run(database, &data_directory))

@@ -540,11 +540,15 @@ pub async fn run(
     database: Database,
     data_directory: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    ArchiveMcp::new(database, data_directory)
-        .serve(stdio())
-        .await?
-        .waiting()
-        .await?;
+    let archive = ArchiveMcp::new(database, data_directory);
+    let embeddings = Arc::clone(&archive.embeddings);
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            embeddings.unload_if_idle(embeddings::MODEL_IDLE_TIMEOUT);
+        }
+    });
+    archive.serve(stdio()).await?.waiting().await?;
     Ok(())
 }
 
