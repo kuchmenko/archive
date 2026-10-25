@@ -12,10 +12,9 @@ use serde_json::{Value, json};
 
 use crate::model::{
     DirectRelationKind, EmbeddingStatus, Label, Lifecycle, LifecycleTransition, Provenance,
-    RecallContext, RecallEvidence, RecallScope, RecallScores, RecallSource, RecallStrategy, Record,
-    RecordInput, RecordKind, RecordPayload, Relation, RelationKind, Retraction, Revision, Scope,
-    SearchHit, SearchPage, SemanticSearchHit, SemanticSearchResult, SnippetOrigin, SourceInput,
-    SourceReference, WriteContext,
+    RecallContext, RecallEvidence, RecallStrategy, Record, RecordInput, RecordKind, RecordPayload,
+    Relation, RelationKind, Retraction, Revision, Scope, SearchHit, SearchPage, SemanticSearchHit,
+    SemanticSearchResult, SnippetOrigin, SourceInput, SourceReference, WriteContext,
 };
 
 const SCHEMA_VERSION: i64 = 9;
@@ -30,10 +29,8 @@ const MAX_SOURCES: usize = 100;
 const RECALL_CANDIDATE_LIMIT: usize = 20;
 const RECALL_RESULT_LIMIT: usize = 5;
 const RECALL_MIN_RESULTS: usize = 3;
-const RECALL_SOURCE_LIMIT: usize = 3;
 const RECALL_MIN_EXCERPT_BYTES: usize = 160;
 const RECALL_MAX_EXCERPT_BYTES: usize = 640;
-const RRF_K: f64 = 60.0;
 pub const DEFAULT_RECALL_BUDGET_BYTES: usize = 12_000;
 const MIN_RECALL_BUDGET_BYTES: usize = 4_000;
 const MAX_RECALL_BUDGET_BYTES: usize = 32_000;
@@ -106,17 +103,10 @@ pub struct EmbeddingRecord {
     pub payload: RecordPayload,
 }
 
-pub(crate) struct Bm25SearchHit {
-    pub record: Record,
-    pub score: f64,
-}
-
 struct RecallCandidate {
     record: Record,
     bm25_rank: Option<usize>,
-    bm25_score: Option<f64>,
     dense_rank: Option<usize>,
-    dense_similarity: Option<f32>,
 }
 
 impl Database {
@@ -460,7 +450,7 @@ impl Database {
         lifecycles: &[Lifecycle],
         label_ids: &[i64],
         limit: usize,
-    ) -> Result<Vec<Bm25SearchHit>, Error> {
+    ) -> Result<Vec<Record>, Error> {
         validate_id("scope_id", scope_id)?;
         validate_limit(limit)?;
         validate_query(query)?;
@@ -482,7 +472,7 @@ impl Database {
             lifecycles.to_vec()
         };
         let mut sql = String::from(
-            "SELECT r.id,-bm25(record_fts) FROM records r
+            "SELECT r.id FROM records r
              JOIN scopes s ON s.id=r.scope_id
              JOIN record_fts ON record_fts.record_id=r.id
              WHERE r.readable=1 AND (r.scope_id=?1 OR (?2=1 AND s.name='global'))
@@ -523,17 +513,12 @@ impl Database {
             let mut statement = connection.prepare(&sql)?;
             statement
                 .query_map(rusqlite::params_from_iter(values), |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+                    row.get::<_, i64>(0)
                 })?
                 .collect::<Result<Vec<_>, _>>()?
         };
         rows.into_iter()
-            .map(|(id, score)| {
-                Ok(Bm25SearchHit {
-                    record: record_from(&connection, id, false)?.ok_or(Error::MissingRecord(id))?,
-                    score,
-                })
-            })
+            .map(|id| record_from(&connection, id, false)?.ok_or(Error::MissingRecord(id)))
             .collect()
     }
 
@@ -580,15 +565,13 @@ impl Database {
             })
             .transpose()?;
         let mut candidates = BTreeMap::new();
-        for (index, hit) in lexical.into_iter().enumerate() {
+        for (index, record) in lexical.into_iter().enumerate() {
             candidates.insert(
-                hit.record.id,
+                record.id,
                 RecallCandidate {
-                    record: hit.record,
+                    record,
                     bm25_rank: Some(index + 1),
-                    bm25_score: Some(hit.score),
                     dense_rank: None,
-                    dense_similarity: None,
                 },
             );
         }
@@ -596,16 +579,11 @@ impl Database {
             for (index, hit) in semantic.records.iter().enumerate() {
                 candidates
                     .entry(hit.record.id)
-                    .and_modify(|candidate| {
-                        candidate.dense_rank = Some(index + 1);
-                        candidate.dense_similarity = Some(hit.similarity);
-                    })
+                    .and_modify(|candidate| candidate.dense_rank = Some(index + 1))
                     .or_insert_with(|| RecallCandidate {
                         record: hit.record.clone(),
                         bm25_rank: None,
-                        bm25_score: None,
                         dense_rank: Some(index + 1),
-                        dense_similarity: Some(hit.similarity),
                     });
             }
         }
@@ -642,9 +620,6 @@ impl Database {
                 &candidates[..count],
                 query,
                 &strategy,
-                semantic_available,
-                model,
-                model_revision,
                 budget_bytes,
                 RECALL_MIN_EXCERPT_BYTES,
             )?;
@@ -660,9 +635,6 @@ impl Database {
                     &candidates[..minimum_count],
                     query,
                     &strategy,
-                    semantic_available,
-                    model,
-                    model_revision,
                     budget_bytes,
                     0,
                 )?;
@@ -678,16 +650,8 @@ impl Database {
         let mut high = RECALL_MAX_EXCERPT_BYTES;
         while low < high {
             let middle = (low + high).div_ceil(2);
-            let candidate = recall_result(
-                &candidates[..count],
-                query,
-                &strategy,
-                semantic_available,
-                model,
-                model_revision,
-                budget_bytes,
-                middle,
-            )?;
+            let candidate =
+                recall_result(&candidates[..count], query, &strategy, budget_bytes, middle)?;
             if candidate.used_bytes <= budget_bytes {
                 low = middle;
                 result = candidate;
@@ -2349,82 +2313,31 @@ fn validate_embedding(embedding: &[f32], dimensions: usize) -> Result<(), Error>
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn recall_result(
     candidates: &[RecallCandidate],
     query: &str,
     strategy: &RecallStrategy,
-    semantic_available: bool,
-    model: &str,
-    model_revision: &str,
     budget_bytes: usize,
     excerpt_bytes: usize,
 ) -> Result<RecallContext, Error> {
     let records = candidates
         .iter()
-        .map(|candidate| {
-            let matched_by = [
-                candidate.bm25_rank.map(|_| RecallStrategy::Bm25),
-                candidate.dense_rank.map(|_| RecallStrategy::Dense),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-            let rrf_score = candidate
-                .bm25_rank
-                .map(|rank| 1.0 / (RRF_K + rank as f64))
-                .into_iter()
-                .chain(candidate.dense_rank.map(|rank| 1.0 / (RRF_K + rank as f64)))
-                .sum::<f64>();
-            RecallEvidence {
-                record_id: candidate.record.id,
-                kind: candidate.record.kind.clone(),
-                title: candidate.record.title.clone(),
-                excerpt: recall_excerpt(
-                    &candidate.record.current.payload.text(),
-                    query,
-                    excerpt_bytes,
-                ),
-                scope: RecallScope {
-                    id: candidate.record.scope.id,
-                    name: candidate.record.scope.name.clone(),
-                },
-                lifecycle: candidate.record.lifecycle.clone(),
-                current_revision: candidate.record.current_revision,
-                provenance: candidate.record.current.provenance.clone(),
-                sources: candidate
-                    .record
-                    .current
-                    .sources
-                    .iter()
-                    .take(RECALL_SOURCE_LIMIT)
-                    .map(|source| RecallSource {
-                        id: source.id,
-                        identity: source.identity.clone(),
-                        locator: source.locator.clone(),
-                        version: source.version.clone(),
-                        content_hash: source.content_hash.clone(),
-                        anchor: source.anchor.clone(),
-                    })
-                    .collect(),
-                source_count: candidate.record.current.sources.len(),
-                retrieval: RecallScores {
-                    matched_by,
-                    bm25_rank: candidate.bm25_rank,
-                    bm25_score: candidate.bm25_score,
-                    dense_rank: candidate.dense_rank,
-                    dense_similarity: candidate.dense_similarity,
-                    rrf_score: Some(rrf_score),
-                },
-                match_explanation: recall_explanation(candidate, semantic_available),
-            }
+        .map(|candidate| RecallEvidence {
+            record_id: candidate.record.id,
+            kind: candidate.record.kind.clone(),
+            title: candidate.record.title.clone(),
+            excerpt: recall_excerpt(
+                &candidate.record.current.payload.text(),
+                query,
+                excerpt_bytes,
+            ),
+            scope: candidate.record.scope.name.clone(),
+            lifecycle: candidate.record.lifecycle.clone(),
+            updated_at: candidate.record.updated_at.clone(),
         })
         .collect();
     let mut result = RecallContext {
         strategy: strategy.clone(),
-        semantic_available,
-        model: semantic_available.then(|| model.to_owned()),
-        model_revision: semantic_available.then(|| model_revision.to_owned()),
         budget_bytes,
         used_bytes: 0,
         records,
@@ -2437,29 +2350,6 @@ fn recall_result(
         result.used_bytes = used_bytes;
     }
     Ok(result)
-}
-
-fn recall_explanation(candidate: &RecallCandidate, semantic_available: bool) -> String {
-    match (
-        candidate.dense_rank,
-        candidate.dense_similarity,
-        candidate.bm25_rank,
-        candidate.bm25_score,
-    ) {
-        (Some(dense_rank), Some(similarity), Some(bm25_rank), Some(bm25_score)) => format!(
-            "Dense rank {dense_rank} with cosine {similarity:.4}; BM25 rank {bm25_rank} with score {bm25_score:.6}. Dense ordering is used because the semantic index is complete."
-        ),
-        (Some(dense_rank), Some(similarity), _, _) => format!(
-            "Dense rank {dense_rank} with cosine {similarity:.4}; no top-{RECALL_CANDIDATE_LIMIT} BM25 match. Dense ordering is used because the semantic index is complete."
-        ),
-        (_, _, Some(bm25_rank), Some(bm25_score)) if semantic_available => format!(
-            "BM25 rank {bm25_rank} with score {bm25_score:.6}; no top-{RECALL_CANDIDATE_LIMIT} dense match."
-        ),
-        (_, _, Some(bm25_rank), Some(bm25_score)) => format!(
-            "BM25 rank {bm25_rank} with score {bm25_score:.6}; semantic retrieval is unavailable."
-        ),
-        _ => "Eligible deterministic retrieval candidate.".to_owned(),
-    }
 }
 
 fn recall_excerpt(text: &str, query: &str, max_bytes: usize) -> String {
