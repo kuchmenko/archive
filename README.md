@@ -182,6 +182,8 @@ Without a path, `install` downloads from the pinned revision only when the model
 
 The installer also writes an optimized `model.ort` next to the model. Archive maps that file into memory instead of copying the weights, so several `archive mcp` processes share one copy. Installations made before this change need one more run of `archive embeddings install`; it does not download anything when the model is already installed. After upgrading the `ort` dependency, delete `model.ort` and run `install` again.
 
+The model code lives in the `granite-embed` crate in `crates/granite-embed`, so other local projects can use the same model. Depend on it by path, for example `granite-embed = { path = "../../archive/crates/granite-embed" }`. `Embedder::new(data_directory)`, `Embedder::install` and `Embedder::download_and_install` all take a data directory, and the model files live in `<data directory>/models/granite-embedding-311m-multilingual-r2/<revision>/`. Pass Archive's data directory (`~/.local/share/dev.kuchmenko.archive` on Linux) to reuse its installed model instead of downloading another copy.
+
 Archive stores one 768-dimensional vector for each readable record revision. The index is derived data and can be rebuilt. Semantic search is available only when the index is complete, so it never returns silently partial results. `recall_context` uses semantic ordering when the complete index is available and BM25 otherwise.
 
 ## Existing databases
