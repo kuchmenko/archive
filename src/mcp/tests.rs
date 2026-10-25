@@ -148,16 +148,22 @@ fn generated_router_has_exact_structured_record_tools_and_closed_payload_schema(
     for field in [
         "record_id",
         "excerpt",
-        "provenance",
-        "sources",
-        "retrieval",
-        "match_explanation",
+        "updated_at",
         "budget_bytes",
         "used_bytes",
     ] {
         assert!(output.contains(field));
     }
-    for excluded in ["payload", "history", "labels", "relations", "quote"] {
+    for excluded in [
+        "payload",
+        "history",
+        "labels",
+        "relations",
+        "provenance",
+        "sources",
+        "retrieval",
+        "match_explanation",
+    ] {
         assert!(!output.contains(excluded));
     }
 }
@@ -262,7 +268,6 @@ async fn duplex_dispatches_typed_create_search_read_and_rejects_unknown_fields()
         .structured_content
         .unwrap();
     assert_eq!(recalled["strategy"], "bm25");
-    assert_eq!(recalled["semantic_available"], false);
     assert_eq!(recalled["records"][0]["record_id"], id);
     assert!(recalled["records"][0].get("payload").is_none());
     assert!(recalled["used_bytes"].as_u64().unwrap() <= 4000);

@@ -485,54 +485,20 @@ pub enum RecallStrategy {
     Dense,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
-pub struct RecallScope {
-    pub id: i64,
-    pub name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, schemars::JsonSchema)]
-pub struct RecallSource {
-    pub id: i64,
-    pub identity: String,
-    pub locator: Option<String>,
-    pub version: Option<String>,
-    pub content_hash: Option<String>,
-    pub anchor: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
-pub struct RecallScores {
-    pub matched_by: Vec<RecallStrategy>,
-    pub bm25_rank: Option<usize>,
-    pub bm25_score: Option<f64>,
-    pub dense_rank: Option<usize>,
-    pub dense_similarity: Option<f32>,
-    pub rrf_score: Option<f64>,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct RecallEvidence {
     pub record_id: i64,
     pub kind: RecordKind,
     pub title: String,
     pub excerpt: String,
-    pub scope: RecallScope,
+    pub scope: String,
     pub lifecycle: Lifecycle,
-    pub current_revision: i64,
-    pub provenance: Provenance,
-    pub sources: Vec<RecallSource>,
-    pub source_count: usize,
-    pub retrieval: RecallScores,
-    pub match_explanation: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, schemars::JsonSchema)]
 pub struct RecallContext {
     pub strategy: RecallStrategy,
-    pub semantic_available: bool,
-    pub model: Option<String>,
-    pub model_revision: Option<String>,
     pub budget_bytes: usize,
     pub used_bytes: usize,
     pub records: Vec<RecallEvidence>,

@@ -285,7 +285,6 @@ fn mcp_stdio_built_binary_runs_representative_record_flow_with_clean_framing() {
     );
     let recalled = &recalled["result"]["structuredContent"];
     assert_eq!(recalled["strategy"], "bm25");
-    assert_eq!(recalled["semantic_available"], false);
     assert_eq!(recalled["records"][0]["record_id"], record_id);
     assert!(recalled["records"][0].get("payload").is_none());
     assert!(recalled["used_bytes"].as_u64().unwrap() <= 4000);

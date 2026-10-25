@@ -556,8 +556,8 @@ fn bm25_recall_uses_or_matches_relevance_order_and_deterministic_ties() {
     let ranked = database
         .bm25_search_records("alpha beta", 1, false, &[], &[], &[], 20)
         .unwrap();
-    assert_eq!(ranked[0].record.id, relevant.id);
-    assert!(ranked.iter().any(|hit| hit.record.id == partial.id));
+    assert_eq!(ranked[0].id, relevant.id);
+    assert!(ranked.iter().any(|record| record.id == partial.id));
 
     let older = create_note(&database, "bm25-tie-old", "Tie", "equal terms");
     let newer = create_note(&database, "bm25-tie-new", "Tie", "equal terms");
@@ -567,7 +567,7 @@ fn bm25_recall_uses_or_matches_relevance_order_and_deterministic_ties() {
     assert_eq!(
         tied.iter()
             .take(2)
-            .map(|hit| hit.record.id)
+            .map(|record| record.id)
             .collect::<Vec<_>>(),
         vec![newer.id, older.id]
     );
@@ -760,7 +760,6 @@ fn recall_deduplicates_dense_and_bm25_candidates_and_uses_dense_ordering() {
         )
         .unwrap();
     assert_eq!(result.strategy, RecallStrategy::Dense);
-    assert!(result.semantic_available);
     assert_eq!(result.records.len(), 5);
     assert_eq!(result.records[0].record_id, records[1].0.id);
     assert_eq!(result.records[1].record_id, records[0].0.id);
@@ -774,15 +773,10 @@ fn recall_deduplicates_dense_and_bm25_candidates_and_uses_dense_ordering() {
             .count(),
         1
     );
-    assert_eq!(
-        result.records[0].retrieval.matched_by,
-        vec![RecallStrategy::Bm25, RecallStrategy::Dense]
-    );
-    assert!(result.records[0].retrieval.rrf_score.unwrap() > 1.0 / 61.0);
 }
 
 #[test]
-fn recall_returns_bounded_excerpts_with_current_sources_and_provenance() {
+fn recall_returns_bounded_excerpts_without_retrieval_details() {
     let database = database();
     for index in 0..5 {
         let mut sources = Vec::new();
@@ -829,7 +823,6 @@ fn recall_returns_bounded_excerpts_with_current_sources_and_provenance() {
         .unwrap();
     assert!((3..=5).contains(&result.records.len()));
     assert_eq!(result.strategy, RecallStrategy::Bm25);
-    assert!(!result.semantic_available);
     assert_eq!(
         serde_json::to_vec(&result).unwrap().len(),
         result.used_bytes
@@ -838,19 +831,23 @@ fn recall_returns_bounded_excerpts_with_current_sources_and_provenance() {
     for record in &result.records {
         assert!(record.excerpt.contains("query-relevant-marker"));
         assert!(record.excerpt.len() < 1_000);
-        assert_eq!(record.scope.name, "global");
+        assert_eq!(record.scope, "global");
         assert_eq!(record.lifecycle, Lifecycle::Active);
-        assert_eq!(record.current_revision, 1);
-        assert_eq!(record.provenance.actor, "agent-a");
-        assert_eq!(record.source_count, 4);
-        assert_eq!(record.sources.len(), 3);
     }
     let json = serde_json::to_value(result).unwrap();
     let record = &json["records"][0];
-    for excluded in ["payload", "history", "labels", "relations"] {
+    for excluded in [
+        "payload",
+        "history",
+        "labels",
+        "relations",
+        "provenance",
+        "sources",
+        "retrieval",
+        "match_explanation",
+    ] {
         assert!(record.get(excluded).is_none());
     }
-    assert!(record["sources"][0].get("quote").is_none());
 }
 
 #[test]

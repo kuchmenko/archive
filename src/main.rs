@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use database::Database;
 use embeddings::Embeddings;
+use granite_embed::Embedder;
 
 fn app_data_directory() -> Result<PathBuf, String> {
     dirs::data_dir()
@@ -45,6 +46,7 @@ fn main() {
 }
 
 fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
+    embeddings::limit_malloc_arenas();
     let data_directory = app_data_directory().map_err(std::io::Error::other)?;
     let database = Database::open(data_directory.join("archive.sqlite3"))?;
     tokio::runtime::Runtime::new()?.block_on(mcp::run(database, &data_directory))
@@ -53,8 +55,8 @@ fn run_mcp() -> Result<(), Box<dyn std::error::Error>> {
 fn install_embeddings(source: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let data_directory = app_data_directory().map_err(std::io::Error::other)?;
     let directory = match source {
-        Some(source) => Embeddings::install(source, &data_directory)?,
-        None => Embeddings::download_and_install(&data_directory)?,
+        Some(source) => Embedder::install(source, &data_directory)?,
+        None => Embedder::download_and_install(&data_directory)?,
     };
     println!(
         "{}",

@@ -18,7 +18,7 @@ mcp:
     cargo run -- mcp
 
 test:
-    cargo test
+    cargo test --workspace
 
 mcp-stdio:
     cargo test --test mcp_stdio
@@ -27,6 +27,6 @@ fmt:
     cargo fmt --check
 
 clippy:
-    cargo clippy --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 check: fmt test clippy
