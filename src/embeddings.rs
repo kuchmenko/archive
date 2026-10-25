@@ -260,10 +260,29 @@ impl Embeddings {
         let mut model = self.model.lock().map_err(|_| Error::Lock)?;
         if model.is_none() {
             *model = Some(GraniteModel::load(&self.directory)?);
+            release_freed_memory();
         }
-        operation(model.as_mut().expect("embedding model was initialized"))
+        let result = operation(model.as_mut().expect("embedding model was initialized"));
+        release_freed_memory();
+        result
     }
 }
+
+/// glibc keeps freed heap memory inside the process. Parsing tokenizer.json frees about
+/// 150 MB and long inputs free more, so return it to the system after each model use.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_freed_memory() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: malloc_trim only releases free heap pages and is safe to call at any time.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_freed_memory() {}
 
 struct GraniteModel {
     tokenizer: Tokenizer,
